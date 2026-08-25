@@ -9,6 +9,7 @@
 ## 版本
 
 - [最新稳定版](https://github.com/i0czf/minecraft-server-ops-kit/releases/latest)
+- [v0.4.2 · QQ 模组分类清单](docs/RELEASE-NOTES-v0.4.2.md)
 - [全部发行说明](https://github.com/i0czf/minecraft-server-ops-kit/releases)
 - [版本对比](https://github.com/i0czf/minecraft-server-ops-kit/compare)
 
