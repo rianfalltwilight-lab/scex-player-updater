@@ -1,38 +1,47 @@
-﻿param(
-    [string]$ConfigPath = ".\tools\portable-pack.json",
-    [int]$Port = 0,
-    [string]$PublicHost = "",
-    [string]$Bind = "::"
+param(
+    [string]$ConfigPath = '.\tools\portable-pack.json',
+    [string]$Bind = '127.0.0.1',
+    [string]$Python = 'python'
 )
 
-$ErrorActionPreference = "Stop"
-try { $Host.UI.RawUI.WindowTitle = '整合包更新服务 —— 玩家同步的下载源；关闭此窗口会停止更新服务' } catch { }
+$ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Root
-
-function Resolve-AnyPath([string]$Path) {
-    if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
-    return [System.IO.Path]::GetFullPath((Join-Path $Root $Path))
+function Resolve-LocalPath([string]$Path) {
+    if ([IO.Path]::IsPathRooted($Path)) { return [IO.Path]::GetFullPath($Path) }
+    return [IO.Path]::GetFullPath((Join-Path $Root $Path))
 }
-
-$configFull = Resolve-AnyPath $ConfigPath
-if (-not (Test-Path -LiteralPath $configFull -PathType Leaf)) {
-    throw "缺少便携配置：$configFull。请先复制 tools\portable-pack.example.json 为 tools\portable-pack.json。"
+$config = Get-Content -LiteralPath (Resolve-LocalPath $ConfigPath) -Raw -Encoding UTF8 | ConvertFrom-Json
+$publish = Resolve-LocalPath ([string]$config.publishDir)
+$rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+if (-not $publish.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'publishDir must be a subdirectory of this updater repository.'
 }
-
-$config = Get-Content -LiteralPath $configFull -Raw -Encoding UTF8 | ConvertFrom-Json
-$publishDir = [string]$config.publishDir
-if ([string]::IsNullOrWhiteSpace($publishDir)) { $publishDir = '.\modpack-public\portable' }
-if ($Port -le 0) { $Port = [int]$config.update.port }
-if ($Port -le 0) { $Port = 18088 }
-if ([string]::IsNullOrWhiteSpace($PublicHost)) { $PublicHost = [string]$config.update.host }
-if ([string]::IsNullOrWhiteSpace($PublicHost)) { $PublicHost = '127.0.0.1' }
-
-Write-Host "[便携] 配置文件：$configFull"
-Write-Host "[便携] 发布目录：$publishDir"
-Write-Host "[便携] 对外主机：$PublicHost"
-Write-Host "[便携] 端口：$Port"
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'tools\start-update-server.ps1') -PublishDir $publishDir -Port $Port -PublicHost $PublicHost -Bind $Bind
+if (-not (Test-Path -LiteralPath (Join-Path $publish 'server-manifest.json') -PathType Leaf)) {
+    throw 'Publish first: powershell -File tools\portable-publish.ps1'
+}
+$tokenFile = [string]$config.update.tokenFile
+if ([string]::IsNullOrWhiteSpace($tokenFile)) { $tokenFile = '.update-server-token' }
+$token = (Get-Content -LiteralPath (Resolve-LocalPath $tokenFile) -Raw -Encoding ASCII).Trim()
+if ($token -notmatch '^[-A-Za-z0-9_]{24,80}$') { throw 'Invalid update token file.' }
+$port = [int]$config.update.port
+if ($port -lt 1 -or $port -gt 65535) { throw 'update.port must be between 1 and 65535.' }
+$serverArgs = @((Join-Path $PSScriptRoot 'secure-update-server.py'), '--directory', $publish,
+    '--port', $port, '--bind', $Bind, '--token', $token)
+$cert = [string]$config.update.certFile
+$key = [string]$config.update.keyFile
+if ($cert) {
+    $cert = Resolve-LocalPath $cert
+    if (-not (Test-Path -LiteralPath $cert -PathType Leaf)) { throw 'Configured TLS certificate does not exist.' }
+    $serverArgs += @('--certfile', $cert)
+    if ($key) {
+        $key = Resolve-LocalPath $key
+        if (-not (Test-Path -LiteralPath $key -PathType Leaf)) { throw 'Configured TLS private key does not exist.' }
+        $serverArgs += @('--keyfile', $key)
+    }
+}
+Write-Host "Serving player updates on ${Bind}:$port. Press Ctrl+C to stop."
+Write-Host 'The player URL is in modpack-public\portable\UPDATE-URL.txt (or your configured publishDir).'
+& $Python @serverArgs
 exit $LASTEXITCODE
-
 

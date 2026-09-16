@@ -1,7 +1,6 @@
 ﻿param(
     [string]$ConfigPath = ".\tools\portable-pack.json",
-    [string]$Version = "",
-    [switch]$NoNotify
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,6 +71,7 @@ function Test-GlobMatch {
     foreach ($glob in @($Globs)) {
         $g = ([string]$glob).Replace('\', '/')
         if ([string]::IsNullOrWhiteSpace($g)) { continue }
+        if ($normalized.Equals($g, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
         if ($normalized -like $g) { return $true }
     }
     return $false
@@ -360,19 +360,41 @@ if (-not (Test-Path -LiteralPath $configFullPath -PathType Leaf)) {
 $config = Get-Content -LiteralPath $configFullPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = [string](Get-ConfigValue -Object $config -Name 'version' -Default '') }
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = Get-Date -Format 'yyyyMMdd-HHmmss' }
+$releaseNotesVersion = [string](Get-ConfigValue -Object $config -Name 'releaseNotesVersion' -Default '')
+$releaseNotes = @(Get-ConfigArray -Object $config -Name 'releaseNotes' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$releaseModChanges = @(Get-ConfigArray -Object $config -Name 'releaseModChanges' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$releaseOtherChanges = @(Get-ConfigArray -Object $config -Name 'releaseOtherChanges' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($releaseNotesVersion -ne $Version) {
+    $releaseNotes = @()
+    $releaseModChanges = @()
+    $releaseOtherChanges = @()
+}
+foreach ($entry in @($releaseModChanges) + @($releaseOtherChanges)) {
+    if ($entry -notmatch '^[+~-]\s+\S') {
+        throw "公开补充变更必须以 '+ '、'- ' 或 '~ ' 开头：$entry"
+    }
+    if ($entry -match '(?i)([A-Z]:\\|SHA-?256|RCON|token|password|backups\\)') {
+        throw "公开补充变更包含内部路径、哈希或凭据关键词，拒绝发布：$entry"
+    }
+}
+$requireReleaseNotes = [bool](Get-ConfigValue -Object $config -Name 'requireReleaseNotes' -Default $false)
+if ($requireReleaseNotes -and $releaseNotes.Count -eq 0) {
+    throw "本次发布要求详细说明，但 releaseNotesVersion/releaseNotes 未匹配版本 $Version。请先填写玩家能看懂的更新原因、实际变化和注意事项。"
+}
 
 $packId = [string](Get-ConfigValue -Object $config -Name 'packId' -Default '')
 $packName = [string](Get-ConfigValue -Object $config -Name 'packName' -Default $packId)
+$publicReleaseName = [string](Get-ConfigValue -Object $config -Name 'publicReleaseName' -Default $packName)
+$releaseLevel = ([string](Get-ConfigValue -Object $config -Name 'releaseLevel' -Default '')).Trim().ToLowerInvariant()
+$releaseDecision = ([string](Get-ConfigValue -Object $config -Name 'releaseDecision' -Default '')).Trim()
 if ([string]::IsNullOrWhiteSpace($packId) -or $packId -match 'CHANGE-ME') {
     Write-Host ''
     Write-Host '[便携] 还不能发布：portable-pack.json 里整合包身份是空的（packId/packName 未填写）。' -ForegroundColor Red
-    Write-Host '这是新服务端（私包出厂即中性）的正常状态，先补两步：' -ForegroundColor Yellow
-    Write-Host '  1. 面板①配置点「初始化配置向导」（或双击 一键脚本\一键便携-初始化配置.bat）——自动识别本服版本/加载器，并让你自定义整合包名称；' -ForegroundColor Yellow
-    Write-Host '  2. 确认主分发客户端已设置（向导里选，或面板点「选择分发客户端目录」）。' -ForegroundColor Yellow
-    Write-Host '完成后再点「仅发布更新」。' -ForegroundColor Yellow
+    Write-Host "请编辑 tools\portable-pack.json，填写 packId、packName 和 sourceClient。"
     exit 1
 }
 if ([string]::IsNullOrWhiteSpace($packName)) { $packName = $packId }
+if ([string]::IsNullOrWhiteSpace($publicReleaseName)) { $publicReleaseName = $packName }
 
 $sourceClientRaw = [string](Get-ConfigValue -Object $config -Name 'sourceClient' -Default '')
 if ([string]::IsNullOrWhiteSpace($sourceClientRaw)) { $sourceClientRaw = '.\main-client' }
@@ -381,8 +403,7 @@ if (-not (Test-Path -LiteralPath $sourceClient -PathType Container)) {
     Write-Host ''
     Write-Host "[便携] 还不能发布：主分发客户端目录不存在：$sourceClient" -ForegroundColor Red
     Write-Host '发布就是把主分发客户端的 mods/config 等复制到更新源，所以必须先有客户端：' -ForegroundColor Yellow
-    Write-Host '  - 已有客户端：在面板点「选择主客户端…」指定它的实例目录（可以在服务端目录外）；' -ForegroundColor Yellow
-    Write-Host '  - 还没有客户端：在服务端根目录新建「客户端」文件夹，放入整合包客户端实例后重跑初始化配置向导。' -ForegroundColor Yellow
+    Write-Host "请将 sourceClient 设置为客户端实例目录（包含 mods/config 的目录）。"
     exit 1
 }
 $publishDir = Resolve-InRoot -Path ([string](Get-ConfigValue -Object $config -Name 'publishDir' -Default '.\modpack-public\portable'))
@@ -434,6 +455,43 @@ if (Test-Path -LiteralPath $oldManifestPath -PathType Leaf) {
         $oldFiles = @{}
         $oldUrlBySha1 = @{}
         $oldManifest = $null
+    }
+}
+
+function ConvertTo-ThreePartReleaseVersion {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    if ($Text -notmatch '^v?(\d+)\.(\d+)\.(\d+)$') {
+        throw "发布版本号必须是 X.Y.Z 三级数字格式：$Text"
+    }
+    return @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+}
+
+function Test-ReleaseVersionBump {
+    param(
+        [Parameter(Mandatory = $true)][string]$OldVersion,
+        [Parameter(Mandatory = $true)][string]$NewVersion,
+        [Parameter(Mandatory = $true)][ValidateSet('major', 'minor', 'patch')][string]$Level
+    )
+    $oldReleaseParts = @(ConvertTo-ThreePartReleaseVersion -Text $OldVersion)
+    $newReleaseParts = @(ConvertTo-ThreePartReleaseVersion -Text $NewVersion)
+    switch ($Level) {
+        'major' { return ($newReleaseParts[0] -eq ($oldReleaseParts[0] + 1) -and $newReleaseParts[1] -eq 0 -and $newReleaseParts[2] -eq 0) }
+        'minor' { return ($newReleaseParts[0] -eq $oldReleaseParts[0] -and $newReleaseParts[1] -eq ($oldReleaseParts[1] + 1) -and $newReleaseParts[2] -eq 0) }
+        'patch' { return ($newReleaseParts[0] -eq $oldReleaseParts[0] -and $newReleaseParts[1] -eq $oldReleaseParts[1] -and $newReleaseParts[2] -eq ($oldReleaseParts[2] + 1)) }
+    }
+}
+
+# 已发布版本可原号重建清单；只有真正换版本时才强制填写并校验三级语义。
+if (-not [string]::IsNullOrWhiteSpace($oldVersion) -and $Version -ne $oldVersion) {
+    if ($releaseLevel -notin @('major', 'minor', 'patch')) {
+        throw '下一次发布必须在 portable-pack.json 填写 releaseLevel：major（大型更新）、minor（小型更新）或 patch（小更改）。'
+    }
+    if ([string]::IsNullOrWhiteSpace($releaseDecision)) {
+        throw '下一次发布必须填写 releaseDecision，说明为什么本次属于大型更新、小型更新或小更改。'
+    }
+    $validReleaseBump = Test-ReleaseVersionBump -OldVersion $oldVersion -NewVersion $Version -Level $releaseLevel
+    if (-not $validReleaseBump) {
+        throw "版本号 $oldVersion → $Version 与 releaseLevel=$releaseLevel 不一致。更高位递增时低位必须归零，且每次只递增一级。"
     }
 }
 
@@ -602,7 +660,7 @@ $manifest = [ordered]@{
     updateUrl = $manifestUrl
     serverName = $serverName
     serverAddress = $serverAddress
-    sourceClient = $sourceClient
+    releaseNotes = $releaseNotes
     preservePlayerCustomizations = $true
     preserveLocalChangeGlobs = Get-ConfigArray -Object $config -Name 'preserveLocalChangeGlobs' -Default @()
     preserveLocalDeletionGlobs = Get-ConfigArray -Object $config -Name 'preserveLocalDeletionGlobs' -Default @()
@@ -639,7 +697,7 @@ try {
 } finally {
     if (Test-Path -LiteralPath $manifestNextPath -PathType Leaf) { Remove-Item -LiteralPath $manifestNextPath -Force -ErrorAction SilentlyContinue }
 }
-Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n源客户端：$sourceClient`r`n更新地址：$manifestUrl`r`n文件数量：$($files.Count)`r`n官方源命中：$($officialReused + $officialFresh) / $officialEligible`r`n"
+Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n文件数量：$($files.Count)`r`n官方源命中：$($officialReused + $officialFresh) / $officialEligible`r`n"
 Write-Host "[便携] 已发布 $packName $Version"
 Write-Host "[便携] 源客户端：$sourceClient"
 Write-Host "[便携] 发布目录：$publishDir"
@@ -648,7 +706,7 @@ Write-Host "[便携] 文件数：$($files.Count)，从源客户端复制：$scri
 
 # ---------------------------------------------------------------
 # 变更对比：生成本次发布的新增/删除/修改文件列表
-# 分类汇总 mods 和 config 变化，写入摘要文件并通知 Discord/QQ
+# 分类汇总 mods 和 config 变化，写入本地摘要文件
 # ---------------------------------------------------------------
 if ($oldFiles.Count -gt 0) {
     # 排除每次发布都会重新生成的元文件，避免误报
@@ -690,7 +748,7 @@ if ($oldFiles.Count -gt 0) {
     }
 
     # 把"同一 mod 的旧版删除 + 新版新增"配对识别成一次"版本变更"——mod jar 文件名带版本号，
-    # 版本一变文件名就变，diff 只会看成 add+remove（非 modify）。摘要和 RCON 广播共用这份配对结果，
+    # 版本一变文件名就变，diff 只会看成 add+remove（非 modify）。更新摘要使用这份配对结果，
     # 摘要再按版本数值方向区分为升级、回退或方向未知，而不是把所有变化都叫成升级。
     # 去掉文件名开头的"装饰前缀"：排序号 + 中文标签，如 "8.4[神秘时代]" / "[更多箱子] " / "[玉 🔍] "。
     # 前缀只是给人看的分类标记，改标签、改排序号不代表换了一个 mod，所以不能进身份。
@@ -847,12 +905,13 @@ if ($oldFiles.Count -gt 0) {
         return "$($parts.Base)：$($parts.OldText) → $($parts.NewText)"
     }
 
-    # 分类汇总：Mod 保留逐条详情（最多 20 条，超出折叠）；配置/其他只报数量。
-    # 逐条列配置既不直观、又会把 QQ/Discord 通知刷成长串（2026-07-08 tacz、配置刷屏实锤）。
+    # 分类汇总：Mod、配置和其他文件都给出具体路径，但限制条数，避免 QQ/Discord 刷屏。
     function Group-Changes {
         param([string[]]$Paths, [string]$Label, [string]$Symbol = '+')
         if (-not $Paths -or $Paths.Count -eq 0) { return @() }
         $maxList = 20
+        $maxConfigList = 12
+        $maxOtherList = 12
         $mods = @($Paths | Where-Object { $_ -like 'mods/*' } | ForEach-Object { $_ -replace 'mods/', '' })
         $configs = @($Paths | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })
         $others = @($Paths | Where-Object { $_ -notlike 'mods/*' -and $_ -notlike 'config/*' -and $_ -notlike 'defaultconfigs/*' })
@@ -862,48 +921,74 @@ if ($oldFiles.Count -gt 0) {
             foreach ($item in ($mods | Select-Object -First $maxList)) { $lines += "    $Symbol $item" }
             if ($mods.Count -gt $maxList) { $lines += "    … 以及另外 $($mods.Count - $maxList) 个" }
         }
-        if ($configs.Count -gt 0) { $lines += "  配置 $Label：$($configs.Count) 项" }
-        if ($others.Count -gt 0)  { $lines += "  其他 $Label：$($others.Count) 项" }
+        if ($configs.Count -gt 0) {
+            $lines += "  配置 $Label（$($configs.Count) 项）："
+            foreach ($item in ($configs | Select-Object -First $maxConfigList)) { $lines += "    $Symbol $item" }
+            if ($configs.Count -gt $maxConfigList) { $lines += "    … 以及另外 $($configs.Count - $maxConfigList) 项" }
+        }
+        if ($others.Count -gt 0) {
+            $lines += "  其他 $Label（$($others.Count) 项）："
+            foreach ($item in ($others | Select-Object -First $maxOtherList)) { $lines += "    $Symbol $item" }
+            if ($others.Count -gt $maxOtherList) { $lines += "    … 以及另外 $($others.Count - $maxOtherList) 项" }
+        }
         return $lines
     }
 
     $hasChanges = ($added.Count -gt 0 -or $removed.Count -gt 0 -or $modified.Count -gt 0)
+    # Server-only/config-only releases may intentionally change the public
+    # version and release notes without adding a managed client file.  They
+    # still need a release log, decision record and player notification.
+    $hasReleaseMetadataChange = (-not [string]::IsNullOrWhiteSpace($oldVersion) -and $oldVersion -ne $Version)
 
-    if ($hasChanges) {
-        $summaryLines = @()
-        $summaryLines += "[更新] $packName 已发布新版本 $Version"
-        if ($oldVersion) { $summaryLines += "上一版本：$oldVersion" }
-        $summaryLines += ""
-        $summaryLines += "本次变更："
-        $maxVersionChangeList = 20
-        foreach ($group in @(
-            @{ Items = $modUpgrades; Label = '升级' }
-            @{ Items = $modDowngrades; Label = '回退' }
-            @{ Items = $modVersionUnknown; Label = '版本变更（方向无法判断）' }
-        )) {
-            # 泛型 List 不能直接套数组子表达式，显式展开后再统计/遍历。
-            $items = @($group['Items'] | ForEach-Object { $_ })
-            if ($items.Count -gt 0) {
-                $summaryLines += "  Mod $($group['Label'])（$($items.Count) 个）："
-                foreach ($u in ($items | Select-Object -First $maxVersionChangeList)) {
-                    $summaryLines += ("    ~ " + (Format-ModVersionChangeLine $u.Old $u.New))
-                }
-                if ($items.Count -gt $maxVersionChangeList) { $summaryLines += "    … 以及另外 $($items.Count - $maxVersionChangeList) 个" }
+    if ($hasChanges -or $hasReleaseMetadataChange) {
+        $publicModLines = New-Object System.Collections.Generic.List[string]
+        $publicOtherLines = New-Object System.Collections.Generic.List[string]
+
+        foreach ($group in @($modUpgrades, $modDowngrades, $modVersionUnknown)) {
+            foreach ($u in @($group | ForEach-Object { $_ })) {
+                [void]$publicModLines.Add("~ $(Format-ModVersionChangeLine $u.Old $u.New)")
             }
         }
-        if ($modRenames.Count -gt 0) {
-            $maxRenameList = 20
-            $summaryLines += "  Mod 改名（$($modRenames.Count) 个，版本未变）："
-            foreach ($u in ($modRenames | Select-Object -First $maxRenameList)) {
-                $summaryLines += ("    ~ " + (Split-Path -Leaf $u.Old) + " → " + (Split-Path -Leaf $u.New))
-            }
-            if ($modRenames.Count -gt $maxRenameList) { $summaryLines += "    … 以及另外 $($modRenames.Count - $maxRenameList) 个" }
+        foreach ($u in @($modRenames | ForEach-Object { $_ })) {
+            [void]$publicModLines.Add("~ $((Split-Path -Leaf $u.Old)) → $((Split-Path -Leaf $u.New))")
         }
-        if ($addedFinal.Count -gt 0)   { $summaryLines += (Group-Changes $addedFinal   '新增' '+') }
-        if ($modified.Count -gt 0)     { $summaryLines += (Group-Changes $modified     '更新' '~') }
-        if ($removedFinal.Count -gt 0) { $summaryLines += (Group-Changes $removedFinal '删除' '-') }
-        $summaryLines += ""
-        $summaryLines += "玩家可运行同步脚本自动更新。服务器：$serverAddress"
+        foreach ($path in @($addedFinal | Where-Object { $_ -like 'mods/*' })) {
+            [void]$publicModLines.Add("+ $(Split-Path -Leaf $path)")
+        }
+        foreach ($path in @($modified | Where-Object { $_ -like 'mods/*' })) {
+            [void]$publicModLines.Add("~ $(Split-Path -Leaf $path)")
+        }
+        foreach ($path in @($removedFinal | Where-Object { $_ -like 'mods/*' })) {
+            [void]$publicModLines.Add("- $(Split-Path -Leaf $path)")
+        }
+        foreach ($path in @($addedFinal | Where-Object { $_ -notlike 'mods/*' })) { [void]$publicOtherLines.Add("+ $path") }
+        foreach ($path in @($modified | Where-Object { $_ -notlike 'mods/*' })) { [void]$publicOtherLines.Add("~ $path") }
+        foreach ($path in @($removedFinal | Where-Object { $_ -notlike 'mods/*' })) { [void]$publicOtherLines.Add("- $path") }
+        foreach ($entry in $releaseModChanges) {
+            if (-not $publicModLines.Contains($entry)) { [void]$publicModLines.Add($entry) }
+        }
+        foreach ($entry in $releaseOtherChanges) {
+            if (-not $publicOtherLines.Contains($entry)) { [void]$publicOtherLines.Add($entry) }
+        }
+
+        $displayVersion = if ($Version.StartsWith('v', [System.StringComparison]::OrdinalIgnoreCase)) { $Version } else { "v$Version" }
+        $summaryLines = @(
+            "> $(Get-Date -Format 'yyyy/M/d') $displayVersion",
+            $publicReleaseName,
+            '',
+            '更新说明'
+        )
+        if ($releaseNotes.Count -gt 0) {
+            foreach ($note in $releaseNotes) { $summaryLines += "- $note" }
+        } else {
+            $summaryLines += '（无）'
+        }
+        $summaryLines += ''
+        $summaryLines += '模组变更'
+        if ($publicModLines.Count -gt 0) { $summaryLines += @($publicModLines) } else { $summaryLines += '（无）' }
+        $summaryLines += ''
+        $summaryLines += '其他内容'
+        if ($publicOtherLines.Count -gt 0) { $summaryLines += @($publicOtherLines) } else { $summaryLines += '（无）' }
 
         $summaryText = ($summaryLines -join "`r`n")
 
@@ -914,78 +999,38 @@ if ($oldFiles.Count -gt 0) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $stableSummary) | Out-Null
         Write-Utf8NoBom -Path $summaryPath -Value ($summaryText + "`r`n")
         Write-Utf8NoBom -Path $stableSummary -Value ($summaryText + "`r`n")
+        $releaseLogDir = Join-Path $Root 'logs\releases'
+        $safeVersion = ($Version -replace '[^A-Za-z0-9._-]', '_')
+        Write-Utf8NoBom -Path (Join-Path $releaseLogDir ($safeVersion + '.txt')) -Value ($summaryText + "`r`n")
+        Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value ($summaryText + "`r`n")
+
+        if (-not [string]::IsNullOrWhiteSpace($releaseLevel) -and -not [string]::IsNullOrWhiteSpace($releaseDecision)) {
+            $levelNames = @{ major = '大型更新'; minor = '小型更新'; patch = '小更改' }
+            $decisionDir = Join-Path $Root 'logs\release-decisions'
+            $decisionText = @(
+                "版本：$Version",
+                "上一版本：$oldVersion",
+                "级别：$($levelNames[$releaseLevel]) ($releaseLevel)",
+                "判断依据：$releaseDecision",
+                "模组新增：$(@($addedFinal | Where-Object { $_ -like 'mods/*' }).Count)",
+                "模组删除：$(@($removedFinal | Where-Object { $_ -like 'mods/*' }).Count)",
+                "模组升级或改名：$($modVersionChanges.Count + $modRenames.Count)",
+                "其他文件变化：$($publicOtherLines.Count)",
+                "公开补充模组条目：$($releaseModChanges.Count)",
+                "公开补充其他条目：$($releaseOtherChanges.Count)"
+            ) -join "`r`n"
+            Write-Utf8NoBom -Path (Join-Path $decisionDir ($safeVersion + '.txt')) -Value ($decisionText + "`r`n")
+        }
 
         Write-Host ""
         Write-Host "[便携] 变更摘要："
         Write-Host $summaryText
         Write-Host ""
 
-        if ($NoNotify) {
-            Write-Host "[便携] 本次使用 -NoNotify：已刷新清单，但跳过 Discord / QQ 与游戏内广播。"
-        } else {
-            # 调用通知脚本转发到 Discord/QQ（best-effort，失败不阻断发布）
-            $notifyScript = Join-Path $PSScriptRoot 'send-update-notify.ps1'
-            if (Test-Path -LiteralPath $notifyScript -PathType Leaf) {
-                Write-Host "[便携] 正在发送更新通知到 Discord / QQ …"
-                try {
-                    $prevErrorAction = $ErrorActionPreference
-                    $ErrorActionPreference = "Continue"
-                    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $notifyScript -SummaryFile $summaryPath 2>&1 | ForEach-Object { Write-Host $_ }
-                    $ErrorActionPreference = $prevErrorAction
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Host "[便携] 通知发送未完全成功（退出码 $LASTEXITCODE），发布流程继续。"
-                    }
-                } catch {
-                    Write-Host "[便携] 通知发送异常：$($_.Exception.Message)，发布流程继续。"
-                }
-            } else {
-                Write-Host "[便携] 未找到通知脚本 send-update-notify.ps1，跳过通知。"
-            }
-
-            # 发布即时提醒：通过 RCON 向在线玩家广播一条游戏内消息（tellraw @a）。
-            # 这是"发布即时通知"的主通道——瞬时、游戏内、必达；后台 daemon 随后 30s 内开始预下载。
-            # best-effort：服务器没开/未启用 RCON/没在线玩家都不阻断发布。
-            $rconScript = Join-Path $PSScriptRoot 'rcon-command.ps1'
-            if (Test-Path -LiteralPath $rconScript -PathType Leaf) {
-                # 三份名单复用上面按 Get-ModKey 配对好的结果：更新（配对成功的 add+remove、以及同名 modify）、纯新增、纯移除。
-                $updatedPaths = New-Object System.Collections.Generic.List[string]
-                foreach ($u in $modVersionChanges) { [void]$updatedPaths.Add($u.New) }
-                foreach ($u in $modRenames)  { [void]$updatedPaths.Add($u.New) }   # 改名也要重下，对玩家等价于"更新"
-                foreach ($m in @($modified | Where-Object { $_ -like 'mods/*.jar' })) { [void]$updatedPaths.Add($m) }
-                $addedPaths   = @($addedFinal   | Where-Object { $_ -like 'mods/*.jar' })
-                $removedPaths = @($removedFinal | Where-Object { $_ -like 'mods/*.jar' })
-
-            # 公屏名单：去掉 mods/ 前缀与 .jar 后缀，最多列 6 个，多余折叠成"…等 N 个"。
-            function Format-ModLine {
-                param($Paths, [int]$Max = 6)
-                $names = @($Paths | ForEach-Object { ($_ -replace '^mods/', '') -replace '\.jar$', '' })
-                if ($names.Count -le $Max) { return ($names -join '、') }
-                return (($names[0..($Max - 1)] -join '、') + " …等 " + $names.Count + " 个")
-            }
-
-                $rawComponents = @(
-                    "",
-                    @{ text = "`n[整合包更新] "; color = "gold"; bold = $true },
-                    @{ text = "服务器已发布新版本，你的客户端会在后台自动下载。`n"; color = "yellow" }
-                )
-                if ($addedPaths.Count -gt 0)   { $rawComponents += @{ text = ("  新增：" + (Format-ModLine $addedPaths) + "`n"); color = "green" } }
-                if ($updatedPaths.Count -gt 0) { $rawComponents += @{ text = ("  更新：" + (Format-ModLine $updatedPaths) + "`n"); color = "aqua" } }
-                if ($removedPaths.Count -gt 0) { $rawComponents += @{ text = ("  移除：" + (Format-ModLine $removedPaths) + "`n"); color = "red" } }
-                if (($addedPaths.Count + $updatedPaths.Count + $removedPaths.Count) -eq 0) { $rawComponents += @{ text = "  本次为配置 / 资源更新`n"; color = "gray" } }
-                $rawComponents += @{ text = "退出游戏后重新双击脚本启动即可用上新内容（无需再等下载）。`n"; color = "gray" }
-                $tellrawJson = ($rawComponents | ConvertTo-Json -Compress -Depth 5)
-                try {
-                    [void](& $rconScript -Command ("tellraw @a " + $tellrawJson))
-                    Write-Host "[便携] 已通过 RCON 向在线玩家广播更新提示。"
-                } catch {
-                    Write-Host "[便携] RCON 广播跳过（服务器未运行 / 未开 RCON / 无在线玩家）：$($_.Exception.Message)"
-                }
-            }
-        }
+        Write-Host "[更新器] 更新摘要已保存。"
     } else {
-        Write-Host "[便携] 本次发布与上一版无文件变化，跳过通知。"
+        Write-Host "[便携] 本次发布与上一版的版本号、说明和文件均无变化。"
     }
 }
 
 if ($script:PublishLockStream) { $script:PublishLockStream.Dispose(); $script:PublishLockStream = $null }
-

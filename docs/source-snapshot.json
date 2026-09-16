@@ -1,0 +1,29 @@
+{
+  "extractedOn": "2026-09-16",
+  "source": "SCEX Legacy Genesis deployed updater; tools matched distributed _updater files",
+  "upstream": "https://github.com/i0czf/minecraft-server-ops-kit",
+  "upstreamCommit": "19de94de25efe149d9364ed6572cd634e8138112",
+  "originalSha256": {
+    "LICENSE": "b527e97213060a07bb8831012c47edbb6223246dc0e2565b2f8519bff1eb2dbf",
+    "tools/player-update-generic.ps1": "e767110bd741e88e446d73b61580c9e480679ebdd2ddeec8e21ad9546f2f3185",
+    "tools/player-update-generic.py": "2c144f2701ac3319ba5fea3c081657aa76270cb5e74945882dd675251d123b27",
+    "tools/portable-stage-daemon.ps1": "61ad417f7ee9603fd3b66a0f801cb02e41e8f8bb2df78ae5f5920fcfbae5140d",
+    "tools/portable-stage-daemon.py": "ad17a854c5882f7f9738b4684203b66783c6444a09cd70dc7036dc02666129d9",
+    "tools/portable-bootstrap-refresh.ps1": "b57a85d70111be713d185572eea7821a9d652b3e2931695b59bc286444548f7f",
+    "tools/portable-windows-repair.ps1": "4485b4eb2ee759d7d842479a5833252efa8fb48622abc47a1772ee5a3b398f94",
+    "tools/portable-windows-repair.bat": "afe13ba8b3933eb72e5d18cf080415791aafbd7ffb302a84ad0e4941fb09dfc6",
+    "tools/portable-windows-sync.bat": "3636d79d9eaa860b1b642f4c2ab252f9a8f5e2b2ea19fcc21c925ec6692d7795",
+    "tools/portable-macos-sync.command": "3151ad79d7fe89511cc03e7542e40a652fff3d1cc003f45037ec65585088b303",
+    "tools/player-self-repair.ps1": "f41b167c58261ba34d2706797c48516adcdfb1d4b98268e274b3249778e9093c",
+    "tools/portable-publish.ps1": "a048301c11acbefb41c82eade7c41d7a01c02f6b355c68b3da0d0bb9ced52727",
+    "tools/secure-update-server.py": "9968a61c9dcec49ca22a3b50503a7d8626b18e5aae42aa547b74c93402f73f6a",
+    "一键脚本/一键客户端自助修复.bat": "4b05e1ba5e152b71a75c13ed902965e88bd45153ca2c1aeca3be167f213ea2a3"
+  },
+  "extractionChanges": [
+    "Remove server operations and notification integrations",
+    "Remove tokenless full-toolkit update route",
+    "Replace operational configuration and documentation with neutral examples",
+    "Add standalone update-service launcher and synthetic regression tests",
+    "Fix extra closing brace in Windows bootstrap fallback Save-DirectFile"
+  ]
+}

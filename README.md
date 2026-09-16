@@ -1,104 +1,87 @@
-# Minecraft 腐竹运维工具包
+# SCEX 玩家更新器
 
-面向 Minecraft Java 服务端服主的便携式运维工具包：开服、玩家分发、增量更新、QQ 群运维、备份恢复和性能诊断收在一个可迁移目录里。
+从 SCEX 怀旧服（Legacy Genesis）当前使用版本中独立提取的 Minecraft 客户端更新工具。基于 [i0czf/minecraft-server-ops-kit](https://github.com/i0czf/minecraft-server-ops-kit)，本仓库是其 GitHub fork。
 
-项目源自 1.21.1 NeoForge 的长期实战，脚本会优先读取目标服务端的实际版本和加载器，不把某一台服的身份写死在公版里。
+默认分支仅提供更新器：客户端增量同步、后台预下载、更新脚本刷新与修复、管理员发布清单、更新文件下载服务。上游的服务器启停、面板、RCON、QQ/Discord 通知、备份管理、整套工具包自更新均已移除。Git 历史保留上游记录。
 
-实服截图按引入版本放在 [Releases](https://github.com/i0czf/minecraft-server-ops-kit/releases)，首页只保留说明和入口。
+这是脚本工具，不是 Minecraft 模组，无须放进 `mods` 文件夹，也不需要服务器安装插件。仓库不包含整合包、模组 JAR、玩家存档、生产地址、令牌或私有配置。
 
-## 版本
+## 功能
 
-- [最新稳定版](https://github.com/i0czf/minecraft-server-ops-kit/releases/latest)
-- [v0.4.2 · QQ 模组分类清单](docs/RELEASE-NOTES-v0.4.2.md)
-- [全部发行说明](https://github.com/i0czf/minecraft-server-ops-kit/releases)
-- [版本对比](https://github.com/i0czf/minecraft-server-ops-kit/compare)
+- 按清单 SHA-1 校验并增量下载；旧文件覆盖或移除时保留本地备份。
+- Python 同步器与 Windows PowerShell 同步器，Windows / macOS 启动入口。
+- 游戏期间可后台预下载到 `.portable-staging`，下一次启动前应用并重新核对。
+- 更新器自刷新、Windows 入口修复、客户端自助检查及按需修复。
+- 可配置保留玩家额外文件、本地配置改动与主动删除；也可显式指定强制同步、强制删除。
+- 发布器生成清单和更新摘要，复用相同内容的文件；可查询 Modrinth 官方下载源，并回退到自建源。
+- 下载服务只接受 GET / HEAD，通过随机 URL 路径限制访问，可配置 TLS；默认监听本机。
 
-发布页只记经过验证、对使用者有意义的批次。
+## 管理员快速开始
 
-## 适合谁
+发布器需要 Windows PowerShell 5.1 或 PowerShell 7；下载服务需要 Python 3.10+。玩家 Windows 入口优先使用 Python，未安装时使用系统 PowerShell；macOS 入口需要 `python3`。
 
-- 自己维护 Minecraft Java 服务端的个人服主
-- 需要把整合包、更新源和运维流程标准化的人
-- 想把临时手工排查变成可复用脚本和报告的人
-- 需要中文一键入口，但不想被某个启动器或加载器锁定的人
+1. 下载或克隆仓库，复制配置：
 
-## 主要能力
+   ```powershell
+   Copy-Item tools\portable-pack.example.json tools\portable-pack.json
+   ```
 
-**服务端**：中文控制面板（启停、RCON、发布、状态）；可选 Web 面板，默认只听 127.0.0.1、令牌登录、任意 RCON 默认关；初始化向导识别版本 / Forge / NeoForge / Fabric / Quilt；按版本匹配 Java；本机 RCON 自动配置。详见 [Web 面板](docs/web-panel-网页远程运维.md)。
+2. 编辑 `tools/portable-pack.json`：设置 `packId`、`packName`、`sourceClient`、`version`；`sourceClient` 指向包含 `mods/config` 的客户端实例目录。相对路径以仓库根目录为基准。`publishDir` 必须是仓库内专用子目录，其中过期文件会被发布器清理。
+3. `update.host` 改为玩家能访问的主机名或 IP，`update.port` 设置下载端口。示例的 `127.0.0.1` 仅用于本机试用。
+4. 生成更新源：
 
-**玩家分发**：规范导入包、PCL 包、完整客户端包和增量更新源；Windows / macOS / Linux 同步；尽量保留玩家按键、服务器列表和资源包；哈希校验、混源回落、客户端自助修复。
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File tools\portable-publish.ps1
+   ```
 
-**QQ 群**：开服 / 聊天 / 进退服 / 成就 / 崩溃 / 备份通知；群友查询、管理执行；高危确认码和审计；可选 AI 助手。QQ 与游戏 ID 绑定后，公屏显示游戏名，游戏里 @游戏ID 会点到对应 QQ；管理员可用 !转发 立刻停双向聊天，用 !绑定提醒 控制未绑定轻提醒。可选图床 + ChatImage 预览、模组发布事务、DDNS。QQ / LLBot 本体不随仓库分发。详见 [绑定说明](docs/qq-player-bind-游戏ID绑定.md)、[图床说明](docs/qq-image-host-转图床.md)。另见 [!mods 分类清单](docs/qq-mod-list-模组清单分类.md)。
+5. 在另一个终端启动下载服务：
 
-**AI 多媒体**：QQ 当前消息、引用消息和合并转发里的原视频可由 Qwen3.7 Flash 覆盖完整时间轴；Qwen Audio ASR 负责视频音轨和 QQ 语音文字，Qwen3.5-Omni 可选判断说话、唱歌、纯音乐和环境声，再由默认 DeepSeek 汇总。引用语音发送 `!转写` 只做 ASR，发送 `!听语音` 或带语音 `!问`/`@机器人` 才并行理解声音。Silk 按真实文件头识别：OneBot 转码优先，失败时用内置 `silk-wasm` 解 WAV；长 WAV 超过 Omni 的 Base64 限制时只在本机压成 MP3，ffmpeg 不可用则按 PCM 帧分片，不会为了绕过限制上传公网。机器人不会自动上传全群语音。取不到原视频才退回少量关键帧，任何媒体内容都不能授权服务器操作。详见 [视频、语音识别与 DeepSeek 汇总](docs/qq-video-audio-ai.md)。
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File tools\start-portable-update-server.ps1
+   ```
 
-**跨群共享 AI 知识库**：主群管理员明确纠正或用 `!知识库记住 主题 => 结论` 写入一次后，所有客群 `@机器人` 都会先按文本与音频 SHA-256 指纹检索相似结论，再交给 DeepSeek 汇总。默认只保存通用短文本，不保存服务器日志/配置、密钥、群号、QQ 号或原始媒体；普通群友只读。可用 `!知识库查询 关键词`、`!知识库删除 关键词` 管理，文件默认 `logs/ai-shared-knowledge.jsonl`。
+   默认只监听本机。需要直接对局域网/公网提供下载时，按实际网络配置传入 `-Bind 0.0.0.0`（IPv4）或 `-Bind ::`（双栈）。脚本不修改防火墙、路由或公网转发。可用 `-Python C:\Python\python.exe` 指定解释器。
 
-**备份与诊断**：定时 / 手动备份、ZIP 校验、恢复冒烟、影子服试车、卡顿取证、错误指纹、事故复盘、运维时间线、BlueMap 时光机。扫地僧、配方和要素查询等可选。高风险能力在公版模板里默认关闭。
+   直接提供 HTTPS 时，填写 `update.certFile`、`update.keyFile` 并设置 `update.scheme` 为 `https`；也可由反向代理终止 TLS。随机 URL 不是账户认证机制，拿到链接的人即可下载。不要把 `.update-server-token`、生成的地址文件或含令牌的日志提交到 Git。
 
-## 快速开始
+6. 把生成目录中的 `_updater`、`更新mod-Windows端.bat`、`更新mod-Mac端.command`、`一键客户端自助修复.bat` 和 `UPDATE-URL.txt` 放入发给玩家的**客户端实例目录**。初始客户端的游戏本体、加载器、Java 等仍需自行准备；本工具同步的是清单文件。
 
-1. 把仓库放到服务端根目录，或用构建器生成 `dist/` 下的公版包再解压。新服可以还没有 `server.properties`。
-2. 运行 `一键脚本\一键便携-初始化配置.bat`。第一次建议逐项确认。结果写入本机私有文件 `tools\portable-pack.json` 和 `tools\ops-config.json`，不要提交或外发。
-3. 需要浏览器运维时运行根目录 `一键便携-Web控制面板.bat`，或 `一键脚本\一键便携-启动Web控制面板.bat`。首次会生成 `tmp\portable-web-panel.token`，默认地址 `http://127.0.0.1:58080/`。远程优先走 SSH / VPN。
-4. 启动服务端：`一键脚本\一键便携-启动服务端.bat`。日常启停、运维监控和 RCON 也可走根目录控制面板。
-5. 发布玩家更新：确认主客户端和更新源后，运行 `一键脚本\一键便携-生成规范导入包.bat` 和 `一键脚本\一键便携-开启更新服务.bat`。公网更新必须用你自己授权的域名、端口和访问策略。
+后续修改客户端源目录，更新版本与 `releaseNotesVersion/releaseNotes`，再运行发布脚本即可。沿用怀旧服发布规则：换版本时使用 `X.Y.Z`，填写 `releaseLevel`（`major` / `minor` / `patch`）及 `releaseDecision`；例如 `1.0.0 → 1.0.1` 用 `patch`，`1.0.0 → 1.1.0` 用 `minor`。同版本允许重建。下载服务保持运行。此独立版发布脚本不发送群消息或游戏广播，也不提供 `-NoNotify` 参数。
 
-完整手册：[docs/portable-server-kit.md](docs/portable-server-kit.md)。
+## 玩家使用
 
-## 目录
+关闭游戏后，双击实例内的 `更新mod-Windows端.bat`；macOS 先执行 `chmod +x 更新mod-Mac端.command`，再运行。入口会在更新完成后尝试启动已有启动器，并可启动后台预下载。
 
-```text
-.
-├─ 一键便携-控制面板.bat     根目录唯一的控制面板入口
-├─ 一键便携-Web控制面板.bat  根目录 Web 面板快捷入口
-├─ 一键脚本/                 可单独双击的一键入口
-├─ tools/                    脚本与公版模板（*.example.json）
-├─ docs/                     功能说明；截图原件在 docs/assets/
-├─ PUBLIC-RELEASE-AUDIT.md   公版纳入 / 排除边界
-└─ .gitignore                私有配置和运行目录保护
-```
-
-## 构建公版
+只执行同步、不启动启动器或后台任务时：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File .\tools\build-portable-server-kit.ps1 `
-  -Version 20260820-170600 -Lite -NoUpdateChannel
+powershell -NoProfile -ExecutionPolicy Bypass -File _updater\player-update-generic.ps1 -InstanceDir . -NoPause
 ```
 
-构建器会做白名单、私有文件门禁、路径 / 密钥扫描、脚本编码和语法检查。产物在 `dist/`，默认不进 Git。发布者还可传 `-PrivacyReferenceRoot <实机根目录>`，只读收集实机身份值与公版交叉比对，命中时只报文件、不回显私密值；`-NoUpdateChannel` 用于审计构建，避免提前覆盖本地更新通道。
+```sh
+python3 _updater/player-update-generic.py --instance-dir .
+```
+
+异常时先运行 `一键客户端自助修复.bat` 检查；确认需要修补后使用 `player-self-repair.ps1 -Fix`。同步状态位于 `.portable-sync-state.json`，被替换文件的备份位于 `.portable-sync-backups`，预下载位于 `.portable-staging`。
+
+## 配置与边界
+
+- 示例默认保留配置的本地修改与删除，不分发 `options.txt`、`servers.dat` 或启动器，也不启用重复模组清理。需要统一覆盖某个文件时，在 `forceSyncGlobs` 填入精确路径。
+- `forceDeleteGlobs` 会主动移除匹配文件并备份，优先使用精确旧文件名；不要用宽泛规则清理玩家自装内容。
+- 常规同步会按上次清单管理的文件处理旧版本；额外模组不因“未出现在新清单”被全目录删除。`additiveDirs` 还可保留资源包、光影等目录的内容。
+- SHA-1 用于文件一致性检查，清单未做数字签名；请只向玩家提供自己可信的更新源。
+- macOS 启动器交互、实际游戏运行期间的后台预下载及公网 TLS/代理环境尚未在本次独立提取中实机验收。详见 [验证记录](docs/VALIDATION.md)。
+
+## 来源与许可
+
+上游作者：**i0czf**，原仓库：[minecraft-server-ops-kit](https://github.com/i0czf/minecraft-server-ops-kit)。SCEX 怀旧服适配及此更新器独立提取由 **rianfalltwilight-lab / SCEX** 维护。本 fork 不代表上游官方发行版。
+
+遵循上游 **PolyForm Noncommercial 1.0.0** 许可，保留原作者版权及 Required Notice；这是允许非商业用途的公开源码项目，商业使用须取得相应许可。详见 [LICENSE](LICENSE)。提取日期、固定上游提交与原始文件 SHA-256 见 [来源记录](docs/source-snapshot.json)。
+
+## 回归测试
 
 ```powershell
-python -m compileall -q .\tools
-New-Item -ItemType Directory -Force .\tmp\javac-check | Out-Null
-javac --add-modules jdk.httpserver -encoding UTF-8 `
-  -d .\tmp\javac-check .\tools\QQConsoleBridge.java
+python -m unittest discover -s tests -v
 ```
 
-## 隐私与安全
-
-仓库只收通用源码、模板和文档，不含：
-
-- 真实 Token、Webhook、密码、群号、域名
-- 本机 ops-config.json / portable-pack.json、RCON 密码、更新令牌
-- 世界、日志、备份、崩溃报告、玩家缓存、白名单
-- 私服客户端、模组、地图、QQ 登录数据和第三方运行时
-
-报 Issue 前先删配置和日志里的域名、IP、玩家名、UUID、群号和密钥。不要整包上传运行中的服务端。
-
-日常建议：密钥放环境变量或本机私有配置；RCON 只听本机并用随机强密码；生产操作先备份，恢复前先验证或影子服试车；不要用管理员身份跑一键入口，除非你清楚在做什么。
-
-## 贡献
-
-欢迎 Issue、文档改进和 Pull Request。提交前请确认：
-
-1. 不含服务器身份、玩家信息或凭据。
-2. 新功能在公版模板里默认安全关闭，或写明风险。
-3. PowerShell 用 UTF-8；Windows .bat 保持 CRLF、不带 BOM。
-4. 跑过公版构建器和相关语法检查。
-5. 写明测试环境、Minecraft 版本和加载器。
-
-## 许可证
-
-原创代码采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，© 2026 i0czf。允许非商业使用、修改和再分发；商业使用需事先书面许可。第三方依赖、QQ / LLBot、Minecraft 模组和启动器遵守各自许可证。
+测试使用临时客户端与本机随机端口，不连接生产更新源；Windows 自动测试 PowerShell 同步器与发布器，可用环境变量 `UPDATER_TEST_POWERSHELL` 指定 `pwsh.exe`。测试结束关闭服务并清理临时数据。

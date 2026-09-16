@@ -308,6 +308,13 @@ if ($manifest -and $manifest.files) {
         $checked++
         $full = Join-Safe $instanceRoot $rel
         $expected = ([string]$f.sha1).ToLowerInvariant()
+        # 支持把整套更新器作为实例根目录下的子文件夹保存。
+        # 此时 manifest 中的 _updater/* 不在实例根目录，但当前诊断脚本旁边已有同一文件；
+        # 只把它作为校验候选，不复制、不移动，也不改变 InstanceDir 的边界。
+        if ($isUpdater -and -not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            $bundledUpdaterFile = Join-Path $PSScriptRoot ([IO.Path]::GetFileName($key))
+            if (Test-Path -LiteralPath $bundledUpdaterFile -PathType Leaf) { $full = $bundledUpdaterFile }
+        }
         if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
             $missing.Add([pscustomobject]@{ path = $rel; sha1 = $expected; size = $f.size }) | Out-Null
             continue

@@ -12,27 +12,11 @@ from urllib.parse import unquote, urlsplit
 
 
 class SecureUpdateHandler(SimpleHTTPRequestHandler):
-    server_version = "TFCRUpdateServer/1.0"
+    server_version = "SCEXPlayerUpdateServer/1.0"
 
-    def __init__(self, *args, token="", kitdir="", **kwargs):
+    def __init__(self, *args, token="", **kwargs):
         self.token = token.strip("/")
-        # kitdir: public tokenless channel at /kit/ for toolkit self-update files
-        # (the kit itself is meant to be public; only flat .zip/.txt basenames are served).
-        self.kitdir = kitdir
         super().__init__(*args, **kwargs)
-
-    def _kit_file(self, decoded):
-        if not self.kitdir:
-            return None
-        parts = [part for part in decoded.split("/") if part]
-        if len(parts) != 2 or parts[0] != "kit":
-            return None
-        name = parts[1]
-        if name in ("", ".", "..") or os.path.dirname(name):
-            return None
-        if not (name.endswith(".zip") or name.endswith(".txt")):
-            return None
-        return os.path.join(self.kitdir, name)
 
     def list_directory(self, path):
         self.send_error(HTTPStatus.NOT_FOUND, "No directory listing")
@@ -50,9 +34,6 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
         raw_path = urlsplit(path).path
         decoded = unquote(raw_path)
-        kit_file = self._kit_file(decoded)
-        if kit_file is not None:
-            return kit_file
         parts = [part for part in decoded.split("/") if part]
         if not parts or parts[0] != self.token:
             return "__blocked__"
@@ -70,8 +51,6 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
         if "/.." in clean or clean.endswith("/.."):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return None
-        if self._kit_file(clean) is not None:
-            return super().send_head()
         expected_prefix = "/" + self.token
         if clean != expected_prefix and not clean.startswith(expected_prefix + "/"):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -135,17 +114,16 @@ class DualStackThreadingHTTPServer(QuietThreadingHTTPServer):
         super().server_bind()
 
 def main():
-    parser = argparse.ArgumentParser(description="Serve TFCR update files behind a secret URL prefix.")
+    parser = argparse.ArgumentParser(description="Serve player update files behind a secret URL prefix.")
     parser.add_argument("--directory", required=True)
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--token", required=True)
     parser.add_argument("--certfile", default="", help="PEM cert chain; enables HTTPS when set")
     parser.add_argument("--keyfile", default="", help="PEM private key; defaults to certfile if omitted")
-    parser.add_argument("--kitdir", default="", help="serve toolkit self-update files at tokenless /kit/ when set")
     args = parser.parse_args()
 
-    handler = functools.partial(SecureUpdateHandler, directory=args.directory, token=args.token, kitdir=args.kitdir)
+    handler = functools.partial(SecureUpdateHandler, directory=args.directory, token=args.token)
     server_class = DualStackThreadingHTTPServer if ":" in args.bind else QuietThreadingHTTPServer
     with server_class((args.bind, args.port), handler) as httpd:
         if args.certfile:

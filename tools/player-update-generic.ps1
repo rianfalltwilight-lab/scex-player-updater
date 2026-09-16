@@ -104,6 +104,7 @@ function Test-GlobMatch {
     foreach ($glob in @($Globs)) {
         $g = Normalize-Rel ([string]$glob)
         if ([string]::IsNullOrWhiteSpace($g)) { continue }
+        if ($normalized.Equals($g, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
         if ($normalized -like $g) { return $true }
     }
     return $false
@@ -696,14 +697,114 @@ function Apply-OptionDefaults {
         if ($script:PreservedDeletionKeys -and $script:PreservedDeletionKeys.Contains((Normalize-RelKey ([string]$targetRel)))) { continue }
         $path = Join-SafeRelativePath -Root $Root -Rel ([string]$targetRel)
         $exists = Test-Path -LiteralPath $path -PathType Leaf
-        if ($applyMode -eq 'missing' -and ($exists -or (-not $script:InitialSync))) { continue }
-        if ($exists) { Backup-FileIfExists -Path $path -Rel ([string]$targetRel) -BackupRoot $BackupRoot }
+        if ($applyMode -eq 'missing' -and $exists) { continue }
+
+        $currentValues = @{}
+        if ($exists) {
+            foreach ($line in Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction SilentlyContinue) {
+                if ($line -match '^([^:]+):(.*)$') { $currentValues[$Matches[1]] = $Matches[2] }
+            }
+        }
+        $pending = New-Object System.Collections.Generic.List[object]
         foreach ($prop in $defaults.PSObject.Properties) {
+            $key = [string]$prop.Name
+            $value = [string]$prop.Value
+            if (-not $currentValues.ContainsKey($key) -or [string]$currentValues[$key] -ne $value) {
+                [void]$pending.Add($prop)
+            }
+        }
+        if ($pending.Count -eq 0) { continue }
+        if ($exists) { Backup-FileIfExists -Path $path -Rel ([string]$targetRel) -BackupRoot $BackupRoot }
+        foreach ($prop in $pending) {
             Set-OptionLine -Path $path -Key ([string]$prop.Name) -Value ([string]$prop.Value)
             $changed++
         }
     }
     if ($changed -gt 0) { Write-Host "[修复] 已写入安全默认选项：$changed 项" }
+    return $changed
+}
+
+function Ensure-RequiredResourcePacks {
+    param([string]$Root, $Manifest, [string]$BackupRoot)
+    $optionsConfig = Get-PropertyValue -Object $Manifest -Name 'playerOptions' -Default $null
+    if (-not $optionsConfig) { return 0 }
+    $requested = @(Get-ArrayValue -Object $optionsConfig -Name 'requiredResourcePacks' -Default @())
+    if ($requested.Count -eq 0) { return 0 }
+
+    $required = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $requested) {
+        $packId = ([string]$item).Trim()
+        if ([string]::IsNullOrWhiteSpace($packId) -or $required.Contains($packId)) { continue }
+        if ($packId.StartsWith('file/')) {
+            $packRel = 'resourcepacks/' + $packId.Substring(5)
+            if (-not (Test-RelativePathSafe -Rel $packRel)) {
+                Write-Host "[警告] 忽略不安全的必选资源包：$packId" -ForegroundColor Yellow
+                continue
+            }
+            $packPath = Join-SafeRelativePath -Root $Root -Rel $packRel
+            if (-not (Test-Path -LiteralPath $packPath -PathType Leaf)) {
+                Write-Host "[警告] 必选资源包尚未同步，暂不启用：$packId" -ForegroundColor Yellow
+                continue
+            }
+        }
+        [void]$required.Add($packId)
+    }
+    if ($required.Count -eq 0) { return 0 }
+
+    $changed = 0
+    $targets = @(Get-ArrayValue -Object $optionsConfig -Name 'targets' -Default @('options.txt'))
+    foreach ($targetRel in $targets) {
+        $rel = [string]$targetRel
+        if (-not (Test-RelativePathSafe -Rel $rel)) { continue }
+        if ($script:PreservedDeletionKeys -and $script:PreservedDeletionKeys.Contains((Normalize-RelKey $rel))) { continue }
+        $path = Join-SafeRelativePath -Root $Root -Rel $rel
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+
+        $rawValue = $null
+        $language = $null
+        foreach ($line in Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction SilentlyContinue) {
+            if ($line -match '^resourcePacks:(.*)$') { $rawValue = $Matches[1] }
+            elseif ($line -match '^lang:(.*)$') { $language = $Matches[1].Trim() }
+        }
+        if ([string]::IsNullOrWhiteSpace($language)) {
+            Write-Host "[警告] $rel 未找到 lang:zh_cn；Relics 中文需要把游戏语言设为简体中文。未自动修改玩家语言。" -ForegroundColor Yellow
+        }
+        elseif ($language -ne 'zh_cn') {
+            Write-Host "[警告] $rel 当前语言为 $language；Relics 中文需要 lang:zh_cn。未自动修改玩家语言。" -ForegroundColor Yellow
+        }
+        try {
+            $current = if ($null -eq $rawValue) { @('vanilla') } else { @($rawValue | ConvertFrom-Json -ErrorAction Stop) }
+        }
+        catch {
+            Write-Host "[警告] 无法解析 $rel 中的 resourcePacks，已保留原值。" -ForegroundColor Yellow
+            continue
+        }
+        if (@($current | Where-Object { $_ -isnot [string] }).Count -gt 0) {
+            Write-Host "[警告] $rel 中的 resourcePacks 不是字符串列表，已保留原值。" -ForegroundColor Yellow
+            continue
+        }
+
+        $desired = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($value in $current) { if (-not $required.Contains([string]$value)) { [void]$desired.Add([string]$value) } }
+        foreach ($value in $required) { [void]$desired.Add($value) }
+        # Opt-in NeoForge baseline: preserve existing pack order and only add a missing ID.
+        if ($optionsConfig.ensureModResourcesBaseline -eq $true -and -not $desired.Contains('mod_resources')) {
+            $vanillaIndex = $desired.IndexOf('vanilla')
+            $insertIndex = if ($vanillaIndex -ge 0) { $vanillaIndex + 1 } else { 0 }
+            $desired.Insert($insertIndex, 'mod_resources')
+        }
+        $currentJson = ConvertTo-Json -InputObject @($current) -Compress
+        $desiredJson = ConvertTo-Json -InputObject @($desired) -Compress
+        if ($currentJson -eq $desiredJson) {
+            Write-Host "[检查] 服务器汉化包已启用且处于最高优先级：$rel" -ForegroundColor Green
+            continue
+        }
+
+        Backup-FileIfExists -Path $path -Rel $rel -BackupRoot $BackupRoot
+        Set-OptionLine -Path $path -Key 'resourcePacks' -Value $desiredJson
+        $changed++
+        Write-Host "[修复] 已启用服务器汉化包并保留其他资源包：$rel" -ForegroundColor Green
+    }
     return $changed
 }
 
@@ -1113,6 +1214,9 @@ $slash = $manifestUrl.LastIndexOf('/')
 if ($slash -lt 0) { throw "manifest URL 格式异常：$manifestUrl" }
 $baseUrl = $manifestUrl.Substring(0, $slash + 1)
 $script:InitialSync = -not $state -or -not (Get-PropertyValue -Object $state -Name 'files' -Default $null)
+$previousVersion = [string](Get-PropertyValue -Object $state -Name 'version' -Default '')
+$currentVersion = [string](Get-PropertyValue -Object $manifest -Name 'version' -Default '')
+$versionChanged = $previousVersion -ne $currentVersion
 $previousMap = ConvertTo-FileMap -Files (Get-PropertyValue -Object $state -Name 'files' -Default @())
 # key 是小写化的，删除旧文件时要还原状态文件里的原始大小写（大小写敏感卷才找得到文件）。
 $previousRelByKey = @{}
@@ -1164,6 +1268,9 @@ $adopted = 0
 $skipped = 0
 $preserved = 0
 $removed = 0
+$updatedPaths = New-Object 'System.Collections.Generic.List[string]'
+$adoptedPaths = New-Object 'System.Collections.Generic.List[string]'
+$forcedAppliedPaths = New-Object 'System.Collections.Generic.List[string]'
 $script:PreservedDeletionKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 # 保留了玩家修改、但服务端同一文件本次其实也有更新的清单：结尾集中提醒一次。
 $script:PreservedConflicts = New-Object 'System.Collections.Generic.List[string]'
@@ -1214,12 +1321,24 @@ foreach ($file in @($manifest.files)) {
         $adopt = Get-AdoptSource -Index (Get-AdoptIndex) -Expected $expected -TargetFull $targetFull -ManifestTargets $manifestTargets
         if ($adopt) {
             New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
-            if ($adopt.Mode -eq 'move') { Move-Item -LiteralPath $adopt.Path -Destination $target -Force }
+            if ($adopt.Mode -eq 'move') {
+                # 同哈希接管通常是官方改名/换名。虽然内容不变，旧路径仍属于玩家本地
+                # 将发生的变更，必须先按原相对路径备份，才能满足可完整回滚的安全约束。
+                $rootFull = [System.IO.Path]::GetFullPath($instanceRoot).TrimEnd('\') + '\'
+                $adoptFull = [System.IO.Path]::GetFullPath([string]$adopt.Path)
+                if (-not $adoptFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "接管来源越出实例目录：$adoptFull"
+                }
+                $adoptRel = Normalize-Rel $adoptFull.Substring($rootFull.Length)
+                Backup-FileIfExists -Path $adopt.Path -Rel $adoptRel -BackupRoot $backupRoot
+                Move-Item -LiteralPath $adopt.Path -Destination $target -Force
+            }
             else { Copy-Item -LiteralPath $adopt.Path -Destination $target -Force }
             if ((Get-Sha1 -Path $target) -eq $expected) {
                 $verified[$relKey] = Get-FileVerifyRecord -Path $target -Sha1 $expected
                 Write-Host "[接管本地文件] $rel"
                 $adopted++
+                [void]$adoptedPaths.Add($rel)
                 continue
             }
             # 接管后校验不符（极罕见）：不 continue，落到下面正常下载覆盖。
@@ -1231,6 +1350,8 @@ foreach ($file in @($manifest.files)) {
         $verified[$relKey] = Get-FileVerifyRecord -Path $target -Sha1 $expected
         if ($source -eq 'official') { Write-Host "[官方源] $rel" } else { Write-Host "[更新] $rel" }
         $downloaded++
+        [void]$updatedPaths.Add($rel)
+        if ($forceSync) { [void]$forcedAppliedPaths.Add($rel) }
     } catch {
         if (Test-OptionalHelperFile -Rel $rel) {
             Write-SyncWarning "辅助脚本未更新：$rel；$($_.Exception.Message)"
@@ -1295,6 +1416,10 @@ foreach ($dir in $additiveDirs) {
 }
 
 [void](Apply-OptionDefaults -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot)
+$requiredPackChanges = Ensure-RequiredResourcePacks -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
+if ($requiredPackChanges -gt 0) {
+    Write-Host "[重要] 已修改资源包顺序。请完全退出 Minecraft 后重新启动客户端；游戏运行中不会自动采用外部 options.txt 变更。" -ForegroundColor Yellow
+}
 Apply-ServerList -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
 Apply-LauncherProfile -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
 Show-LauncherHints -Root $instanceRoot
@@ -1337,7 +1462,22 @@ $stateOut = [ordered]@{
     verified = $verifiedOut
 }
 Write-Utf8NoBom -Path $statePath -Value (($stateOut | ConvertTo-Json -Depth 8) + "`r`n")
-Write-Host "[同步] 完成。更新=$downloaded 接管=$adopted 跳过=$skipped 保留=$preserved 删除=$removed 备份=$backupRoot"
+$configApplied = @(@($updatedPaths) + @($adoptedPaths) | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })
+$forcedAppliedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($rel in $forcedAppliedPaths) { [void]$forcedAppliedSet.Add($rel) }
+Write-Host "[同步] 完成。更新=$downloaded 配置变更=$($configApplied.Count) 接管=$adopted 跳过=$skipped 保留=$preserved 删除=$removed 备份=$backupRoot"
+if ($configApplied.Count -gt 0) {
+    Write-Host "[配置已应用] 共 $($configApplied.Count) 项："
+    foreach ($rel in $configApplied) {
+        $suffix = if ($forcedAppliedSet.Contains($rel)) { '（强制同步；原文件如存在已备份）' } else { '' }
+        Write-Host ("  - " + $rel + $suffix)
+    }
+}
+$releaseNotes = @(Get-ArrayValue -Object $manifest -Name 'releaseNotes' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($releaseNotes.Count -gt 0 -and ($versionChanged -or $downloaded -gt 0 -or $adopted -gt 0 -or $removed -gt 0 -or $script:InitialSync)) {
+    Write-Host ("[本版说明] " + $(if ($currentVersion) { $currentVersion } else { '当前版本' }))
+    foreach ($note in $releaseNotes) { Write-Host ("  - " + $note) }
+}
 if ($script:PreservedConflicts.Count -gt 0) {
     Write-Host ("[提示] 以下 " + $script:PreservedConflicts.Count + " 个文件保留了你的本地修改，但服务端本次也更新了它们（未应用服务端版）：")
     foreach ($r in $script:PreservedConflicts) { Write-Host ("  - " + $r) }

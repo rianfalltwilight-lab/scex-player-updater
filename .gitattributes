@@ -1,5 +1,7 @@
-# Cross-platform launchers are byte-sensitive.
+* text=auto
+*.bat -text
+*.ps1 -text
+*.py text eol=lf
 *.command text eol=lf
-*.sh text eol=lf
-*.bat text eol=crlf
-*.cmd text eol=crlf
+*.md text eol=lf
+*.json text eol=lf

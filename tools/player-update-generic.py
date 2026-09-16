@@ -181,7 +181,14 @@ def is_protected_rel(rel: str) -> bool:
 
 def glob_match(rel: str, globs) -> bool:
     rel = safe_rel(rel)
-    return any(fnmatch.fnmatchcase(rel, str(g).replace("\\", "/").lstrip("/")) for g in globs or [])
+    rel_key = rel.casefold()
+    for glob in globs or []:
+        pattern = str(glob).replace("\\", "/").lstrip("/")
+        if rel_key == pattern.casefold():
+            return True
+        if fnmatch.fnmatchcase(rel_key, pattern.casefold()):
+            return True
+    return False
 
 
 def file_map(files) -> dict:
@@ -670,15 +677,114 @@ def apply_option_defaults(root: pathlib.Path, manifest: dict, backup_root: pathl
             continue
         path = join_safe(root, rel)
         exists = path.is_file()
-        if mode == "missing" and (exists or not initial_sync):
+        if mode == "missing" and exists:
+            continue
+        current_values = {}
+        if exists:
+            for line in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    current_values[key] = value
+        pending = [
+            (str(key), str(value))
+            for key, value in defaults.items()
+            if current_values.get(str(key)) != str(value)
+        ]
+        if not pending:
             continue
         if exists:
             backup_file(path, root, rel, backup_root)
-        for key, value in defaults.items():
-            set_option_line(path, str(key), str(value))
+        for key, value in pending:
+            set_option_line(path, key, value)
             changed += 1
     if changed:
         print(f"[修复] 已写入安全默认选项：{changed} 项")
+    return changed
+
+
+def ensure_required_resource_packs(
+    root: pathlib.Path,
+    manifest: dict,
+    backup_root: pathlib.Path,
+    preserved_deletions=None,
+) -> int:
+    """Merge server-required resource packs into options.txt without replacing player packs."""
+    preserved_deletions = preserved_deletions or set()
+    config = manifest.get("playerOptions") or {}
+    requested = config.get("requiredResourcePacks") or []
+    if not isinstance(requested, list):
+        return 0
+
+    required: list[str] = []
+    for value in requested:
+        pack_id = str(value).strip()
+        if not pack_id or pack_id in required:
+            continue
+        if pack_id.startswith("file/"):
+            try:
+                pack_rel = safe_rel("resourcepacks/" + pack_id[5:])
+            except ValueError:
+                print(f"[警告] 忽略不安全的必选资源包：{pack_id}")
+                continue
+            if not join_safe(root, pack_rel).is_file():
+                print(f"[警告] 必选资源包尚未同步，暂不启用：{pack_id}")
+                continue
+        required.append(pack_id)
+    if not required:
+        return 0
+
+    changed = 0
+    for target_rel in config.get("targets") or ["options.txt"]:
+        rel = safe_rel(str(target_rel))
+        if rel.lower() in preserved_deletions:
+            continue
+        path = join_safe(root, rel)
+        if not path.is_file():
+            continue
+
+        raw_value = None
+        language = None
+        for line in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key == "resourcePacks":
+                raw_value = value
+            elif key == "lang":
+                language = value.strip()
+        if not language:
+            print(f"[警告] {rel} 未找到 lang:zh_cn；Relics 中文需要把游戏语言设为简体中文。未自动修改玩家语言。")
+        elif language != "zh_cn":
+            print(f"[警告] {rel} 当前语言为 {language}；Relics 中文需要 lang:zh_cn。未自动修改玩家语言。")
+        try:
+            current = json.loads(raw_value) if raw_value is not None else ["vanilla"]
+        except (TypeError, json.JSONDecodeError):
+            print(f"[警告] 无法解析 {rel} 中的 resourcePacks，已保留原值。")
+            continue
+        if not isinstance(current, list) or any(not isinstance(item, str) for item in current):
+            print(f"[警告] {rel} 中的 resourcePacks 不是字符串列表，已保留原值。")
+            continue
+
+        # Remove any earlier occurrence, then append: Minecraft's later entries
+        # have higher priority, so the server localization overrides mod_resources.
+        desired = [item for item in current if item not in required]
+        desired.extend(required)
+        # NeoForge inserts a missing required mod_resources pack at TOP on launch.
+        # Put the missing baseline below player packs before the game can do so.
+        if config.get("ensureModResourcesBaseline") is True and "mod_resources" not in desired:
+            index = desired.index("vanilla") + 1 if "vanilla" in desired else 0
+            desired.insert(index, "mod_resources")
+        if desired == current:
+            print(f"[检查] 服务器汉化包已启用且处于最高优先级：{rel}")
+            continue
+        backup_file(path, root, rel, backup_root)
+        set_option_line(
+            path,
+            "resourcePacks",
+            json.dumps(desired, ensure_ascii=False, separators=(",", ":")),
+        )
+        changed += 1
+        print(f"[修复] 已启用服务器汉化包并保留其他资源包：{rel}")
     return changed
 
 
@@ -1083,6 +1189,9 @@ def main() -> int:
         raise SystemExit("清单没有 files 文件列表。")
     base_url = manifest_url.rsplit("/", 1)[0] + "/"
     initial_sync = not bool(state.get("files"))
+    previous_version = str(state.get("version") or "")
+    current_version = str(manifest.get("version") or "")
+    version_changed = previous_version != current_version
     previous = file_map(state.get("files"))
     # key 是小写化的，删除旧文件时要还原状态文件里的原始大小写（大小写敏感卷才找得到文件）。
     previous_rel = {}
@@ -1142,6 +1251,9 @@ def main() -> int:
         except (ValueError, KeyError):
             continue
     downloaded = adopted = skipped = preserved = removed = 0
+    updated_paths = []
+    adopted_paths = []
+    forced_applied_paths = []
     preserved_deletions = set()
     # 保留了玩家修改、但服务端同一文件本次其实也有更新的清单：结尾集中提醒一次。
     preserved_conflicts = []
@@ -1189,6 +1301,13 @@ def main() -> int:
                 src, mode = picked
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if mode == "move":
+                    # Same-hash adoption is usually a managed rename. Content is unchanged,
+                    # but the old local path is still being mutated, so preserve it first.
+                    try:
+                        old_rel = src.relative_to(root).as_posix()
+                    except ValueError as exc:
+                        raise ValueError(f"adopt source escaped instance root: {src}") from exc
+                    backup_file(src, root, old_rel, backup_root)
                     shutil.move(str(src), target)
                 else:
                     shutil.copy2(str(src), target)
@@ -1197,24 +1316,25 @@ def main() -> int:
                     verified[key] = file_verify_record(target, expected)
                     print(f"[接管本地文件] {rel}")
                     adopted += 1
+                    adopted_paths.append(rel)
                     continue
                 # adopted content didn't verify (rare); fall through to a normal download
         if exists:
             backup_file(target, root, rel, backup_root)
-        download_jobs.append((item, target, expected, rel, key))
+        download_jobs.append((item, target, expected, rel, key, force_sync))
 
     def run_download_job(job):
-        item, target, expected, rel, key = job
+        item, target, expected, rel, key, force_sync = job
         try:
             source = download_manifest_entry(item, base_url, target, expected, rel)
             ensure_executable_if_needed(target, rel)
             sync_print(f"[官方源] {rel}" if source == "official" else f"[更新] {rel}")
-            return key, file_verify_record(target, expected), None
+            return key, rel, force_sync, file_verify_record(target, expected), None
         except Exception as exc:
             if is_optional_helper(rel):
                 sync_print(f"[警告] 辅助脚本未更新：{rel}；{exc}")
-                return key, None, "optional"
-            return key, None, exc
+                return key, rel, force_sync, None, "optional"
+            return key, rel, force_sync, None, exc
 
     if download_jobs:
         print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {_DOWNLOAD_WORKERS}）。")
@@ -1225,10 +1345,13 @@ def main() -> int:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 results = list(pool.map(run_download_job, download_jobs))
         hard_error = None
-        for key, record, err in results:
+        for key, rel, force_sync, record, err in results:
             if record is not None:
                 verified[key] = record
                 downloaded += 1
+                updated_paths.append(rel)
+                if force_sync:
+                    forced_applied_paths.append(rel)
             elif err == "optional":
                 preserved += 1
             elif hard_error is None:
@@ -1274,7 +1397,7 @@ def main() -> int:
             rel = path.relative_to(root).as_posix()
             if is_protected_rel(rel):
                 continue
-            if fnmatch.fnmatchcase(rel, pattern):
+            if glob_match(rel, [pattern]):
                 backup_file(path, root, rel, backup_root)
                 path.unlink()
                 print(f"[强制删除] {rel}")
@@ -1301,6 +1424,14 @@ def main() -> int:
             pass
 
     apply_option_defaults(root, manifest, backup_root, preserved_deletions, initial_sync)
+    required_pack_changes = ensure_required_resource_packs(
+        root, manifest, backup_root, preserved_deletions
+    )
+    if required_pack_changes:
+        print(
+            "[重要] 已修改资源包顺序。请完全退出 Minecraft 后重新启动客户端；"
+            "游戏运行中不会自动采用外部 options.txt 变更。"
+        )
     apply_server_list(root, manifest, backup_root, preserved_deletions, initial_sync)
     apply_launcher_profile(root, manifest, backup_root)
     show_launcher_hints(root)
@@ -1342,7 +1473,22 @@ def main() -> int:
         "verified": verified,
     }
     state_path.write_text(json.dumps(state_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"[同步] 完成。更新={downloaded} 接管={adopted} 跳过={skipped} 保留={preserved} 删除={removed} 备份={backup_root}")
+    config_applied = [
+        rel for rel in updated_paths + adopted_paths
+        if rel.lower().startswith(("config/", "defaultconfigs/"))
+    ]
+    forced_keys = {rel.lower() for rel in forced_applied_paths}
+    print(f"[同步] 完成。更新={downloaded} 配置变更={len(config_applied)} 接管={adopted} 跳过={skipped} 保留={preserved} 删除={removed} 备份={backup_root}")
+    if config_applied:
+        print(f"[配置已应用] 共 {len(config_applied)} 项：")
+        for rel in config_applied:
+            suffix = "（强制同步；原文件如存在已备份）" if rel.lower() in forced_keys else ""
+            print(f"  - {rel}{suffix}")
+    release_notes = [str(note).strip() for note in (manifest.get("releaseNotes") or []) if str(note).strip()]
+    if release_notes and (version_changed or downloaded or adopted or removed or initial_sync):
+        print(f"[本版说明] {current_version or '当前版本'}")
+        for note in release_notes:
+            print(f"  - {note}")
     if preserved_conflicts:
         print(f"[提示] 以下 {len(preserved_conflicts)} 个文件保留了你的本地修改，但服务端本次也更新了它们（未应用服务端版）：")
         for rel in preserved_conflicts:
