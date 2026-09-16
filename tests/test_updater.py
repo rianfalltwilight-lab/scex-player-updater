@@ -222,7 +222,8 @@ class PublishTests(unittest.TestCase):
             run([PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
                  str(root / 'tools/start-portable-update-server.ps1'), '-Python', sys.executable], root)
             args = json.loads((root / 'args.json').read_text())
-            self.assertEqual(args[args.index('--directory') + 1], str(publish))
+            # Windows runners may expose TEMP through its equivalent 8.3 short path.
+            self.assertTrue(Path(args[args.index('--directory') + 1]).samefile(publish))
             self.assertEqual(args[args.index('--bind') + 1], '127.0.0.1')
             self.assertEqual(args[args.index('--token') + 1], (root / '.test-token').read_text().strip())
             self.assertNotIn('--kitdir', args)
