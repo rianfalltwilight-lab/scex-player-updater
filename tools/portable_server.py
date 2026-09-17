@@ -89,6 +89,8 @@ def load_config(root, config_path=None, overrides=None, environ=None, allow_new_
     if supplied and not path.is_file() and not allow_new_config:
         raise ValueError(f'Explicit configuration not found: {path}')
     config = read_json(path) if path.exists() else read_json(root / 'tools/portable-pack.example.json')
+    if not isinstance(config, dict) or not isinstance(config.get('update', {}), dict):
+        raise ValueError('Configuration and update must be JSON objects.')
     if not path.exists():
         config['sourceClient'] = 'auto'
     origins = {}
@@ -112,6 +114,12 @@ def load_config(root, config_path=None, overrides=None, environ=None, allow_new_
 
 def resolve_config(root, config, require_source=True):
     c = copy.deepcopy(config)
+    for key in ('includeRoots', 'includeFiles', 'excludeGlobs', 'preserveLocalChangeGlobs',
+                'preserveLocalDeletionGlobs', 'additiveDirs', 'forceSyncGlobs', 'forceDeleteGlobs'):
+        if key in c and (not isinstance(c[key], list) or any(not isinstance(v, str) for v in c[key])):
+            raise ValueError(f'{key} must be a JSON array of strings.')
+    if 'allowEmptyClient' in c and type(c['allowEmptyClient']) is not bool:
+        raise ValueError('allowEmptyClient must be true or false, not a string.')
     raw = c.get('sourceClient', 'auto')
     if (not raw or raw == 'auto') and not require_source:
         source = root / 'main-client'
@@ -355,6 +363,9 @@ def publish(root, config):
                     raise ValueError(f'Private/server file cannot be distributed: {name}')
                 if not any(fnmatch.fnmatchcase(name.lower(), str(g).lower()) for g in c.get('excludeGlobs', [])):
                     add_file(source / name, name)
+            if not seen and not c.get('allowEmptyClient', False):
+                raise ValueError('No distributable client files found. Check sourceClient/includeRoots; '
+                                 'set allowEmptyClient=true only for an intentional empty release.')
             tools = ['player-update-generic.py', 'player-update-generic.ps1',
                      'portable-stage-daemon.py', 'portable-stage-daemon.ps1',
                      'portable-bootstrap-refresh.ps1', 'portable-windows-repair.ps1',

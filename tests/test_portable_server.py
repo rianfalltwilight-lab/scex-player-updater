@@ -245,6 +245,19 @@ class PortablePublishTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Unsafe'):
                 server.publish(root, c)
 
+    def test_empty_input_and_wrong_config_types_do_not_replace_release(self):
+        with fixture() as (root, c):
+            server.publish(root, c)
+            target = root / c['publishDir']
+            before = (target / 'server-manifest.json').read_bytes()
+            c['includeRoots'] = []
+            with self.assertRaisesRegex(ValueError, 'No distributable'):
+                server.publish(root, c)
+            self.assertEqual((target / 'server-manifest.json').read_bytes(), before)
+            c['includeRoots'] = 'mods'
+            with self.assertRaisesRegex(ValueError, 'JSON array'):
+                server.publish(root, c)
+
     def test_existing_lock_and_offline_source_for_serve(self):
         with fixture() as (root, c):
             with server.publish_lock(root):
