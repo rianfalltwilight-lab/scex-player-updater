@@ -296,7 +296,9 @@ class StandaloneEntryTests(unittest.TestCase):
             instance = self.create_client(root, '.minecraft/versions/Example')
             out = run(batch_command(entry), root,
                 {'PORTABLE_ENTRY_DETECT_ONLY': '1', 'PORTABLE_ENTRY_NO_PAUSE': '1'})
-            self.assertEqual(json.loads(out), [str(instance)])
+            detected = json.loads(out)
+            self.assertEqual(len(detected), 1)
+            self.assertTrue(Path(detected[0]).samefile(instance))
             run(batch_command(entry), root, {'PORTABLE_ENTRY_NO_PAUSE': '1'}, expected=7)
             self.assertTrue((instance / '_updater/called.txt').is_file())
 
