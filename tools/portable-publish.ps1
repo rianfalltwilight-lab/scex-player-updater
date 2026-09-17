@@ -539,7 +539,7 @@ Copy-ToolFile -SourceName 'portable-bootstrap-refresh.ps1' -DestinationName 'por
 Copy-ToolFile -SourceName 'portable-windows-repair.ps1' -DestinationName 'portable-windows-repair.ps1' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-windows-repair.bat' -DestinationName 'portable-windows-repair.bat' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-windows-sync.bat' -DestinationName 'Windows-sync.bat' -DestinationRoot $updaterRoot
-Copy-ToolFile -SourceName 'portable-windows-sync.bat' -DestinationName '更新mod-Windows端.bat' -DestinationRoot $publishDir
+Copy-ToolFile -SourceName 'portable-client-entry.bat' -DestinationName '更新mod-Windows端.bat' -DestinationRoot $publishDir
 Copy-ToolFile -SourceName 'portable-macos-sync.command' -DestinationName 'macOS-sync.command' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-macos-sync.command' -DestinationName '更新mod-Mac端.command' -DestinationRoot $publishDir
 Copy-ToolFile -SourceName 'player-self-repair.ps1' -DestinationName 'player-self-repair.ps1' -DestinationRoot $updaterRoot

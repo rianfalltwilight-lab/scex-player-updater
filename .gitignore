@@ -13,4 +13,6 @@ __pycache__/
 .portable-*/
 UPDATE-URL*.txt
 PORTABLE-UPDATE-URL.txt
-
+/.portable-publish-lock/
+**/.portable-build-*/
+**/.portable-backup-*/

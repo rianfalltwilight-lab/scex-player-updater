@@ -9,7 +9,9 @@
 ## 功能
 
 - 按清单 SHA-1 校验并增量下载；旧文件覆盖或移除时保留本地备份。
-- Python 同步器与 Windows PowerShell 同步器，Windows / macOS 启动入口。
+- Python 同步器与 Windows PowerShell 同步器，Windows / Linux / macOS 启动入口。
+- 通用服主入口自动识别 Windows/Linux、可用 Python、指定环境变量和常见客户端布局，缺项/多实例明确提示。
+- 玩家更新 BAT 可单独复制到启动器旁，自动查找已有更新器的实例；多实例由玩家选择。
 - 游戏期间可后台预下载到 `.portable-staging`，下一次启动前应用并重新核对。
 - 更新器自刷新、Windows 入口修复、客户端自助检查及按需修复。
 - 可配置保留玩家额外文件、本地配置改动与主动删除；也可显式指定强制同步、强制删除。
@@ -18,7 +20,19 @@
 
 ## 管理员快速开始
 
-发布器需要 Windows PowerShell 5.1 或 PowerShell 7；下载服务需要 Python 3.10+。玩家 Windows 入口优先使用 Python，未安装时使用系统 PowerShell；macOS 入口需要 `python3`。
+**Windows/Linux 通用入口（推荐新部署）**：只需 Python 3.10+，支持检测、初始化、发布和启动下载服务。Linux 无须 PowerShell。完整环境变量、目录识别、可移动 BAT 和回滚说明见 [通用部署指南](docs/PORTABLE-SETUP.md)。
+
+```sh
+sh tools/portable-server.sh doctor --source-client /srv/client-pack
+sh tools/portable-server.sh init --source-client /srv/client-pack --host update.example.com --bind 0.0.0.0
+# 编辑 tools/portable-pack.json 的整合包身份、版本和更新说明后：
+sh tools/portable-server.sh publish
+sh tools/portable-server.sh serve
+```
+
+Windows 将 `sh tools/portable-server.sh` 换成 `.\tools\portable-server.bat`，路径换成自己的客户端目录。`update.example.com` 是占位符；自动检测不猜测公网转发地址。通用发布器不捆绑启动器，也不查询第三方下载源。
+
+**已有 Windows PowerShell 发布流程**继续可用：发布器需要 Windows PowerShell 5.1 或 PowerShell 7；下载服务需要 Python 3.10+。玩家 Windows 入口优先使用 Python，未安装时使用系统 PowerShell；macOS 入口需要 `python3`。以下步骤对应原 PowerShell 流程：
 
 1. 下载或克隆仓库，复制配置：
 
@@ -50,7 +64,7 @@
 
 ## 玩家使用
 
-关闭游戏后，双击实例内的 `更新mod-Windows端.bat`；macOS 先执行 `chmod +x 更新mod-Mac端.command`，再运行。入口会在更新完成后尝试启动已有启动器，并可启动后台预下载。
+关闭游戏后，双击实例内的 `更新mod-Windows端.bat`，也可只把这个 BAT 复制到启动器旁。它会寻找附近的已配置实例，多份时先选择；`_updater` 和更新地址文件留在实例内。Windows 入口会在更新完成后尝试启动已有启动器，并可启动后台预下载。Linux/macOS 在实例内用 `sh 更新mod-Linux端.sh` / `sh 更新mod-Mac端.command` 运行通用发布器生成的入口；原 PowerShell 发布器生成的旧 macOS 入口仍用 `bash` 运行。
 
 只执行同步、不启动启动器或后台任务时：
 
@@ -85,3 +99,5 @@ python -m unittest discover -s tests -v
 ```
 
 测试使用临时客户端与本机随机端口，不连接生产更新源；Windows 自动测试 PowerShell 同步器与发布器，可用环境变量 `UPDATER_TEST_POWERSHELL` 指定 `pwsh.exe`。测试结束关闭服务并清理临时数据。
+
+GitHub CI 同时覆盖 Windows、Ubuntu 与 Python 3.10/3.12。通用发布、实际 HTTP 下载与增量同步、失败恢复、目录识别和 Windows 可移动 BAT 均使用合成数据验收；不启动 Minecraft 或操作生产服务器。

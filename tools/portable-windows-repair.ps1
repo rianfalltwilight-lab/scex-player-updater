@@ -219,7 +219,7 @@ $instanceCopy = Join-Path $instanceDir '更新mod-Windows端.bat'
 if (Test-Path -LiteralPath $instanceCopy -PathType Leaf) {
     $copyBytes = [IO.File]::ReadAllBytes($instanceCopy)
     $copyText = [Text.Encoding]::UTF8.GetString($copyBytes)
-    if ($copyBytes.Length -gt 2000 -or $copyText -match 'PORTABLE_SYNC_BOOTSTRAPPED') {
+    if ($copyText -notmatch '(?m)^# PORTABLE_ENTRY_SCRIPT\r?$' -and ($copyBytes.Length -gt 2000 -or $copyText -match 'PORTABLE_SYNC_BOOTSTRAPPED')) {
         if (Install-Bat -Source $source -Dest $instanceCopy) {
             Write-Host '[修复] 已写入实例目录的 更新mod-Windows端.bat' -ForegroundColor Green
         }

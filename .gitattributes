@@ -3,5 +3,6 @@
 *.ps1 -text
 *.py text eol=lf
 *.command text eol=lf
+*.sh text eol=lf
 *.md text eol=lf
 *.json text eol=lf

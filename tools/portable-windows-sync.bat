@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
 rem ============================================================
 rem Portable player sync launcher (maintenance notes)
@@ -20,13 +20,13 @@ if defined PORTABLE_SYNC_BOOTSTRAPPED goto :Main
 rem Wrapper uses delayed expansion to return the child exit code on one
 rem line; everything after cmd /c must stay on that same line because
 rem this file may get overwritten by the sync right afterwards.
-setlocal EnableDelayedExpansion
 set "PORTABLE_SYNC_HOME=%~dp0"
 set "PORTABLE_SYNC_BOOTSTRAPPED=1"
 set "_PSYNC_TMP=%TEMP%\portable-sync-run-%RANDOM%%RANDOM%.bat"
 copy /y "%~f0" "%_PSYNC_TMP%" >nul 2>nul
 if not exist "%_PSYNC_TMP%" goto :Main
-cmd /c ""%_PSYNC_TMP%"" & set "_PSYNC_CODE=!ERRORLEVEL!" & del "%_PSYNC_TMP%" >nul 2>nul & exit /b !_PSYNC_CODE!
+setlocal EnableDelayedExpansion
+cmd /d /v:off /c ""!_PSYNC_TMP!"" & set "_PSYNC_CODE=!ERRORLEVEL!" & del "%_PSYNC_TMP%" >nul 2>nul & exit /b !_PSYNC_CODE!
 
 :Main
 if defined PORTABLE_SYNC_HOME (cd /d "%PORTABLE_SYNC_HOME%") else (cd /d "%~dp0")
@@ -76,6 +76,7 @@ if "%code%"=="9009" (
 )
 :AfterSync
 if not "%code%"=="0" goto :SyncFailed
+if "%PORTABLE_SYNC_ONLY%"=="1" exit /b %code%
 
 rem Launch the background staging daemon as an independent process (survives this
 rem window closing). It pre-downloads future updates into .portable-staging while
