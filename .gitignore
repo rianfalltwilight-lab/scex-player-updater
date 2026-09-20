@@ -1,4 +1,5 @@
 /tools/portable-pack.json
+/tools/cloud.local.json
 /.update-server-token
 *.pem
 *.key

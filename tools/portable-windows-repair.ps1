@@ -74,7 +74,7 @@ function Save-DirectFile {
     $hostHeader = $null
     try {
         $uri = [Uri]$Url
-        if ($uri.HostNameType -eq [UriHostNameType]::Dns) {
+        if ($uri.Scheme -eq 'http' -and $uri.HostNameType -eq [UriHostNameType]::Dns) {
             $ipv4 = [Net.Dns]::GetHostAddresses($uri.Host) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
             if ($ipv4) {
                 $builder = New-Object UriBuilder $uri

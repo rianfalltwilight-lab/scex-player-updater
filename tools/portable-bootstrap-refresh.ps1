@@ -74,7 +74,7 @@ function Save-DirectFile {
     $hostHeader = $null
     try {
         $uri = [Uri]$Url
-        if ($uri.HostNameType -eq [UriHostNameType]::Dns) {
+        if ($uri.Scheme -eq 'http' -and $uri.HostNameType -eq [UriHostNameType]::Dns) {
             $ipv4 = [Net.Dns]::GetHostAddresses($uri.Host) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
             if ($ipv4) {
                 $builder = New-Object UriBuilder $uri
@@ -167,10 +167,11 @@ $addUrl = {
     $v = ([string]$Value).Trim()
     if (-not [string]::IsNullOrWhiteSpace($v) -and $seenUrl.Add($v)) { [void]$ordered.Add($v) }
 }
-if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 $publicUrls = @($urls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
 $candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($urls) }
+if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in $candidates) { & $addUrl $u }
+if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 $urls = @($ordered)
 $selected = ''
 $selectedIndex = -1

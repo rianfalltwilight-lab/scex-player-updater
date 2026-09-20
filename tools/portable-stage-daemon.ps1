@@ -413,10 +413,11 @@ $addUrl = {
     $v = ([string]$Value).Trim()
     if (-not [string]::IsNullOrWhiteSpace($v) -and $seenUrl.Add($v)) { [void]$ordered.Add($v) }
 }
-if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 $publicUrls = @($manifestUrls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
 $candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($manifestUrls) }
+if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in $candidates) { & $addUrl $u }
+if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 $manifestUrls = @($ordered)
 $manifestUrl = ""
 $selectedIndex = -1
@@ -519,7 +520,12 @@ function Save-StagedEntry {
             break
         }
     }
-    Save-StagedFile -Url (Join-UrlPath -BaseUrl $BaseUrl -Rel $Rel) -Destination $Destination -ExpectedSha1 $ExpectedSha1
+    $remote = $Rel
+    if ($File -and $File.PSObject.Properties['downloadPath']) {
+        $remote = [string]$File.downloadPath
+        if ($remote -cne $Rel -and $remote -cnotmatch '^blobs/[0-9a-f]{64}$') { throw 'Invalid cloud downloadPath' }
+    }
+    Save-StagedFile -Url (Join-UrlPath -BaseUrl $BaseUrl -Rel $remote) -Destination $Destination -ExpectedSha1 $ExpectedSha1
     return 'home'
 }
 

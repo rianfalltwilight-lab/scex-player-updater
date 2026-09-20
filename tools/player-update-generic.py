@@ -47,6 +47,10 @@ def fetch_bytes(url: str, timeout: float = 20) -> bytes:
     """直连下载。优先 IPv4，避免 macOS 先卡在不通的 AAAA 上直到超时。"""
     req = urllib.request.Request(url, headers={"User-Agent": _SYNC_UA})
     parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == 'https':
+        # Keep the DNS name for TLS SNI and certificate verification.
+        with _DIRECT_OPENER.open(req, timeout=timeout) as response:
+            return response.read()
     host = parsed.hostname
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     path = parsed.path or "/"
@@ -357,10 +361,12 @@ def order_manifest_urls(urls, last_good: str = "") -> list:
     public = [url for url in (urls or []) if not is_private_update_url(url)]
     # 玩家自己把 UPDATE-URL 写成局域网地址时保留；自动探测产生的 192.168 一律丢掉。
     candidates = public or list(urls or [])
-    if last_good and not is_private_update_url(last_good):
+    if last_good in candidates and not is_private_update_url(last_good):
         add(last_good)
     for url in candidates:
         add(url)
+    if last_good and not is_private_update_url(last_good):
+        add(last_good)
     return out
 
 
@@ -582,8 +588,11 @@ def download_manifest_entry(item, base_url: str, dest: pathlib.Path, expected_sh
     size = 0
     if isinstance(item, dict):
         size = item.get("size") or 0
+    remote = item.get("downloadPath", rel) if isinstance(item, dict) else rel
+    if remote != rel and not re.fullmatch(r"blobs/[0-9a-f]{64}", str(remote)):
+        raise ValueError("Invalid cloud downloadPath")
     download_file(
-        url_for(base_url, rel), dest, expected_sha1,
+        url_for(base_url, remote), dest, expected_sha1,
         opener=_DIRECT_OPENER, timeout=home_timeout_sec(size),
     )
     return "home"

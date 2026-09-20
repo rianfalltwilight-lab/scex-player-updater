@@ -285,8 +285,9 @@ function Get-OrderedManifestUrls {
     }
     $public = @($Urls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
     $candidates = if ($public.Count -gt 0) { $public } else { @($Urls) }
-    if (-not [string]::IsNullOrWhiteSpace($LastGood) -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
+    if ($candidates -contains $LastGood -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
     foreach ($u in $candidates) { & $add $u }
+    if (-not [string]::IsNullOrWhiteSpace($LastGood) -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
     return @($out)
 }
 
@@ -343,7 +344,7 @@ function New-DirectHttpRequest {
     if (-not $AllowProxy) {
         try {
             $uri = [Uri]$Url
-            if ($uri.HostNameType -eq [UriHostNameType]::Dns) {
+            if ($uri.Scheme -eq 'http' -and $uri.HostNameType -eq [UriHostNameType]::Dns) {
                 $ipv4 = [Net.Dns]::GetHostAddresses($uri.Host) |
                     Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
                     Select-Object -First 1
@@ -587,7 +588,12 @@ function Download-ManifestEntry {
             $homeTimeout = [Math]::Max(120, [Math]::Min(300, [int]([int64]$File.size / 131072) + 60))
         }
     } catch { $homeTimeout = 180 }
-    Download-ManifestFile -Url (Join-UrlPath -BaseUrl $BaseUrl -Rel $Rel) -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec $homeTimeout
+    $remote = $Rel
+    if ($File -and $File.PSObject.Properties['downloadPath']) {
+        $remote = [string]$File.downloadPath
+        if ($remote -cne $Rel -and $remote -cnotmatch '^blobs/[0-9a-f]{64}$') { throw 'Invalid cloud downloadPath' }
+    }
+    Download-ManifestFile -Url (Join-UrlPath -BaseUrl $BaseUrl -Rel $remote) -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec $homeTimeout
     return 'home'
 }
 

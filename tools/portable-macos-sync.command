@@ -69,6 +69,9 @@ urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHa
 
 def fetch_bytes(url, timeout=12):
     parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == 'https':
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.read()
     host = parsed.hostname
     port = parsed.port or 80
     path = parsed.path or "/"
@@ -140,10 +143,12 @@ def add(url):
     ordered.append(key)
 public = [url for url in manifest_urls if not is_private_update_url(url)]
 candidates = public or list(manifest_urls)
-if last_good and not is_private_update_url(last_good):
+if last_good in candidates and not is_private_update_url(last_good):
     add(last_good)
 for url in candidates:
     add(url)
+if last_good and not is_private_update_url(last_good):
+    add(last_good)
 manifest_urls = ordered
 script_dir = pathlib.Path(sys.argv[2]).resolve()
 self_path = pathlib.Path(sys.argv[3]).resolve()

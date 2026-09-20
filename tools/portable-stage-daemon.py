@@ -16,6 +16,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import ipaddress
+import re
 import json
 import os
 import pathlib
@@ -140,10 +141,12 @@ def order_update_urls(urls: list, last_good: str = "") -> list:
 
     public = [url for url in (urls or []) if not is_private_update_url(url)]
     candidates = public or list(urls or [])
-    if last_good and not is_private_update_url(last_good):
+    if last_good in candidates and not is_private_update_url(last_good):
         add(last_good)
     for url in candidates:
         add(url)
+    if last_good and not is_private_update_url(last_good):
+        add(last_good)
     return out
 
 
@@ -388,7 +391,10 @@ def download_staged_entry(item, base: str, dest: pathlib.Path, expected: str, re
                 _OFFICIAL_SKIP = True
                 log(log_path, "[预下载] 官方源本轮不再尝试，其余文件直接走更新服务。")
             break
-    download_verify(url_for(base, rel), dest, expected, opener=_DIRECT_OPENER)
+    remote = item.get("downloadPath", rel) if isinstance(item, dict) else rel
+    if remote != rel and not re.fullmatch(r"blobs/[0-9a-f]{64}", str(remote)):
+        raise ValueError("Invalid cloud downloadPath")
+    download_verify(url_for(base, remote), dest, expected, opener=_DIRECT_OPENER)
     return "home"
 
 
