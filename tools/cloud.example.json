@@ -1,9 +1,9 @@
 {
-  "endpointUrl": "https://s3.7caiyun.com",
-  "region": "us-west",
+  "endpointUrl": "https://s3.YOUR_PROVIDER.example",
+  "region": "YOUR_REGION",
   "bucket": "YOUR_BUCKET",
   "prefix": "scex-updates",
-  "publicBaseUrl": "https://YOUR_BUCKET.cdn.7caiyun.com/scex-updates",
+  "publicBaseUrl": "https://YOUR_BUCKET.cdn.YOUR_PROVIDER.example/scex-updates",
   "accessKeyEnv": "SCEX_CLOUD_ACCESS_KEY",
   "secretKeyEnv": "SCEX_CLOUD_SECRET_KEY"
 }

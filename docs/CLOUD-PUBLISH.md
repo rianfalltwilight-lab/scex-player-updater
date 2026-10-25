@@ -25,7 +25,7 @@
 从 `tools/cloud.example.json` 复制到 `tools/cloud.local.json`，填写实际桶参数。
 `publicBaseUrl` 必须是**包含 prefix 的完整公开目录**，如
 `https://example.cdn.provider.com/scex-updates`；不能只填写域名。
-配置模板中的七彩云参数是参考值，必须按自己的控制台及实测核对。
+配置模板中的地址和区域是占位值，必须按自己服务商的控制台及实测填写。
 AK/SK 通过 `SCEX_CLOUD_ACCESS_KEY`、`SCEX_CLOUD_SECRET_KEY` 环境变量提供，
 不放入玩家文件或仓库。子账号只授权专用更新目录。
 
@@ -107,4 +107,4 @@ python -m unittest discover -s tests -v
 
 `test_cloud_publish.py` 和 `test_cloud_staging.py` 使用内存对象存储模拟故障、竞争、分阶段激活与候选变化，并以真实本地 HTTP
 测试 Windows/Python 玩家同步、中文路径、资源包和个人文件保护。
-本地通过不代表七彩云实测通过。
+本地通过不代表真实存储桶实测通过。
