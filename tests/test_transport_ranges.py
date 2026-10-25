@@ -10,6 +10,13 @@ import tempfile
 import threading
 import unittest
 from unittest import mock
+import sys
+
+# macOS keeps temp folders under /var, a symlink to /private/var; the updaters refuse
+# paths through links, so tests work in the real location (Windows keeps 8.3 TEMP).
+if sys.platform == 'darwin':
+    tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = Path(os.environ.get('UPDATER_TRANSPORT_TOOLS', ROOT / 'tools'))

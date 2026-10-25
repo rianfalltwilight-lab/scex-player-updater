@@ -1,6 +1,12 @@
 import ctypes,hashlib,http.server,importlib.util,io,json,os,pathlib,subprocess,sys,tempfile,threading,unittest,urllib.error
 from ctypes import wintypes
 from unittest import mock
+
+# macOS keeps temp folders under /var, a symlink to /private/var; the updaters refuse
+# paths through links, so tests work in the real location (Windows keeps 8.3 TEMP).
+if sys.platform == 'darwin':
+    tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 CANDIDATE=pathlib.Path(os.environ.get('SCEX_UPDATER_TEST_PATH', str(ROOT/'tools'/'player-update-generic.py')))
 WINDOWS=os.name == 'nt'

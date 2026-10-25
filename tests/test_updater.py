@@ -15,6 +15,12 @@ import tempfile
 import threading
 import unittest
 
+# macOS keeps temp folders under /var, a symlink to /private/var; the updaters refuse
+# paths through links, so tests work in the real location (Windows keeps 8.3 TEMP).
+if sys.platform == 'darwin':
+    tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
+
 ROOT = Path(__file__).resolve().parents[1]
 PS = os.environ.get('UPDATER_TEST_POWERSHELL') or shutil.which('powershell.exe')
 

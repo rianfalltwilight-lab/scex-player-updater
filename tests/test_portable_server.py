@@ -16,6 +16,12 @@ import unittest
 from unittest import mock
 import urllib.request
 
+# macOS keeps temp folders under /var, a symlink to /private/var; the updaters refuse
+# paths through links, so tests work in the real location (Windows keeps 8.3 TEMP).
+if sys.platform == 'darwin':
+    tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('portable_server', ROOT / 'tools/portable_server.py')
 server = importlib.util.module_from_spec(spec)
@@ -109,6 +115,7 @@ class DetectionTests(unittest.TestCase):
             run(cli, root.parent, expected=2)
             self.assertEqual(config.read_bytes(), before)
 
+    @unittest.skipIf(sys.version_info < (3, 10), 'the server kit requires Python 3.10+')
     def test_native_server_entry_and_custom_config(self):
         with fixture() as (root, c):
             if os.name == 'nt':

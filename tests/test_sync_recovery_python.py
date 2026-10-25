@@ -14,6 +14,12 @@ import unittest
 import urllib.error
 from unittest import mock
 
+# macOS keeps temp folders under /var, a symlink to /private/var; the updaters refuse
+# paths through links, so tests work in the real location (Windows keeps 8.3 TEMP).
+if sys.platform == 'darwin':
+    tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
+
 ROOT = Path(__file__).resolve().parents[1]
 UPDATER = Path(os.environ.get('SCEX_UPDATER_TEST_PATH', str(ROOT / 'tools/player-update-generic.py')))
 PS = shutil.which('powershell.exe')
