@@ -119,8 +119,25 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual((outside / 'marker.txt').read_bytes(), b'old')
             self.assertEqual(self.u.existing_hash_index(client), {})
         finally:
-            self.assertTrue(junction.is_junction())
+            self.assertEqual(os.lstat(junction).st_reparse_tag, 0xA0000003)  # Path.is_junction() needs 3.12
             os.rmdir(junction)
+
+    @unittest.skipUnless(os.name == 'nt' and PS, 'Windows junctions')
+    def test_wildcard_cleanup_does_not_walk_into_a_junction(self):
+        outside = self.root / 'outside-walk'
+        outside.mkdir()
+        (outside / 'foreign.disabled').write_bytes(b'not ours')
+        client = self.root / 'client-walk'
+        write(client, 'mods/old.disabled', b'ours')
+        junction = client / 'linked'
+        script = "New-Item -ItemType Junction -Path '" + str(junction) + "' -Target '" + str(outside) + "' | Out-Null"
+        subprocess.run([PS, '-NoProfile', '-Command', script], check=True, capture_output=True)
+        try:
+            found = self.u.cleanup_candidates(client, ['*.disabled'])
+            self.assertEqual([p.relative_to(client).as_posix() for p in found], ['mods/old.disabled'])
+        finally:
+            os.rmdir(junction)
+        self.assertTrue((outside / 'foreign.disabled').is_file())
 
     def test_backup_keeps_original_before_defaults_and_resource_pack_merge(self):
         original = b'lang:en_us\nresourcePacks:["vanilla"]\n'
