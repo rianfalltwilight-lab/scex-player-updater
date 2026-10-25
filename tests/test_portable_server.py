@@ -239,6 +239,9 @@ class PortablePublishTests(unittest.TestCase):
                 server.publish(root, c)
             link.unlink()
             write(root, 'main-client/config/Example.txt', b'collision')
+            names = [p.name for p in (root / 'main-client/config').iterdir()]
+            if len({n.lower() for n in names}) == len(names):
+                return  # case-insensitive filesystem (macOS default): no second file exists
             with self.assertRaisesRegex(ValueError, 'Case-colliding'):
                 server.publish(root, c)
 
