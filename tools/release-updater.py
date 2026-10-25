@@ -569,11 +569,14 @@ class Release:
                 (folder / ".portable-sync-state.json").write_text(json.dumps({"format": 3, "version": previous["version"], "files": rows}), encoding="utf-8")
                 return folder
 
-            def check(folder, label):
+            def check(folder, label, signed=True):
+                """Rows match this release; signed=False for previous engines, which do not
+                know signatures (the next run with the new engine turns the requirement on)."""
                 wrong = [p for p, s in expected.items() if not (folder / p).is_file() or hashlib.sha1((folder / p).read_bytes()).hexdigest() != s]
                 state = read_json(folder / ".portable-sync-state.json")
                 gone = [r["path"] for r in old_rows if r["path"] not in expected and (folder / r["path"]).exists()]
-                assert not wrong and not gone and state.get("version") == self.version and state.get("manifestSignature") == "required", (label, wrong, gone, state.get("version"))
+                sticky = state.get("manifestSignature") == "required"
+                assert not wrong and not gone and state.get("version") == self.version and (sticky or not signed), (label, wrong, gone, state.get("version"), sticky)
                 return sorted(p.name for p in folder.iterdir() if p.is_file() and not p.name.startswith("."))
 
             def run(argv, cwd, **env):
@@ -599,7 +602,12 @@ class Release:
                     code, out = run([a.replace("{u}", str(engine)).replace("{c}", str(folder)) for a in argv], folder)
                     (self.out / f"e2e-{label}.log").write_text(out, encoding="utf-8")
                     assert code == 0, (label, out[-1500:])
-                    report[label] = {"rootFilesAfter": check(folder, label)}
+                    check(folder, label, signed=False)
+                    # The next run uses the engine that the previous one just installed.
+                    code, out = run([a.replace("{u}", str(folder / "_updater")).replace("{c}", str(folder)) for a in argv], folder)
+                    (self.out / f"e2e-{label}2.log").write_text(out, encoding="utf-8")
+                    assert code == 0 and "清单签名校验通过" in out, (label, out[-1500:])
+                    report[label] = {"rootFilesAfter": check(folder, label), "nextRunVerifiedSignature": True}
             finally:
                 server.shutdown()
                 server.server_close()
