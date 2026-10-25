@@ -31,6 +31,31 @@ function Get-Sha1 {
     }
 }
 
+
+function Stop-PreviousWatch {
+    param([string]$Root)
+    $record = Join-Path $Root '.portable-staging\daemon.lock'
+    if (-not (Test-Path -LiteralPath $record -PathType Leaf)) { return }
+    $oldPid = 0
+    [void][int]::TryParse(([IO.File]::ReadAllText($record)).Trim(), [ref]$oldPid)
+    $process = if ($oldPid -gt 0) { Get-CimInstance Win32_Process -Filter ("ProcessId=$oldPid") -ErrorAction Stop }
+    if ($process) {
+        $line = [string]$process.CommandLine
+        $rootPattern = [regex]::Escape(([IO.Path]::GetFullPath($Root)).TrimEnd('\', '/'))
+        $sameInstance = $line -match ('(?i)(?:--instance-dir|-InstanceDir)\s+"?' + $rootPattern + '[\\/]?"?(?:\s|$)')
+        if ($line -match '(?i)portable-stage-daemon\.(?:ps1|py)(?:"|\s|$)' -and $sameInstance -and $line -match '(?i)(?:--mode|-Mode)\s+"?watch(?:"|\s|$)') {
+            Stop-Process -Id $oldPid -Force -ErrorAction Stop
+            Wait-Process -Id $oldPid -Timeout 5 -ErrorAction SilentlyContinue
+            if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) { throw '旧后台预下载仍在运行，请关闭后重试。' }
+            Write-Host '[更新器] 已停止本实例的旧后台预下载。'
+        }
+    }
+    # A missing process or a reused PID is a stale record, never a reason to kill another process.
+    if (Test-Path -LiteralPath $record -PathType Leaf) {
+        if (([IO.File]::ReadAllText($record)).Trim() -eq [string]$oldPid) { Remove-Item -LiteralPath $record -Force }
+    }
+}
+
 function Read-UpdateUrls {
     param([string]$Root, [string]$ToolsRoot, [string]$Override)
     $urls = New-Object 'System.Collections.Generic.List[string]'
@@ -41,11 +66,11 @@ function Read-UpdateUrls {
         if (-not [string]::IsNullOrWhiteSpace($v) -and -not $v.StartsWith('#') -and $seen.Add($v)) { [void]$urls.Add($v) }
     }
     if (-not [string]::IsNullOrWhiteSpace($Override)) {
-        & $add $Override
+        foreach ($line in ($Override -split '[\r\n\x1f]+')) { & $add $line }
         return @($urls.ToArray())
     }
     $relative = @(
-        'UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt'
+        'UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', 'UPDATE-URL-LAN.txt'
     )
     foreach ($base in @($Root, $ToolsRoot)) {
         foreach ($rel in $relative) {
@@ -108,15 +133,16 @@ function Save-DirectFile {
     }
 }
 
-function Test-ManifestUrl {
+function Read-ManifestUrl {
     param([string]$Url, [int]$TimeoutSec = 8)
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('portable-manifest-' + [guid]::NewGuid().ToString('N') + '.json')
     try {
         Save-DirectFile -Url $Url -Path $temp -TimeoutSec $TimeoutSec
         $manifest = Get-Content -LiteralPath $temp -Raw -Encoding UTF8 | ConvertFrom-Json
-        return ($null -ne $manifest -and $null -ne $manifest.files)
+        if ($null -ne $manifest -and $null -ne $manifest.files) { return $manifest }
+        return $null
     } catch {
-        return $false
+        return $null
     } finally {
         if (Test-Path -LiteralPath $temp -PathType Leaf) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
     }
@@ -146,6 +172,7 @@ function Install-RefreshedFile {
 
 $instanceRoot = [IO.Path]::GetFullPath($InstanceDir)
 $toolsRoot = [IO.Path]::GetFullPath($ScriptDir)
+try { Stop-PreviousWatch -Root $instanceRoot } catch { Write-Host '[更新器] 无法安全停止旧后台预下载，请关闭该实例的更新器后重试。'; exit 1 }
 $urls = @(Read-UpdateUrls -Root $instanceRoot -ToolsRoot $toolsRoot -Override $ManifestUrl)
 if ($urls.Count -eq 0) {
     Write-Host '[更新器] 未找到更新地址，跳过自刷新。'
@@ -176,9 +203,12 @@ if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUr
 foreach ($u in @($urls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
 $urls = @($ordered)
 $selected = ''
+$selectedManifest = $null
 $selectedIndex = -1
 for ($i = 0; $i -lt $urls.Count; $i++) {
-    if (Test-ManifestUrl -Url ([string]$urls[$i]) -TimeoutSec 8) {
+    $probe = Read-ManifestUrl -Url ([string]$urls[$i]) -TimeoutSec 8
+    if ($null -ne $probe) {
+        $selectedManifest = $probe
         $selected = [string]$urls[$i]
         $selectedIndex = $i
         break
@@ -192,6 +222,13 @@ if ($selectedIndex -gt 0) { Write-Host '[更新器] 已切换到备用更新地�
 $base = $selected.Substring(0, $selected.LastIndexOf('/'))
 $names = @('player-update-generic.ps1', 'player-update-generic.py', 'portable-stage-daemon.ps1', 'portable-stage-daemon.py', 'portable-bootstrap-refresh.ps1', 'macOS-sync.command', 'Windows-sync.bat')
 foreach ($name in $names) {
+    $entries = @($selectedManifest.files | Where-Object { ([string]$_.path).Replace('\', '/') -ieq ('_updater/' + $name) })
+    if ($entries.Count -ne 1 -or ([string]$entries[0].sha1) -notmatch '^[0-9a-fA-F]{40}$' -or ([string]$entries[0].size) -notmatch '^\d+$') {
+        Write-Host "[更新器] 清单未提供有效校验信息，保留本地 $name。"
+        continue
+    }
+    $expectedHash = ([string]$entries[0].sha1).ToLowerInvariant()
+    $expectedSize = [long]$entries[0].size
     $url = $base + '/_updater/' + [Uri]::EscapeDataString($name) + '?t=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $destination = Join-Path $toolsRoot $name
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('portable-refresh-' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -200,7 +237,7 @@ foreach ($name in $names) {
         for ($attempt = 1; $attempt -le 2 -and -not $done; $attempt++) {
             try {
                 Save-DirectFile -Url $url -Path $temp -TimeoutSec 8
-                if ((Get-Item -LiteralPath $temp).Length -le 0) { throw 'empty download' }
+                if ((Get-Item -LiteralPath $temp).Length -ne $expectedSize -or (Get-Sha1 -Path $temp) -ne $expectedHash) { throw '清单大小或 SHA1 校验失败' }
                 $done = $true
             } catch {
                 if ($attempt -eq 2) { Write-Host ("[更新器] 跳过自刷新 $name（更新源暂时不可达或文件校验失败）。") }

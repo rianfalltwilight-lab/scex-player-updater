@@ -13,6 +13,7 @@
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$explicitManifestUrl = $ManifestUrl
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
 
@@ -40,8 +41,17 @@ function Test-RelativePathSafe([string]$Rel) {
     return $true
 }
 function Join-Safe([string]$Root, [string]$Rel) {
-    if (-not (Test-RelativePathSafe $Rel)) { throw "不安全路径: $Rel" }
-    return Join-Path $Root ((Normalize-Rel $Rel).Replace('/', [IO.Path]::DirectorySeparatorChar))
+    if ([IO.Path]::IsPathRooted($Rel) -or $Rel -match ':' -or $Rel -match '(^|[\\/])\.\.?([\\/]|$)') { throw "[路径错误] 清单路径不安全：$Rel" }
+    if (-not (Test-RelativePathSafe $Rel)) { throw "[路径错误] 清单路径不安全：$Rel" }
+    $rootFull=[IO.Path]::GetFullPath($Root).TrimEnd('\','/')
+    $target=[IO.Path]::GetFullPath((Join-Path $rootFull ($Rel.Replace('/',[IO.Path]::DirectorySeparatorChar))))
+    if (-not $target.StartsWith($rootFull+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw "[路径错误] 文件越出实例目录：$Rel" }
+    $cursor=$target
+    while ($cursor -and $cursor.Length -ge $rootFull.Length) {
+        if (Test-Path -LiteralPath $cursor) { if ([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint) { throw "[路径错误] 路径包含链接，已停止修复：$Rel" } }
+        if ($cursor -eq $rootFull) { break };$cursor=Split-Path -Parent $cursor
+    }
+    return $target
 }
 function New-DirectHttpRequest([string]$Url, [int]$TimeoutSec = 30, [switch]$AllowProxy) {
     # 家宽和官方源都直连。系统代理下 Timeout 经常不生效，会卡数分钟。
@@ -112,24 +122,20 @@ function Save-UrlToFile([string]$Url, [string]$Path, [int]$TimeoutSec = 90, [swi
 }
 function Download-FileChecked([string]$Url, [string]$Dest, [string]$ExpectedSha1, [switch]$AllowProxy, [int]$TimeoutSec = 90) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $Dest) | Out-Null
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('repair-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $tmp=Join-Path (Split-Path -Parent $Dest) ('.repair-'+[guid]::NewGuid().ToString('N')+'.tmp')
     try {
-        Save-UrlToFile -Url $Url -Path $tmp -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy
-        $actual = Get-Sha1 $tmp
-        if ($actual -ne $ExpectedSha1.ToLowerInvariant()) {
-            throw "SHA1 不匹配 expected=$ExpectedSha1 actual=$actual"
-        }
-        Move-Item -LiteralPath $tmp -Destination $Dest -Force
-    } finally {
-        if (Test-Path -LiteralPath $tmp) { Remove-Item $tmp -Force -EA SilentlyContinue }
-    }
+        try { Save-UrlToFile -Url $Url -Path $tmp -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy }
+        catch { throw (Format-RepairError $_ $Dest '下载') }
+        if ((Get-Sha1 $tmp) -ne $ExpectedSha1.ToLowerInvariant()) { throw "[校验失败] 下载内容与清单不一致：$Dest；原文件已保留。" }
+        Install-RepairFile -Temporary $tmp -Destination $Dest
+    } finally { if ([IO.File]::Exists($tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
 }
 function Download-RepairEntry($File, [string]$FileBaseUrl, [string]$Dest, [string]$ExpectedSha1, [string]$Rel) {
     foreach ($url in @(Get-OfficialFileUrls $File)) {
         try {
             Download-FileChecked -Url $url -Dest $Dest -ExpectedSha1 $ExpectedSha1 -TimeoutSec 8
             return
-        } catch {}
+        } catch { if ($_.Exception.Message -match '^\[(文件占用|权限不足|空间不足|安装失败|路径错误)\]') { throw } }
     }
     $parts = ($Rel -replace '\\', '/').Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }
     Download-FileChecked -Url ($FileBaseUrl + ($parts -join '/')) -Dest $Dest -ExpectedSha1 $ExpectedSha1
@@ -215,6 +221,65 @@ function Find-JavaInfo([int]$RequiredMajor = 0) {
     return $info
 }
 
+
+# REPAIR_SAFETY_V2: use the same persistent exclusive lock as the main updater.
+function Enter-RepairLock([string]$Root) {
+    try { return [IO.File]::Open((Join-Path $Root '.portable-sync.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { throw '[更新进行中] 此实例已有更新或修复任务，请等待该窗口结束后重试。' }
+}
+function Format-RepairError($ErrorRecord, [string]$Path = '', [string]$Phase = '修复') {
+    $ex=$ErrorRecord.Exception; $code=0
+    while ($ex) {
+        if ([string]$ex.Message -match '(\[(文件占用|更新进行中|权限不足|空间不足|校验失败|路径错误|下载失败|修复失败|安装失败)\].*)') { return $Matches[1] }
+        $native=$ex.HResult -band 65535
+        if ($native -in @(5,32,33,39,112)) { $code=$native }
+        $ex=$ex.InnerException
+    }
+    if ($code -in @(32,33)) { return "[文件占用] $Path。请完全退出 Minecraft，关闭打开此文件的程序后重试；原文件已保留。" }
+    if ($code -eq 5) { return "[权限不足] $Path。请检查文件权限和安全软件拦截后重试。" }
+    if ($code -in @(39,112)) { return "[空间不足] $Path。请腾出目标磁盘空间后重试。" }
+    if ($Phase -eq '下载') { return "[下载失败] $Path。无法取得更新内容，请检查网络或稍后重试。" }
+    return "[修复失败] $Path。操作未完成，请保留窗口截图联系管理员。"
+}
+function Assert-RepairPathsAvailable($Paths) {
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($path in $Paths) {
+        if (-not $seen.Add([string]$path) -or -not [IO.File]::Exists($path)) { continue }
+        $handle=$null
+        try { $handle=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None) }
+        catch { throw (Format-RepairError $_ $path) }
+        finally { if($handle){$handle.Dispose()} }
+    }
+}
+function Install-RepairFile([string]$Temporary,[string]$Destination) {
+    $attributes=$null
+    try {
+        if ([IO.File]::Exists($Destination)) {
+            $attributes=[IO.File]::GetAttributes($Destination)
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw "[路径错误] 目标是链接，已停止替换：$Destination" }
+            if ($attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($Destination,($attributes -band (-bnot [IO.FileAttributes]::ReadOnly))) }
+            [IO.File]::Replace($Temporary,$Destination,[NullString]::Value)
+        } else { [IO.File]::Move($Temporary,$Destination) }
+    } catch {
+        if ($null -ne $attributes -and [IO.File]::Exists($Destination)) { [IO.File]::SetAttributes($Destination,$attributes) }
+        throw (Format-RepairError $_ $Destination)
+    }
+}
+function Get-RepairProperty($Object,[string]$Name,$Default=$null) {
+    if ($null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]) { return $Object.$Name }
+    return $Default
+}
+function Test-RepairGlob([string]$Rel,$Globs) {
+    foreach($glob in @($Globs)) { if($Rel.Replace('\','/') -like ([string]$glob).Replace('\','/')){return $true} }
+    return $false
+}
+function Get-RepairMaskedUrl([string]$Url) {
+    if ($Url -like 'file:*') { return '本地清单' }
+    try { $uri=[Uri]$Url;return [regex]::Replace($uri.GetLeftPart([UriPartial]::Path), '(?<=^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/)[^/]+(?=/)', '***') } catch { return '更新地址' }
+}
+
+$repairLock=$null
+try {
 $instanceRoot = if ([IO.Path]::IsPathRooted($InstanceDir)) {
     [IO.Path]::GetFullPath($InstanceDir)
 } else {
@@ -224,10 +289,11 @@ if (-not (Test-Path -LiteralPath $instanceRoot -PathType Container)) {
     throw "实例目录不存在: $instanceRoot"
 }
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$repairLock=Enter-RepairLock $instanceRoot
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $diagId = 'RPR-' + $stamp + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 6).ToUpperInvariant())
 $outDir = Join-Path $instanceRoot ('_repair\' + $stamp)
-New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
 
 $missing = New-Object System.Collections.Generic.List[object]
 $mismatch = New-Object System.Collections.Generic.List[object]
@@ -243,7 +309,7 @@ $serverReachable = $false
 
 # UPDATE-URL：支持多行候选地址，按顺序尝试；局域网用户可在公网地址失败后回落到 LAN。
 $rawUrlValues = New-Object 'System.Collections.Generic.List[string]'
-if (-not [string]::IsNullOrWhiteSpace($ManifestUrl)) { [void]$rawUrlValues.Add($ManifestUrl) }
+if (-not [string]::IsNullOrWhiteSpace($explicitManifestUrl)) { [void]$rawUrlValues.Add($explicitManifestUrl) }
 else {
     foreach ($rel in @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', '_updater\UPDATE-URL.txt')) {
         $urlPath = Join-Path $instanceRoot $rel
@@ -302,12 +368,30 @@ foreach ($candidateUrl in @($manifestUrls)) {
             if ($slash -gt 0) { $fileBaseUrl = $u.Substring(0, $slash + 1) }
         }
     } catch {
-        [void]$manifestErrors.Add(($candidateUrl + ' -> ' + $_.Exception.Message))
+        [void]$manifestErrors.Add('更新地址未返回有效清单')
     }
 }
 if (-not $manifest -and $errors.Count -eq 0) {
     $errors.Add('拉取/解析清单失败：已尝试 ' + $manifestUrls.Count + ' 个更新地址。' + (($manifestErrors -join '；'))) | Out-Null
     if ($manifestUrls.Count -gt 0) { $manifestUrl = [string]$manifestUrls[0] }
+}
+
+# Preserve the same customization policy as normal synchronization.
+$stateFiles=@();$previousHashes=@{};$preserved=New-Object 'System.Collections.Generic.List[string]'
+$statePath=Join-Path $instanceRoot '.portable-sync-state.json'
+if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+    try { $repairState=Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json;$stateFiles=@($repairState.files) } catch { [void]$warnings.Add('同步状态无法读取；不会覆盖符合保留规则的本地修改。') }
+}
+foreach($entry in $stateFiles){if($entry.path -and $entry.sha1){$previousHashes[(Normalize-RelKey ([string]$entry.path))]=[string]$entry.sha1}}
+if ($Fix -and $manifest) {
+    $probePaths=New-Object 'System.Collections.Generic.List[string]'
+    foreach($entry in (@($manifest.files)+@($stateFiles))) {
+        if (-not $entry.path) { continue }
+        $rel=[string]$entry.path
+        if ($rel -match '\.(bat|command)$') { continue }
+        [void]$probePaths.Add((Join-Safe $instanceRoot $rel))
+    }
+    Assert-RepairPathsAvailable $probePaths
 }
 
 # Java：需求随清单里的 Minecraft 版本变化，不把某个私服版本写死在公版逻辑里。
@@ -335,7 +419,8 @@ if ($manifest -and $manifest.files) {
         $isUpdater = $key -like '_updater/*'
         if (-not $Deep -and -not $isMod -and -not $isUpdater) { continue }
         # 跳过玩家个人向
-        if ($key -match '^(options\.txt|servers\.dat|saves/|screenshots/)') { continue }
+        $forceSync=Test-RepairGlob $key (Get-RepairProperty $manifest 'forceSyncGlobs' @())
+        if ($key -match '^(saves/|screenshots/)' -or (-not $forceSync -and $key -match '^(options\.txt|servers\.dat)$')) { continue }
 
         $checked++
         $full = Join-Safe $instanceRoot $rel
@@ -346,6 +431,18 @@ if ($manifest -and $manifest.files) {
         if ($isUpdater -and -not (Test-Path -LiteralPath $full -PathType Leaf)) {
             $bundledUpdaterFile = Join-Path $PSScriptRoot ([IO.Path]::GetFileName($key))
             if (Test-Path -LiteralPath $bundledUpdaterFile -PathType Leaf) { $full = $bundledUpdaterFile }
+        }
+        $exists=Test-Path -LiteralPath $full -PathType Leaf
+        $previous=[string]$previousHashes[(Normalize-RelKey $key)]
+        $preserveCustom=[bool](Get-RepairProperty $manifest 'preservePlayerCustomizations' $true)
+        if ($preserveCustom -and -not $forceSync) {
+            if (-not $exists -and $previous -and (Test-RepairGlob $key (Get-RepairProperty $manifest 'preserveLocalDeletionGlobs' @()))) {
+                [void]$preserved.Add($rel);continue
+            }
+            if ($exists -and (Test-RepairGlob $key (Get-RepairProperty $manifest 'preserveLocalChangeGlobs' @()))) {
+                $local=Get-Sha1 $full
+                if ($local -ne $expected -and (-not $previous -or $local -ne $previous)) { [void]$preserved.Add($rel);continue }
+            }
         }
         if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
             $missing.Add([pscustomobject]@{ path = $rel; sha1 = $expected; size = $f.size }) | Out-Null
@@ -397,7 +494,7 @@ if ($Fix -and $fileBaseUrl -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)
             $rel = [string]$item.path
             $dest = Join-Safe $instanceRoot $rel
             if (Test-Path $dest) {
-                $bak = Join-Path $outDir ('backup\' + ($rel -replace '/', '_'))
+                $bak = Join-Safe (Join-Path $outDir 'backup') $rel
                 New-Item -ItemType Directory -Force (Split-Path $bak) | Out-Null
                 Copy-Item $dest $bak -Force
             }
@@ -405,8 +502,18 @@ if ($Fix -and $fileBaseUrl -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)
             Download-RepairEntry -File $src -FileBaseUrl $fileBaseUrl -Dest $dest -ExpectedSha1 $item.sha1 -Rel $rel
             $fixed.Add($rel) | Out-Null
         } catch {
-            $errors.Add(("修补失败 {0}: {1}" -f $item.path, $_.Exception.Message)) | Out-Null
+            $errors.Add((Format-RepairError $_ ([string]$item.path))) | Out-Null
         }
+    }
+}
+
+# Recheck actual repaired bytes before reporting remaining problems.
+if ($Fix) {
+    foreach($item in @($missing.ToArray())) {
+        if ((Get-Sha1 (Join-Safe $instanceRoot ([string]$item.path))) -eq $item.sha1) { [void]$missing.Remove($item);$okCount++ }
+    }
+    foreach($item in @($mismatch.ToArray())) {
+        if ((Get-Sha1 (Join-Safe $instanceRoot ([string]$item.path))) -eq $item.expected) { [void]$mismatch.Remove($item);$okCount++ }
     }
 }
 
@@ -430,6 +537,7 @@ if ($java.found) {
     [void]$sb.AppendLine('Java：未检测到')
 }
 [void]$sb.AppendLine(('检查文件：{0} · 正常 {1} · 缺失 {2} · 哈希不符 {3}' -f $checked, $okCount, $missing.Count, $mismatch.Count))
+if ($preserved.Count -gt 0) { [void]$sb.AppendLine(('按清单保留个人修改或删除：{0} 个文件' -f $preserved.Count)) }
 if ($extraMods.Count -gt 0) {
     [void]$sb.AppendLine(('本地多余模组 jar：{0} 个（未强制删除）' -f $extraMods.Count))
     $show = $extraMods | Select-Object -First 8
@@ -462,7 +570,8 @@ $meta = [ordered]@{
     packVersion = $packVersion
     minecraftVersion = $minecraftVersion
     requiredJavaMajor = $requiredJavaMajor
-    manifestUrl = $manifestUrl
+    manifestUrl = Get-RepairMaskedUrl $manifestUrl
+    preserved = @($preserved.ToArray())
     serverReachable = $serverReachable
     java = $java
     checked = $checked
@@ -475,6 +584,7 @@ $meta = [ordered]@{
     fixMode = [bool]$Fix
     generatedAt = (Get-Date).ToString('o')
 }
+New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 $enc = New-Object Text.UTF8Encoding $true
 [IO.File]::WriteAllText((Join-Path $outDir 'report.txt'), $qqText, $enc)
 [IO.File]::WriteAllText((Join-Path $outDir 'report-qq.txt'), $qqText, $enc)
@@ -499,3 +609,8 @@ if (-not $NoPause -and -not $QqSummary -and -not $Quiet) {
 if ($level -eq '红' -or $errors.Count -gt 0) { exit 2 }
 if ($level -eq '黄') { exit 1 }
 exit 0
+
+} catch {
+    Write-Host (Format-RepairError $_) -ForegroundColor Red
+    exit 2
+} finally { if ($repairLock) { $repairLock.Dispose() } }

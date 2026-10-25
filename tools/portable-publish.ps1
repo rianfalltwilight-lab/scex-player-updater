@@ -316,15 +316,23 @@ function Register-PublishedRel {
 function Copy-FileWithRetry {
     param([string]$Source, [string]$Dest, [int]$Attempts = 5, [int]$DelaySec = 2)
     for ($i = 1; $i -le $Attempts; $i++) {
+        $temporary = Join-Path (Split-Path -Parent $Dest) ('.publish-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $attributes = $null
         try {
-            Copy-Item -LiteralPath $Source -Destination $Dest -Force
+            Copy-Item -LiteralPath $Source -Destination $temporary -Force
+            if ([IO.File]::Exists($Dest)) {
+                $attributes = [IO.File]::GetAttributes($Dest)
+                if ($attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($Dest, ($attributes -band (-bnot [IO.FileAttributes]::ReadOnly))) }
+                [IO.File]::Replace($temporary, $Dest, [NullString]::Value)
+            } else { [IO.File]::Move($temporary, $Dest) }
             return
         } catch {
-            if ($i -ge $Attempts) {
-                throw ("文件被其它进程占用，多次重试仍失败：$Dest。多半是玩家正通过更新服务下载文件，稍等几分钟再点「仅发布更新」即可；本次发布已中止，旧清单未被破坏。原始错误：" + $_.Exception.Message)
-            }
-            Write-Host "[便携] 目标文件被占用，$DelaySec 秒后重试（$i/$Attempts）：$Dest"
+            if ($null -ne $attributes -and [IO.File]::Exists($Dest)) { [IO.File]::SetAttributes($Dest, $attributes) }
+            if ($i -ge $Attempts) { throw "[发布失败] 无法替换文件：$Dest。旧目标已保留，请检查文件占用、权限和磁盘空间。" }
+            Write-Host "[便携] 文件暂时无法替换，$DelaySec 秒后重试（$i/$Attempts）：$Dest"
             Start-Sleep -Seconds $DelaySec
+        } finally {
+            if ([IO.File]::Exists($temporary)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
         }
     }
 }
@@ -612,6 +620,8 @@ $lookupHashes = New-Object System.Collections.Generic.List[string]
 $fileRows = New-Object System.Collections.Generic.List[object]
 Get-ChildItem -LiteralPath $publishDir -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
     $rel = $_.FullName.Substring($base.Length).TrimStart('\', '/') -replace '\\', '/'
+    # A locked retired file may remain on disk; it must never re-enter the release.
+    if (-not $script:DesiredRelKeys.Contains($rel)) { return }
     # server-manifest.json / update-log.txt 在清单生成之后才写入，不能进清单，
     # 否则增量发布时旧内容的哈希会跟着进清单、随后又被覆盖，玩家端校验必失败。
     if ($rel -in @('server-manifest.json', 'update-log.txt')) { return }

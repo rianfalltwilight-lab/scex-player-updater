@@ -168,9 +168,9 @@ class PublishTests(unittest.TestCase):
     def test_windows_bootstrap_fallback_download(self):
         batch = (ROOT / 'tools/portable-windows-sync.bat').read_text(encoding='utf-8-sig')
         command_line = next(line for line in batch.splitlines()
-                            if '-Command "' in line and 'function Save-DirectFile' in line)
+                            if '-Command "' in line and 'function Fetch(' in line)
         command = command_line.split('-Command "', 1)[1].rsplit('"', 1)[0]
-        function_block = command.split("; Write-Host '====", 1)[0]
+        function_block = command.split(';$root=', 1)[0]
         with tempfile.TemporaryDirectory(prefix='updater-bootstrap-') as tmp:
             root = Path(tmp)
             web = root / 'web'
@@ -178,7 +178,7 @@ class PublishTests(unittest.TestCase):
             script = root / 'fallback.ps1'
             with serve(web) as port:
                 script.write_text(function_block + "\n$ErrorActionPreference='Stop'\n"
-                                  + f"Save-DirectFile -Url 'http://127.0.0.1:{port}/example.txt' -Path 'download.txt'\n",
+                                  + f"[IO.File]::WriteAllBytes((Join-Path $PSScriptRoot 'download.txt'), (Fetch 'http://127.0.0.1:{port}/example.txt'))\n",
                                   encoding='utf-8-sig')
                 run([PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)], root)
             self.assertEqual((root / 'download.txt').read_bytes(), b'bootstrap download')

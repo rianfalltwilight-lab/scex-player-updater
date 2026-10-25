@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @version 12
+# @version 13
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
@@ -16,27 +16,6 @@ echo "实例目录: $INSTANCE_DIR"
 echo
 
 MANIFEST_URLS="${PORTABLE_MANIFEST_URL:-}"
-append_manifest_url() {
-  local value="$1"
-  value="$(printf '%s' "$value" | tr -d '\r\n')"
-  [ -z "$value" ] && return 0
-  case "$MANIFEST_URLS" in
-    *"$value"*) return 0 ;;
-  esac
-  if [ -z "$MANIFEST_URLS" ]; then
-    MANIFEST_URLS="$value"
-  else
-    MANIFEST_URLS="${MANIFEST_URLS}"$'\x1f'"$value"
-  fi
-}
-if [ -z "$MANIFEST_URLS" ]; then
-  for candidate in "$INSTANCE_DIR/UPDATE-URL.txt" "$INSTANCE_DIR/PORTABLE-UPDATE-URL.txt" "$INSTANCE_DIR/TFCR-update-url.txt" "$SCRIPT_DIR/UPDATE-URL.txt" "$SCRIPT_DIR/PORTABLE-UPDATE-URL.txt" "$SCRIPT_DIR/TFCR-update-url.txt"; do
-    if [ -f "$candidate" ]; then
-      append_manifest_url "$(head -n 1 "$candidate")"
-      break
-    fi
-  done
-fi
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[错误] 没找到 python3。请先安装 Python 3，或在 Windows 上运行 Windows-sync.bat 更新。"
   read -r -p "按回车关闭。"
@@ -61,7 +40,7 @@ fi
 
 set +e
 python3 - "$MANIFEST_URLS" "$SCRIPT_DIR" "$0" <<'PY'
-import hashlib, http.client, ipaddress, json, os, pathlib, re, shutil, socket, stat, sys, tempfile, time, urllib.parse, urllib.request
+import hashlib, http.client, ipaddress, json, os, pathlib, re, signal, socket, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 
 # 更新源是家宽直连地址，绝不走系统代理：macOS 上 urllib 会自动读系统代理（Clash“设为系统
 # 代理”），代理到不了 18088 就把自刷新请求整齐变成 503。空 ProxyHandler 强制直连、绕过代理。
@@ -104,145 +83,150 @@ def fetch_bytes(url, timeout=12):
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return response.read()
 
-manifest_urls = [value for value in sys.argv[1].split("\x1f") if value.strip()]
-def is_private_update_url(url):
+def watch_matches(pid, root):
     try:
-        host = (urllib.parse.urlsplit(url).hostname or "").lower()
-    except Exception:
+        command = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True, stderr=subprocess.DEVNULL).strip()
+        # macOS ps does not preserve argv quotes. Match the exact --instance-dir
+        # argument including spaces, ending at the next option or command end.
+        expected = re.escape(str(root))
+        return (re.search(r"portable-stage-daemon\.py(?:[\"']|\s|$)", command) is not None and
+                re.search(r"--instance-dir\s+[\"']?" + expected + r"/?[\"']?(?=\s+--|$)", command) is not None and
+                re.search(r"--mode\s+[\"']?watch(?:[\"']|\s|$)", command) is not None)
+    except (OSError, subprocess.SubprocessError):
         return False
+
+def stop_previous_watch(root):
+    record = root / ".portable-staging/daemon.lock"
+    if not record.is_file():
+        return
+    try:
+        pid = int(record.read_text().strip())
+    except ValueError:
+        pid = 0
+    if pid > 0 and watch_matches(pid, root):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(30):
+            if not watch_matches(pid, root):
+                break
+            time.sleep(0.1)
+        if watch_matches(pid, root):
+            raise RuntimeError("旧后台预下载仍在运行，请关闭后重试。")
+        print("[更新器] 已停止本实例的旧后台预下载。")
+    if record.is_file() and record.read_text().strip() == str(pid):
+        record.unlink()
+
+original_self = pathlib.Path(sys.argv[3]).resolve().read_bytes()
+manifest_urls = []
+raw_override = sys.argv[1].strip()
+script_dir = pathlib.Path(sys.argv[2]).resolve()
+self_path = pathlib.Path(sys.argv[3]).resolve()
+instance_guess = script_dir.parent if script_dir.name == "_updater" else script_dir
+try:
+    stop_previous_watch(instance_guess)
+except (OSError, RuntimeError):
+    print("[更新器] 无法安全停止旧后台预下载，请关闭该实例的更新器后重试。")
+    raise SystemExit(1)
+if raw_override:
+    manifest_urls = re.split(r"[\r\n\x1f]+", raw_override)
+else:
+    for root in (instance_guess, script_dir):
+        for name in ("UPDATE-URL.txt", "PORTABLE-UPDATE-URL.txt", "TFCR-update-url.txt", "UPDATE-URL-LAN.txt"):
+            path = root / name
+            if path.is_file():
+                manifest_urls.extend(path.read_text(encoding="utf-8-sig").splitlines())
+manifest_urls = list(dict.fromkeys(value.strip() for value in manifest_urls if value.strip() and not value.strip().startswith("#")))
+
+def is_private_update_url(url):
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
     if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local"):
         return True
     try:
         return ipaddress.ip_address(host).is_private
     except ValueError:
         return False
-def probe_timeout(url):
-    return 8
+
 last_good = ""
-# argv[2] is script_dir; instance is parent when script lives in _updater.
-instance_guess = pathlib.Path(sys.argv[2]).resolve()
-if instance_guess.name == "_updater":
-    instance_guess = instance_guess.parent
-state_file = instance_guess / ".portable-sync-state.json"
-if state_file.is_file():
-    try:
-        state = json.loads(state_file.read_text(encoding="utf-8-sig"))
-        last_good = str(state.get("lastManifestUrl") or state.get("manifestUrl") or "")
-    except Exception:
-        last_good = ""
-ordered = []
-seen = set()
-def add(url):
-    key = (url or "").strip()
-    if not key:
-        return
-    low = key.lower()
-    if low in seen:
-        return
-    seen.add(low)
-    ordered.append(key)
+try:
+    state = json.loads((instance_guess / ".portable-sync-state.json").read_text(encoding="utf-8-sig"))
+    last_good = str(state.get("lastManifestUrl") or state.get("manifestUrl") or "")
+except (OSError, ValueError):
+    pass
 public = [url for url in manifest_urls if not is_private_update_url(url)]
-candidates = public or list(manifest_urls)
-if last_good in candidates and not is_private_update_url(last_good):
-    add(last_good)
-for url in candidates:
-    add(url)
+ordered = ([last_good] if last_good in public else []) + public
 if last_good and not is_private_update_url(last_good):
-    add(last_good)
-manifest_urls = ordered
-script_dir = pathlib.Path(sys.argv[2]).resolve()
-self_path = pathlib.Path(sys.argv[3]).resolve()
+    ordered.append(last_good)
+ordered.extend(url for url in manifest_urls if is_private_update_url(url))
+manifest_urls = list(dict.fromkeys(ordered))
 if not manifest_urls:
-    print("[更新器] 未找到 UPDATE-URL.txt，将使用包内同步脚本。")
+    print("[更新器] 未找到更新地址，将使用包内同步脚本。")
     raise SystemExit(0)
 selected_manifest_url = None
-manifest_errors = []
-def mask_url(url):
-    parsed = urllib.parse.urlsplit(url)
-    parts = parsed.path.split("/")
-    if len(parts) > 2 and parts[1]:
-        parts[1] = "***"
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/".join(parts), parsed.query, parsed.fragment))
-
+selected_manifest = None
 for candidate in manifest_urls:
     try:
-        # 先探测一次清单；成功后整轮自刷新复用这个地址，避免五个文件各自刷同一条错误。
-        fetch_bytes(candidate, timeout=probe_timeout(candidate))
-        selected_manifest_url = candidate
+        parsed = json.loads(fetch_bytes(candidate, timeout=8).decode("utf-8-sig"))
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("files"), list):
+            continue
+        selected_manifest_url, selected_manifest = candidate, parsed
         break
-    except Exception as exc:
-        manifest_errors.append(f"{mask_url(candidate)}: {exc}")
+    except (OSError, ValueError, http.client.HTTPException):
+        continue
 if not selected_manifest_url:
-    print("[更新器] 更新源暂时不可达，跳过自刷新（已保留本地脚本）：" + "；".join(manifest_errors))
+    print("[更新器] 更新源暂时不可达，已保留本地脚本；主同步器将重试备用地址。")
     raise SystemExit(0)
 if selected_manifest_url != manifest_urls[0]:
     print("[更新器] 已切换到备用更新地址。")
 base = selected_manifest_url.rsplit("/", 1)[0] + "/"
 
-def version(path):
+def install_bytes(payload, dest, executable=False):
+    # A sibling temporary file keeps replacement atomic without modifying a running inode.
+    fd, name = tempfile.mkstemp(prefix="." + dest.name + ".portable-new-", dir=str(dest.parent))
+    temp = pathlib.Path(name)
     try:
-        text = pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return 0
-    match = re.search(r"^# @version\s+(\d+)", text, re.MULTILINE)
-    return int(match.group(1)) if match else 0
-
-def sha1(path):
-    try:
-        return hashlib.sha1(pathlib.Path(path).read_bytes()).hexdigest()
-    except Exception:
-        return ""
-
-def install(src, dest, executable=False):
-    # 同目录临时文件 + os.replace 原子换入：运行中的 bash 持有旧 inode，
-    # 自更新不会改写正在执行的脚本内容（v9 起废除字节偏移约束的关键）。
-    tmp_new = dest.with_name(dest.name + ".portable-new")
-    try:
-        shutil.copy2(src, tmp_new)
+        with os.fdopen(fd, "wb") as output:
+            output.write(payload)
         if executable:
-            tmp_new.chmod(tmp_new.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        os.replace(tmp_new, dest)
+            temp.chmod(0o755)
+        os.replace(temp, dest)
     finally:
-        if tmp_new.exists():
-            try:
-                tmp_new.unlink()
-            except Exception:
-                pass
+        if temp.exists():
+            temp.unlink()
 
 restart = False
-for name in ("player-update-generic.py", "player-update-generic.ps1", "portable-stage-daemon.py", "Windows-sync.bat", "macOS-sync.command"):
-    url = urllib.parse.urljoin(base, "_updater/" + urllib.parse.quote(name)) + "?t=" + str(int(time.time() * 1000))
+for name in ("player-update-generic.py", "player-update-generic.ps1", "portable-stage-daemon.py", "portable-stage-daemon.ps1", "portable-bootstrap-refresh.ps1", "Windows-sync.bat", "macOS-sync.command"):
+    entries = [row for row in selected_manifest["files"] if isinstance(row, dict) and row.get("path") == "_updater/" + name]
+    if (len(entries) != 1 or not re.fullmatch(r"[0-9a-fA-F]{40}", str(entries[0].get("sha1", ""))) or
+            not isinstance(entries[0].get("size"), int) or entries[0]["size"] < 0):
+        print(f"[更新器] 清单未提供有效校验信息，保留本地 {name}。")
+        continue
+    entry = entries[0]
     dest = script_dir / name
-    tmp = pathlib.Path(tempfile.gettempdir()) / f"portable-sync-{name}.tmp"
+    url = urllib.parse.urljoin(base, "_updater/" + urllib.parse.quote(name)) + "?t=" + str(int(time.time() * 1000))
     try:
-        tmp.write_bytes(fetch_bytes(url, timeout=12))
-        if name == "macOS-sync.command":
-            remote_version = version(tmp)
-            local_tool_version = version(dest)
-            self_version = version(self_path)
-            if remote_version and remote_version > local_tool_version:
-                install(tmp, dest, executable=True)
-                print(f"[更新器] Mac 同步工具已更新：v{local_tool_version} -> v{remote_version}")
-            else:
-                print(f"[更新器] Mac 同步工具已是最新：v{local_tool_version}")
-            if remote_version and remote_version > self_version:
-                install(tmp, self_path, executable=True)
-                print(f"[更新器] 当前启动脚本已更新：v{self_version} -> v{remote_version}")
-                restart = True
-        elif sha1(tmp) != sha1(dest):
-            install(tmp, dest)
+        payload = fetch_bytes(url, timeout=12)
+        if len(payload) != entry["size"] or hashlib.sha1(payload).hexdigest() != entry["sha1"].lower():
+            raise ValueError("清单大小或 SHA1 校验失败")
+        if name.endswith(".py"):
+            compile(payload.decode("utf-8-sig"), name, "exec")  # Parse only; never execute downloaded code.
+        if not dest.is_file() or dest.read_bytes() != payload:
+            install_bytes(payload, dest, executable=name.endswith(".command"))
             print(f"[更新器] 已刷新 {name}")
         else:
             print(f"[更新器] 已是最新 {name}")
-    except Exception as exc:
-        print(f"[更新器] 跳过自刷新 {name}: {exc}")
-    finally:
-        try:
-            tmp.unlink()
-        except Exception:
-            pass
+        if name == "macOS-sync.command" and self_path != dest and self_path.read_bytes() != payload:
+            install_bytes(payload, self_path, executable=True)
+            restart = True
+        elif name == "macOS-sync.command" and self_path == dest:
+            # The running bash still holds the old inode; re-exec once after replacement.
+            restart = payload != original_self
+    except (OSError, ValueError, SyntaxError, http.client.HTTPException):
+        print(f"[更新器] 跳过自刷新 {name}（下载或清单校验失败，已保留原文件）。")
 if restart:
     raise SystemExit(42)
+
 PY
 status=$?
 set -e
@@ -251,11 +235,12 @@ if [ "$status" = "42" ]; then
   exec "$0"
 fi
 
-set +e
-# 落位上个会话后台预下载的文件（此时游戏未起、jar 未占用），再交给同步器统一校验。best-effort。
-if [ -f "$SCRIPT_DIR/portable-stage-daemon.py" ]; then
-  python3 "$SCRIPT_DIR/portable-stage-daemon.py" --instance-dir "$INSTANCE_DIR" --mode promote 2>/dev/null || true
+if [ "$status" != "0" ]; then
+  echo "[更新器] 启动准备失败，退出码 $status。"
+  exit "$status"
 fi
+
+set +e
 python3 "$SCRIPT_DIR/player-update-generic.py" --instance-dir "$INSTANCE_DIR"
 status=$?
 set -e
@@ -268,6 +253,7 @@ done
 echo
 if [ "$status" = "0" ]; then
   echo "[同步] 完成。"
+  if [ "${PORTABLE_SYNC_ONLY:-}" = "1" ]; then exit 0; fi
   LAUNCHER_DIR="$INSTANCE_DIR/_launchers"
   HMCL_JAR="$INSTANCE_DIR/HMCL.jar"
   if [ ! -f "$HMCL_JAR" ]; then
@@ -297,13 +283,7 @@ if [ "$status" = "0" ]; then
   else
     echo "[启动器] 未找到 HMCL：$INSTANCE_DIR/HMCL.jar 或 $LAUNCHER_DIR/HMCL.jar"
   fi
-  # 后台暂存 daemon：随游戏在线时预下载后续更新，玩家退出/超时后自退。先停掉上会话残留的，
-  # 保证跑当前版本、不被过期锁挡住（与 Windows 端自愈一致）。
-  if [ -f "$INSTANCE_DIR/.portable-staging/daemon.lock" ]; then
-    OLDPID="$(tr -d ' \r\n' < "$INSTANCE_DIR/.portable-staging/daemon.lock" 2>/dev/null)"
-    if [ -n "$OLDPID" ]; then kill "$OLDPID" 2>/dev/null || true; fi
-    rm -f "$INSTANCE_DIR/.portable-staging/daemon.lock" 2>/dev/null || true
-  fi
+  # 旧 Watch 已在同步前核验并停止；同步成功后启动当前版本。
   if [ -f "$SCRIPT_DIR/portable-stage-daemon.py" ]; then
     nohup python3 "$SCRIPT_DIR/portable-stage-daemon.py" --instance-dir "$INSTANCE_DIR" --mode watch >/dev/null 2>&1 &
     echo "[更新] 后台预下载已启动：管理员发布更新后会自动下好，重开游戏即可用上（无需再等下载）。"

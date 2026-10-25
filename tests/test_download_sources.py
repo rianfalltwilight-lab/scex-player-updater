@@ -103,7 +103,7 @@ class DownloadRoutingTests(unittest.TestCase):
             self.assertEqual(opener.open.call_count, 2)
             self.assertGreaterEqual(sleep.call_args.args[0], 3)
             opener.open.side_effect = [io.BytesIO(b'wrong bytes')]
-            with self.assertRaisesRegex(RuntimeError, 'SHA1 mismatch'):
+            with self.assertRaisesRegex(u.UpdateError, '校验失败'):
                 u.download_file('https://example.test/demo', dest, digest, opener=opener)
             self.assertEqual(dest.read_bytes(), content)
             self.assertEqual(list(Path(tmp).glob('.portable-sync-*')), [])
@@ -120,7 +120,7 @@ class DownloadRoutingTests(unittest.TestCase):
             temp.write_bytes(b'new')
             mode = dest.stat().st_mode
             with mock.patch.object(u.os, 'replace', side_effect=PermissionError('locked')):
-                with self.assertRaises(PermissionError):
+                with self.assertRaisesRegex(u.LocalFileUpdateError, '权限不足'):
                     u.install_verified_file(temp, dest)
             self.assertEqual(dest.read_bytes(), b'old')
             self.assertEqual(dest.stat().st_mode, mode)

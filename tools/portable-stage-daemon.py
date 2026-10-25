@@ -3,7 +3,7 @@
 #
 # 把整合包更新的下载耗时，从"下次启动前干等"提前到"玩家在线正在游戏时后台悄悄拉"。
 # 管理员在线发布更新后，本进程后台把变更文件下到 .portable-staging/；玩家下次重启游戏时，
-# 由 --mode promote 就地落位，再交给 player-update-generic.py 正常对账（补下/删旧/去重/校验）。
+# 由主更新器按最新清单验证缓存，再执行备份、安装与对账；旧 promote 仅提示。
 #
 # 设计铁律（与 .ps1 完全一致）：
 #   1) 只写 .portable-staging/，绝不改运行中的 mods/*.jar；player-update-generic.py 仍是唯一权威对账器。
@@ -147,6 +147,9 @@ def order_update_urls(urls: list, last_good: str = "") -> list:
         add(url)
     if last_good and not is_private_update_url(last_good):
         add(last_good)
+    for url in urls or []:
+        if is_private_update_url(url):
+            add(url)
     return out
 
 
@@ -437,53 +440,55 @@ def load_sync_baseline(instance_root: pathlib.Path) -> dict:
 
 
 def run_promote(instance_root: pathlib.Path, stage_root: pathlib.Path, notice_path: pathlib.Path):
-    if not stage_root.is_dir():
-        return
-    # 落位前三方判断：目标文件与基线不符说明玩家本地改过，绝不直接覆盖
-    # （丢弃暂存件，交给权威同步器按保留规则裁决）。没有这层防护时，
-    # Promote 会无备份地清掉玩家自改的 config（2026-07-21 玩家实锤）。
-    baseline = load_sync_baseline(instance_root)
-    promoted = 0
-    for f in stage_root.rglob("*"):
-        if not f.is_file():
-            continue
-        rel = f.relative_to(stage_root).as_posix()
-        if rel in STAGE_META:
-            continue
-        try:
-            dest = join_safe(instance_root, rel)
-            # 目标缺失但上次同步基线里有它：交给权威同步器按清单的
-            # preserveLocalDeletionGlobs / forceSyncGlobs 裁决，绝不能让
-            # 暂存件绕过删除保护直接复活（尤其是玩家删掉的 mods/*.jar）。
-            if not dest.is_file() and rel.lower() in baseline:
-                f.unlink()
-                print(f"[暂存落位] 目标缺失且已有同步基线，交给同步器裁决：{rel}")
-                continue
-            if dest.is_file():
-                dest_hash = sha1(dest)
-                if dest_hash != sha1(f) and dest_hash != baseline.get(rel.lower(), ""):
-                    f.unlink()
-                    print(f"[暂存落位] 检测到本地修改，跳过：{rel}")
-                    continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), dest)
-            promoted += 1
-        except Exception as exc:
-            print(f"[暂存落位] 跳过（可能被占用）：{rel}；{exc}")
-    if promoted:
-        print(f"[暂存落位] 已落位 {promoted} 个预下载文件，交给同步器校验。")
-    # 清空暂存区元文件 + 空目录，下个会话重来。
-    for p in (stage_root / "READY.json", notice_path):
-        try:
-            p.unlink()
-        except Exception:
-            pass
-    for d in sorted(stage_root.rglob("*"), key=lambda x: len(str(x)), reverse=True):
-        if d.is_dir():
+    # Compatibility for old launchers. Only the main updater may install verified cache.
+    print("[暂存] 缓存将由主更新器按最新清单校验后安装；此步骤不改动客户端或缓存。")
+
+
+class SyncLock:
+    """Same persistent OS lock as both main engines; no PID or lock-file deletion."""
+    def __init__(self, root):
+        self.path = pathlib.Path(root) / ".portable-sync.lock"
+        self.handle = None
+
+    def acquire(self):
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            api = ctypes.WinDLL("kernel32", use_last_error=True)
+            api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            api.CreateFileW.restype = wintypes.HANDLE
+            api.CloseHandle.argtypes = [wintypes.HANDLE]
+            api.CloseHandle.restype = wintypes.BOOL
+            handle = api.CreateFileW(str(self.path), 0xC0000000, 0, None, 4, 0x80, None)
+            if handle == ctypes.c_void_p(-1).value:
+                error = ctypes.get_last_error()
+                if error in (32, 33):
+                    return False
+                raise ctypes.WinError(error)
+            self.handle = handle
+            self.api = api
+        else:
+            import fcntl
+            stream = self.path.open("a+b")
             try:
-                d.rmdir()
-            except Exception:
-                pass
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                stream.close()
+                return False
+            except BaseException:
+                stream.close()
+                raise
+            self.handle = stream
+        return True
+
+    def release(self):
+        if self.handle is not None:
+            if os.name == "nt":
+                self.api.CloseHandle(self.handle)
+            else:
+                self.handle.close()
+            self.handle = None
 
 
 def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log_path,
@@ -543,7 +548,11 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
                     if idle >= idle_exit_checks:
                         log(log_path, "检测到游戏已退出，暂存 daemon 收工。")
                         break
+            sync_lock = SyncLock(instance_root)
             try:
+                if not sync_lock.acquire():
+                    log(log_path, "主更新器正在同步，跳过本轮预下载。")
+                    continue
                 try:
                     changed, text = manifest.if_changed(manifest_url)
                 except Exception as exc:
@@ -641,9 +650,12 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
                     log(log_path, "清单有变化，但无需预下载的新文件（可能只是元数据/被保留项）。")
             except Exception as exc:
                 log(log_path, f"本轮异常已跳过：{exc}")
+            finally:
+                sync_lock.release()
     finally:
         try:
-            lock_path.unlink()
+            if lock_path.read_text().strip() == str(os.getpid()):
+                lock_path.unlink()
         except Exception:
             pass
         log(log_path, "暂存 daemon 已退出。")

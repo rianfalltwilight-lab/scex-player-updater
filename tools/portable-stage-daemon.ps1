@@ -3,12 +3,12 @@
 
     目的：把整合包更新的下载耗时，从"下次启动前干等"提前到"玩家在线正在游戏时后台悄悄拉"。
           管理员在线发布更新后，本进程后台把变更文件下到 .portable-staging/，玩家下次重启游戏时
-          由 -Mode Promote 就地落位，再交给 player-update-generic.ps1 正常对账（删旧/去重/校验）。
+          由主更新器按最新清单验证缓存，再执行备份、安装与对账。
 
     设计铁律（务必保持）：
       1) 只写 .portable-staging/，绝不改运行中被 JVM 锁住的 mods/*.jar 等文件——热覆盖在 Windows 上必失败。
       2) player-update-generic.ps1 仍是唯一权威对账器。暂存只是"预下载"，即使暂存过期/残缺也无害：
-         Promote 落位后 player-update 会用最新清单重新校验、补下、删多余。所以本脚本不做任何删除。
+         旧 Promote 入口仅提示，不落位或清理。Watch 只改暂存区，与主同步共用实例锁。
       3) 只在 manifest 文本变化时才做文件 diff；idle 轮询近乎零开销（一次 GET + 字符串比较）。
       4) 生命周期自管：游戏由 PCL/HMCL 独立进程启动，本 daemon 靠"检测 java 进程 + 最大时长 + 单例锁"自退，
          不残留后台进程。
@@ -289,6 +289,20 @@ function Save-UrlToFile {
     }
 }
 
+
+function Enter-SyncLock {
+    param([string]$Root)
+    try { return [IO.File]::Open((Join-Path $Root '.portable-sync.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch {
+        $e = $_.Exception
+        while ($e) {
+            if (($e.HResult -band 0xffff) -in @(32,33)) { return $null }
+            $e = $e.InnerException
+        }
+        throw
+    }
+}
+
 # --- 解析实例目录与暂存区 -------------------------------------------------
 $instanceRoot = Resolve-FullPath $InstanceDir
 $stageRoot = Join-Path $instanceRoot '.portable-staging'
@@ -298,65 +312,10 @@ $lockPath = Join-Path $stageRoot 'daemon.lock'
 $script:LogPath = Join-Path $stageRoot 'daemon.log'
 
 # ==========================================================================
-# Promote 模式：把暂存区就地落位，然后自身清空暂存区。仅在游戏未运行时调用（启动脚本里、player-update 之前）。
+# Promote remains a no-op for old launchers. The main updater verifies and installs cache.
 # ==========================================================================
 if ($Mode -eq 'Promote') {
-    if (-not (Test-Path -LiteralPath $stageRoot -PathType Container)) { return }
-    # 基线 = 上次同步写入状态文件的清单哈希。落位前用它三方判断：目标文件与基线不符
-    # 说明玩家本地改过，绝不直接覆盖（丢弃暂存件，交给权威同步器按保留规则裁决）。
-    # 没有这层防护时，Promote 会无备份地清掉玩家自改的 config（2026-07-21 玩家实锤）。
-    $baseline = @{}
-    $syncStatePath = Join-Path $instanceRoot '.portable-sync-state.json'
-    if (Test-Path -LiteralPath $syncStatePath -PathType Leaf) {
-        try {
-            $syncState = Get-Content -LiteralPath $syncStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($item in @($syncState.files)) {
-                if ($item -and $item.path -and $item.sha1) { $baseline[(Normalize-Rel ([string]$item.path)).ToLowerInvariant()] = ([string]$item.sha1).ToLowerInvariant() }
-            }
-        } catch {}
-    }
-    $files = @(Get-ChildItem -LiteralPath $stageRoot -Recurse -File -Force -ErrorAction SilentlyContinue)
-    $promoted = 0
-    foreach ($f in $files) {
-        $rel = $f.FullName.Substring($stageRoot.Length).TrimStart('\', '/') -replace '\\', '/'
-        # 暂存区自身的元文件不落位
-        if ($rel -in @('READY.json', 'daemon.lock', 'daemon.log')) { continue }
-        if (-not (Test-RelativePathSafe -Rel $rel)) { continue }
-        $dest = Join-SafeRel -Root $instanceRoot -Rel $rel
-        try {
-            # 目标缺失但上次同步基线里有它：交给权威同步器按清单的
-            # preserveLocalDeletionGlobs / forceSyncGlobs 裁决，绝不能让
-            # 暂存件绕过删除保护直接复活（尤其是玩家删掉的 mods/*.jar）。
-            if (-not (Test-Path -LiteralPath $dest -PathType Leaf) -and $baseline.ContainsKey($rel.ToLowerInvariant())) {
-                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-                Write-Host ("[暂存落位] 目标缺失且已有同步基线，交给同步器裁决：" + $rel)
-                continue
-            }
-            if (Test-Path -LiteralPath $dest -PathType Leaf) {
-                $destHash = Get-Sha1 -Path $dest
-                $baseHash = [string]$baseline[$rel.ToLowerInvariant()]
-                if ($destHash -ne (Get-Sha1 -Path $f.FullName) -and $destHash -ne $baseHash) {
-                    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-                    Write-Host ("[暂存落位] 检测到本地修改，跳过：" + $rel)
-                    continue
-                }
-            }
-            New-Item -ItemType Directory -Force (Split-Path -Parent $dest) | Out-Null
-            Move-Item -LiteralPath $f.FullName -Destination $dest -Force
-            $promoted++
-        } catch {
-            Write-Host ("[暂存落位] 跳过（可能被占用）：" + $rel + "；" + $_.Exception.Message)
-        }
-    }
-    if ($promoted -gt 0) { Write-Host ("[暂存落位] 已落位 $promoted 个预下载文件，交给同步器校验。") }
-    # 清空暂存区（含元文件），下个会话重新开始。落位失败残留的文件保留，等下次。
-    try {
-        Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $noticePath -Force -ErrorAction SilentlyContinue
-        Get-ChildItem -LiteralPath $stageRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Sort-Object { $_.FullName.Length } -Descending |
-            ForEach-Object { if (-not (Get-ChildItem -LiteralPath $_.FullName -Force)) { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } }
-    } catch {}
+    Write-Host '[暂存] 缓存将由主更新器按最新清单校验后安装；此步骤不改动客户端或缓存。'
     return
 }
 
@@ -418,6 +377,7 @@ $candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($manifestUrl
 if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in $candidates) { & $addUrl $u }
 if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
+foreach ($u in @($manifestUrls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
 $manifestUrls = @($ordered)
 $manifestUrl = ""
 $selectedIndex = -1
@@ -638,7 +598,10 @@ try {
             }
         }
 
+        $syncLock = $null
         try {
+        $syncLock = Enter-SyncLock -Root $instanceRoot
+        if ($null -eq $syncLock) { Write-Log '主更新器正在同步，跳过本轮预下载。'; continue }
         # 条件请求拉清单：304（未变化）或失败都跳过本轮，几乎零负担。
         $mres = $null
         try { $mres = Get-ManifestIfChanged -Url $manifestUrl } catch { Write-Log ("清单获取失败：" + $_.Exception.Message); continue }
@@ -741,9 +704,9 @@ try {
         } catch {
             # 兜住本轮任何未预期异常：记进日志、继续下一轮，绝不让 daemon 崩掉或在小黑窗里闪红。
             Write-Log ("本轮异常已跳过：" + $_.Exception.Message)
-        }
+        } finally { if ($syncLock) { $syncLock.Dispose() } }
     }
 } finally {
-    Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    if (([string](Get-Content -LiteralPath $lockPath -Raw -ErrorAction SilentlyContinue)).Trim() -eq [string]$PID) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue }
     Write-Log "暂存 daemon 已退出。"
 }

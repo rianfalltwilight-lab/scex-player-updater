@@ -2,8 +2,11 @@
 import argparse
 import atexit
 import functools
+import datetime
+import email.utils
 import os
 import posixpath
+import re
 import socket
 import ssl
 import sys
@@ -88,7 +91,90 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
         if "/.." in clean or clean.endswith("/.."):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return None
-        return super().send_head()
+        return self._send_file_head()
+
+    def _send_file_head(self):
+        """Serve one stable open file; byte ranges never enter the full-file buffer."""
+        self._byte_range = None
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            return super().send_head()
+        try:
+            handle = open(path, 'rb')
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, 'File not found')
+            return None
+        try:
+            stat = os.fstat(handle.fileno())
+            size = stat.st_size
+            etag = '"{:x}-{:x}-{:x}"'.format(stat.st_ino, stat.st_mtime_ns, size)
+            modified = datetime.datetime.fromtimestamp(int(stat.st_mtime), datetime.timezone.utc)
+
+            def date_matches(value):
+                try:
+                    date = email.utils.parsedate_to_datetime(value)
+                    if date.tzinfo is None:
+                        date = date.replace(tzinfo=datetime.timezone.utc)
+                    return modified <= date
+                except (TypeError, ValueError, OverflowError):
+                    return False
+
+            none_match = self.headers.get('If-None-Match')
+            unchanged = False
+            if none_match:
+                unchanged = any(value.strip().removeprefix('W/') in ('*', etag)
+                                for value in none_match.split(','))
+            elif self.headers.get('If-Modified-Since'):
+                unchanged = date_matches(self.headers['If-Modified-Since'])
+            if unchanged:
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header('ETag', etag)
+                self.send_header('Last-Modified', self.date_time_string(stat.st_mtime))
+                self.end_headers()
+                handle.close()
+                return None
+
+            byte_range = self.headers.get('Range')
+            if_range = self.headers.get('If-Range')
+            if byte_range and if_range:
+                # A changed or weak validator requires a fresh full response.
+                valid = if_range == etag if if_range.startswith(('"', 'W/')) else date_matches(if_range)
+                if not valid:
+                    byte_range = None
+            start, end = 0, size - 1
+            if byte_range:
+                match = re.fullmatch(r'bytes=(\d*)-(\d*)', byte_range.strip())
+                valid = bool(match and (match[1] or match[2]) and size)
+                if valid:
+                    if match[1]:
+                        start = int(match[1])
+                        end = min(int(match[2]), size - 1) if match[2] else size - 1
+                    else:
+                        suffix = int(match[2])
+                        start = max(0, size - suffix)
+                    valid = 0 <= start <= end < size
+                if not valid:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header('Content-Range', 'bytes */{}'.format(size))
+                    self.send_header('Content-Length', '0')
+                    self.send_header('ETag', etag)
+                    self.end_headers()
+                    handle.close()
+                    return None
+                self._byte_range = (start, end)
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if byte_range else HTTPStatus.OK)
+            self.send_header('Content-type', self.guess_type(path))
+            self.send_header('Content-Length', str(end - start + 1))
+            self.send_header('Last-Modified', self.date_time_string(stat.st_mtime))
+            self.send_header('ETag', etag)
+            self.send_header('Accept-Ranges', 'bytes')
+            if byte_range:
+                self.send_header('Content-Range', 'bytes {}-{}/{}'.format(start, end, size))
+            self.end_headers()
+            return handle
+        except BaseException:
+            handle.close()
+            raise
 
     # Read the whole file into memory and close the handle immediately instead of
     # streaming from the open handle for the entire (possibly slow) transfer.
@@ -103,6 +189,17 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
         if f is None:
             return
         try:
+            if getattr(self, '_byte_range', None) is not None:
+                start, end = self._byte_range
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    block = f.read(min(64 * 1024, remaining))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    remaining -= len(block)
+                return
             try:
                 size = os.fstat(f.fileno()).st_size
             except (OSError, AttributeError, ValueError):

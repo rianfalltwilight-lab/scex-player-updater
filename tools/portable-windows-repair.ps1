@@ -105,21 +105,92 @@ function Save-DirectFile {
     }
 }
 
-function Read-UpdateUrl([string]$InstanceDir, [string]$KitHome) {
-    foreach ($p in @(
-            (Join-Path $InstanceDir 'UPDATE-URL.txt'),
-            (Join-Path $InstanceDir 'PORTABLE-UPDATE-URL.txt'),
-            (Join-Path $InstanceDir 'TFCR-update-url.txt'),
-            (Join-Path $KitHome 'UPDATE-URL.txt')
-        )) {
-        if (Test-Path -LiteralPath $p -PathType Leaf) {
-            $u = (Get-Content -LiteralPath $p -Raw -Encoding UTF8).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($u)) { return $u }
-        }
+
+# REPAIR_SAFETY_V2: use the same persistent exclusive lock as the main updater.
+function Enter-RepairLock([string]$Root) {
+    try { return [IO.File]::Open((Join-Path $Root '.portable-sync.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { throw '[更新进行中] 此实例已有更新或修复任务，请等待该窗口结束后重试。' }
+}
+function Format-RepairError($ErrorRecord, [string]$Path = '', [string]$Phase = '修复') {
+    $ex=$ErrorRecord.Exception; $code=0
+    while ($ex) {
+        if ([string]$ex.Message -match '(\[(文件占用|更新进行中|权限不足|空间不足|校验失败|路径错误|下载失败|修复失败|安装失败)\].*)') { return $Matches[1] }
+        $native=$ex.HResult -band 65535
+        if ($native -in @(5,32,33,39,112)) { $code=$native }
+        $ex=$ex.InnerException
     }
-    return ''
+    if ($code -in @(32,33)) { return "[文件占用] $Path。请完全退出 Minecraft，关闭打开此文件的程序后重试；原文件已保留。" }
+    if ($code -eq 5) { return "[权限不足] $Path。请检查文件权限和安全软件拦截后重试。" }
+    if ($code -in @(39,112)) { return "[空间不足] $Path。请腾出目标磁盘空间后重试。" }
+    if ($Phase -eq '下载') { return "[下载失败] $Path。无法取得更新内容，请检查网络或稍后重试。" }
+    return "[修复失败] $Path。操作未完成，请保留窗口截图联系管理员。"
+}
+function Assert-RepairPathsAvailable($Paths) {
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($path in $Paths) {
+        if (-not $seen.Add([string]$path) -or -not [IO.File]::Exists($path)) { continue }
+        $handle=$null
+        try { $handle=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None) }
+        catch { throw (Format-RepairError $_ $path) }
+        finally { if($handle){$handle.Dispose()} }
+    }
+}
+function Install-RepairFile([string]$Temporary,[string]$Destination) {
+    $attributes=$null
+    try {
+        if ([IO.File]::Exists($Destination)) {
+            $attributes=[IO.File]::GetAttributes($Destination)
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw "[路径错误] 目标是链接，已停止替换：$Destination" }
+            if ($attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($Destination,($attributes -band (-bnot [IO.FileAttributes]::ReadOnly))) }
+            [IO.File]::Replace($Temporary,$Destination,[NullString]::Value)
+        } else { [IO.File]::Move($Temporary,$Destination) }
+    } catch {
+        if ($null -ne $attributes -and [IO.File]::Exists($Destination)) { [IO.File]::SetAttributes($Destination,$attributes) }
+        throw (Format-RepairError $_ $Destination)
+    }
+}
+function Get-RepairProperty($Object,[string]$Name,$Default=$null) {
+    if ($null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]) { return $Object.$Name }
+    return $Default
+}
+function Test-RepairGlob([string]$Rel,$Globs) {
+    foreach($glob in @($Globs)) { if($Rel.Replace('\','/') -like ([string]$glob).Replace('\','/')){return $true} }
+    return $false
+}
+function Get-RepairMaskedUrl([string]$Url) {
+    if ($Url -like 'file:*') { return '本地清单' }
+    try { $uri=[Uri]$Url;return [regex]::Replace($uri.GetLeftPart([UriPartial]::Path), '(?<=^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/)[^/]+(?=/)', '***') } catch { return '更新地址' }
 }
 
+function Read-UpdateUrls([string]$InstanceDir, [string]$KitHome) {
+    $result=New-Object 'System.Collections.Generic.List[string]'
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($p in @((Join-Path $InstanceDir 'UPDATE-URL.txt'),(Join-Path $InstanceDir 'PORTABLE-UPDATE-URL.txt'),(Join-Path $InstanceDir 'TFCR-update-url.txt'),(Join-Path $KitHome 'UPDATE-URL.txt'))) {
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+        foreach($line in ((Get-Content -LiteralPath $p -Raw -Encoding UTF8) -split "`r?`n")) {
+            $url=([string]$line).Trim()
+            if ($url -and -not $url.StartsWith('#') -and $seen.Add($url)) { [void]$result.Add($url) }
+        }
+    }
+    return @($result.ToArray())
+}
+function Read-UpdateUrl([string]$InstanceDir, [string]$KitHome) {
+    return @(Read-UpdateUrls $InstanceDir $KitHome) | Select-Object -First 1
+}
+function Get-RepairSha1([string]$Path) {
+    $hash=[Security.Cryptography.SHA1]::Create();$stream=$null
+    try { $stream=[IO.File]::OpenRead($Path);return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+    finally { if($stream){$stream.Dispose()};$hash.Dispose() }
+}
+function Assert-RepairTargetRoot([string]$Root,[string]$Path) {
+    $rootFull=[IO.Path]::GetFullPath($Root).TrimEnd('\','/')
+    $cursor=[IO.Path]::GetFullPath($Path)
+    if (-not $cursor.StartsWith($rootFull+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw '[路径错误] 修复目标越出实例目录。' }
+    while($cursor -and $cursor.Length -ge $rootFull.Length) {
+        if(Test-Path -LiteralPath $cursor){if([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint){throw '[路径错误] 修复目标包含链接，已停止。'}}
+        if($cursor -eq $rootFull){break};$cursor=Split-Path -Parent $cursor
+    }
+}
 function Install-Bat([string]$Source, [string]$Dest) {
     if (Test-Path -LiteralPath $Dest -PathType Leaf) {
         $srcBytes = [IO.File]::ReadAllBytes($Source)
@@ -137,13 +208,16 @@ function Install-Bat([string]$Source, [string]$Dest) {
     $tmp = Join-Path $dir ('.Windows-sync.portable-new-' + [guid]::NewGuid().ToString('N') + '.bat')
     try {
         Copy-Item -LiteralPath $Source -Destination $tmp -Force
-        Move-Item -LiteralPath $tmp -Destination $Dest -Force
+        Install-RepairFile -Temporary $tmp -Destination $Dest
     } finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
     return $true
 }
 
+$repairLock=$null
+$tempDownload=$null
+try {
 Write-Host '============================================================'
 Write-Host '  修复 Windows 更新脚本'
 Write-Host '============================================================'
@@ -168,45 +242,52 @@ $instanceDir = Split-Path -Parent $updaterDir
 Write-Host ("实例: " + $instanceDir)
 Write-Host ("脚本: " + $inner)
 
+$repairLock=Enter-RepairLock $instanceDir
+$instanceCopy=Join-Path $instanceDir '更新mod-Windows端.bat'
+Assert-RepairTargetRoot $instanceDir $inner
+Assert-RepairTargetRoot $instanceDir $instanceCopy
+Assert-RepairPathsAvailable @($inner,$instanceCopy)
+
 $source = $null
 $tempDownload = $null
-foreach ($cand in @(
-        (Join-Path $RepairHome 'Windows-sync.bat'),
-        (Join-Path $RepairHome '_updater\Windows-sync.bat')
-    )) {
-    if (Test-GoodSyncBat $cand) {
-        $source = $cand
-        Write-Host '[修复] 使用随包的好脚本'
-        break
-    }
+$localSource = $null
+foreach ($cand in @((Join-Path $RepairHome 'Windows-sync.bat'), (Join-Path $RepairHome '_updater\Windows-sync.bat'))) {
+    if (Test-GoodSyncBat $cand) { $localSource=$cand;break }
 }
-
-if (-not $source) {
-    $manifestUrl = Read-UpdateUrl -InstanceDir $instanceDir -KitHome $RepairHome
-    if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
-        Write-Host '[错误] 没有随包好脚本，也没有 UPDATE-URL.txt。请使用群里发的完整修复包。' -ForegroundColor Red
-        if (-not $NoLaunch) { Read-Host '按回车关闭' | Out-Null }
-        exit 1
-    }
-    $base = $manifestUrl.Substring(0, $manifestUrl.LastIndexOf('/'))
-    $fileUrl = $base + '/_updater/' + [Uri]::EscapeDataString('Windows-sync.bat')
-    $tempDownload = Join-Path ([IO.Path]::GetTempPath()) ('portable-repair-' + [guid]::NewGuid().ToString('N') + '.bat')
-    Write-Host '[修复] 正在从更新源下载好脚本（直连）...'
-    $ok = $false
-    for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
-        try {
-            Save-DirectFile -Url $fileUrl -Path $tempDownload -TimeoutSec 25
-            if (Test-GoodSyncBat $tempDownload) { $ok = $true } else { throw 'downloaded file failed validation' }
-        } catch {
-            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+$urls=@(Read-UpdateUrls -InstanceDir $instanceDir -KitHome $RepairHome)
+$sawValidManifest=$false
+if ($urls.Count -eq 0) {
+    if (-not $localSource) { throw '[修复失败] 没有可用的本地修复包或更新地址。请保留完整修复包，或补充 UPDATE-URL.txt。' }
+    $source=$localSource
+    Write-Host '[修复] 未配置更新地址，使用本地完整修复包。'
+} else {
+    $tempDownload=Join-Path ([IO.Path]::GetTempPath()) ('portable-repair-'+[guid]::NewGuid().ToString('N')+'.bat')
+    $manifestTemp=Join-Path ([IO.Path]::GetTempPath()) ('portable-repair-manifest-'+[guid]::NewGuid().ToString('N')+'.json')
+    try {
+        foreach($manifestUrl in $urls) {
+            try {
+                Save-DirectFile -Url $manifestUrl -Path $manifestTemp -TimeoutSec 8
+                $manifest=Get-Content -LiteralPath $manifestTemp -Raw -Encoding UTF8 | ConvertFrom-Json
+                $rows=@($manifest.files | Where-Object { $_.path -ceq '_updater/Windows-sync.bat' })
+                if ($rows.Count -ne 1 -or [string]$rows[0].sha1 -notmatch '^[0-9a-fA-F]{40}$' -or $null -eq $rows[0].size -or [long]$rows[0].size -le 0) { throw '[校验失败] 清单没有有效的 Windows 更新入口。' }
+                $row=$rows[0]
+                $sawValidManifest=$true
+                if ($localSource -and (Get-Item -LiteralPath $localSource).Length -eq [long]$row.size -and (Get-RepairSha1 $localSource) -eq ([string]$row.sha1).ToLowerInvariant()) { $source=$localSource;break }
+                $slash=$manifestUrl.LastIndexOf('/')
+                if ($slash -lt 0) { throw '[校验失败] 更新地址无效。' }
+                $fileUrl=$manifestUrl.Substring(0,$slash+1)+'_updater/Windows-sync.bat'
+                Save-DirectFile -Url $fileUrl -Path $tempDownload -TimeoutSec 15
+                if ((Get-Item -LiteralPath $tempDownload).Length -ne [long]$row.size -or (Get-RepairSha1 $tempDownload) -ne ([string]$row.sha1).ToLowerInvariant() -or -not (Test-GoodSyncBat $tempDownload)) { throw '[校验失败] 下载的更新入口与清单不一致，旧脚本已保留。' }
+                $source=$tempDownload;break
+            } catch { Write-Host '[修复] 此更新地址不可用或校验未通过，正在尝试下一地址。' }
         }
+    } finally { if([IO.File]::Exists($manifestTemp)){Remove-Item -LiteralPath $manifestTemp -Force -ErrorAction SilentlyContinue} }
+    if (-not $source -and $localSource -and -not $sawValidManifest) {
+        $source=$localSource
+        Write-Host '[离线修复] 更新源暂时不可用，使用本地完整修复包；联网后仍会检查更新。'
     }
-    if (-not $ok) {
-        Write-Host '[错误] 下载失败，或下到的脚本仍是坏的。同一 Wi-Fi 可改用群里带 Windows-sync.bat 的修复包。' -ForegroundColor Red
-        if (-not $NoLaunch) { Read-Host '按回车关闭' | Out-Null }
-        exit 1
-    }
-    $source = $tempDownload
+    if (-not $source) { throw '[修复失败] 所有更新地址均未提供通过校验的入口；旧脚本已保留，请稍后重试。' }
+    if ($sawValidManifest) { Write-Host '[修复] 更新入口已通过清单大小和哈希校验。' }
 }
 
 if (Install-Bat -Source $source -Dest $inner) {
@@ -226,13 +307,24 @@ if (Test-Path -LiteralPath $instanceCopy -PathType Leaf) {
     }
 }
 
+if (-not (Test-GoodSyncBat $inner) -or (Get-RepairSha1 $inner) -ne (Get-RepairSha1 $source)) { throw '[校验失败] 修复后的入口复查未通过，请重试。' }
+
 if ($tempDownload -and (Test-Path -LiteralPath $tempDownload -PathType Leaf)) {
     Remove-Item -LiteralPath $tempDownload -Force -ErrorAction SilentlyContinue
 }
 
+if ($repairLock) { $repairLock.Dispose();$repairLock=$null }
 if ($NoLaunch) { exit 0 }
 
 Write-Host '[修复] 完成，正在启动正常更新...'
 $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
 & $cmd /d /c "`"$inner`""
 exit $LASTEXITCODE
+
+} catch {
+    Write-Host (Format-RepairError $_) -ForegroundColor Red
+    exit 1
+} finally {
+    if ($repairLock) { $repairLock.Dispose() }
+    if ($tempDownload -and [IO.File]::Exists($tempDownload)) { Remove-Item -LiteralPath $tempDownload -Force -ErrorAction SilentlyContinue }
+}

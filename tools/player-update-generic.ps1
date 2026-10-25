@@ -19,20 +19,21 @@ function Normalize-Rel { param([string]$Rel) return ([string]$Rel).Replace('\', 
 function Normalize-RelKey { param([string]$Rel) return (Normalize-Rel $Rel).ToLowerInvariant() }
 
 function Test-RelativePathSafe {
-    param([Parameter(Mandatory = $true)][string]$Rel)
-    $normalized = Normalize-Rel $Rel
-    if ([string]::IsNullOrWhiteSpace($normalized)) { return $false }
-    if ($normalized.StartsWith('/') -or $normalized -match '^[A-Za-z]:') { return $false }
-    foreach ($part in $normalized.Split('/')) {
-        if ($part -eq '..') { return $false }
+    param([Parameter(Mandatory=$true)][string]$Rel)
+    if ([string]::IsNullOrWhiteSpace($Rel) -or [IO.Path]::IsPathRooted($Rel) -or $Rel -match '[:<>"|?*]') { return $false }
+    foreach ($part in $Rel.Replace('\','/').Split('/')) {
+        if (-not $part -or $part -in @('.','..') -or $part.EndsWith('.') -or $part.EndsWith(' ')) { return $false }
     }
     return $true
 }
 
 function Join-SafeRelativePath {
-    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$Rel)
-    if (-not (Test-RelativePathSafe -Rel $Rel)) { throw "Unsafe manifest path: $Rel" }
-    return Join-Path $Root ((Normalize-Rel $Rel).Replace('/', '\'))
+    param([Parameter(Mandatory=$true)][string]$Root,[Parameter(Mandatory=$true)][string]$Rel)
+    if (-not (Test-RelativePathSafe $Rel)) { throw "[路径错误] 无效更新路径：$Rel" }
+    $target = [IO.Path]::GetFullPath((Join-Path $Root $Rel.Replace('/','\')))
+    Assert-SafeAbsolutePath -Path $target -Boundary $Root
+    if ($script:SyncRoot -and $target.StartsWith($script:SyncRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) { Assert-SafeAbsolutePath -Path $target -Boundary $script:SyncRoot }
+    return $target
 }
 
 function Get-Sha1 {
@@ -51,6 +52,7 @@ function Get-Sha1 {
 
 function Write-Utf8NoBom {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Value)
+    Assert-SafeAbsolutePath -Path $Path
     New-Item -ItemType Directory -Force (Split-Path -Parent $Path) | Out-Null
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Value, $encoding)
@@ -117,24 +119,28 @@ function Join-UrlPath {
 }
 
 function Get-MaskedUrl {
-    # 更新地址首个路径段是访问 token，玩家截图求助时容易泄漏，打印前掩码。
     param([string]$Url)
-    return [regex]::Replace([string]$Url, '(?<=^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/)[^/]+(?=/)', '***')
+    try {
+        $builder = New-Object UriBuilder $Url
+        $builder.UserName=''; $builder.Password=''; $builder.Query=''; $builder.Fragment=''
+        return [regex]::Replace($builder.Uri.AbsoluteUri, '(?<=^[A-Za-z][A-Za-z0-9+.-]*://[^/]+/)[^/]+(?=/)', '***')
+    } catch { return '[地址已隐藏]' }
 }
 
 function Test-ProtectedRel {
-    # 同步自身生成的备份/归档目录，任何清理规则都不得删除。
     param([string]$Rel)
-    $normalized = Normalize-Rel $Rel
-    return ($normalized -like '.portable-sync-backups/*' -or $normalized -like '_disabled_*/*')
+    $first = (Normalize-Rel $Rel).Split('/')[0]
+    return ($first -like '.portable-*' -or $first -like '_disabled_*' -or $first -eq '_repair')
 }
 
 function Backup-FileIfExists {
-    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Rel, [Parameter(Mandatory = $true)][string]$BackupRoot)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][string]$Rel,[Parameter(Mandatory=$true)][string]$BackupRoot)
+    if (-not [IO.File]::Exists($Path)) { return }
+    Assert-SafeAbsolutePath -Path $Path
     $backupPath = Join-SafeRelativePath -Root $BackupRoot -Rel $Rel
+    if ([IO.File]::Exists($backupPath)) { return }
     New-Item -ItemType Directory -Force (Split-Path -Parent $backupPath) | Out-Null
-    Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+    [IO.File]::Copy($Path,$backupPath,$false)
 }
 
 $script:ProxyUrl = $null
@@ -327,7 +333,7 @@ function Test-LooksLikeCurrentFile {
             if ($vSize -eq $size -and $vMtime -eq $mtime) { return $true }
             return ((Get-Sha1 -Path $Path) -eq $expected)
         }
-        return $true
+        return ((Get-Sha1 -Path $Path) -eq $expected)
     }
     if ($vSha -eq $expected -and $vSize -eq $size -and $vMtime -eq $mtime) { return $true }
     return ((Get-Sha1 -Path $Path) -eq $expected)
@@ -378,11 +384,11 @@ function New-DirectHttpRequest {
 function Get-DownloadFailReason {
     param($Exception)
     $msg = [string]$Exception.Message
-    if ($msg -match 'SHA1') { return '哈希不符' }
-    if ($msg -match 'too slow|太慢') { return '太慢' }
+    if ($msg -match 'SHA1|校验失败') { return '哈希不符' }
+    if ($msg -match 'too slow|太慢|过低') { return '太慢' }
     if ($msg -match 'timed out|Timeout|超时') { return '超时' }
-    if ($msg -match '\(404\)') { return '404' }
-    if ($msg -match '\(403\)') { return '403' }
+    if ($msg -match '\(404\)|HTTP 404') { return '404' }
+    if ($msg -match '\(403\)|HTTP 403') { return '403' }
     if ($msg -match '无法解析|name or service|DNS') { return 'DNS' }
     return '连接失败'
 }
@@ -493,34 +499,103 @@ function Save-OfficialViaProxy {
 }
 
 function Save-UrlToFile {
-    param([Parameter(Mandatory = $true)][string]$Url, [Parameter(Mandatory = $true)][string]$Path, [int]$TimeoutSec = 60, [switch]$AllowProxy, [int]$MinBytesAfterTimeout = 0, [int]$MinRateBps = 0)
+    param([Parameter(Mandatory=$true)][string]$Url,[Parameter(Mandatory=$true)][string]$Path,[int]$TimeoutSec=60,[switch]$AllowProxy,[int]$MinBytesAfterTimeout=0,[int]$MinRateBps=0,[switch]$Resume)
     if ($AllowProxy) {
         $proxy = Get-SystemProxyUrl
-        if ($proxy) {
-            Save-OfficialViaProxy -Url $Url -Path $Path -TimeoutSec $TimeoutSec -ProxyUrl $proxy -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps
-            return
-        }
+        if ($proxy) { Save-OfficialViaProxy -Url $Url -Path $Path -TimeoutSec $TimeoutSec -ProxyUrl $proxy -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps; return }
     }
+    $offset = if ($Resume -and [IO.File]::Exists($Path)) { (Get-Item -LiteralPath $Path).Length } else { [long]0 }
     $request = New-DirectHttpRequest -Url $Url -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy
-    $response = $null
-    $inputStream = $null
-    $outputStream = $null
+    if ($offset -gt 0) { $request.AddRange([long]$offset) }
+    $response=$null; $inputStream=$null; $outputStream=$null
     try {
-        $response = $request.GetResponse()
-        $inputStream = $response.GetResponseStream()
-        $outputStream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try { $response=$request.GetResponse() }
+        catch [Net.WebException] {
+            if ($offset -gt 0 -and $_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 416) {
+                $_.Exception.Response.Close()
+                [IO.File]::Delete($Path)
+                Save-UrlToFile -Url $Url -Path $Path -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps
+                return
+            }
+            throw
+        }
+        $append = $false
+        if ([int]$response.StatusCode -eq 206) {
+            $range=[string]$response.Headers['Content-Range']
+            if ($range -notmatch '^bytes (\d+)-(\d+)/(\d+)$' -or [long]$Matches[1] -ne $offset -or [long]$Matches[2] -lt $offset -or [long]$Matches[3] -le [long]$Matches[2]) { throw '[下载失败] 更新源返回无效续传范围，请稍后重试。' }
+            $append = $offset -gt 0
+        } elseif ([int]$response.StatusCode -ne 200) { throw '[下载失败] 更新源返回了无法处理的下载状态。' }
+        $mode = if ($append) { [IO.FileMode]::Append } else { [IO.FileMode]::Create }
+        $inputStream=$response.GetResponseStream()
+        $outputStream=[IO.File]::Open($Path,$mode,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $before=$outputStream.Length
         Copy-DownloadStream -InputStream $inputStream -OutputStream $outputStream -TimeoutSec $TimeoutSec -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps
-    } catch {
-        try { $request.Abort() } catch {}
-        throw
-    } finally {
-        if ($outputStream) { $outputStream.Dispose() }
-        if ($inputStream) { $inputStream.Dispose() }
-        if ($response) { $response.Dispose() }
+        if ($response.ContentLength -ge 0 -and ($outputStream.Length-$before) -ne $response.ContentLength) { throw '[下载失败] 下载连接提前中断，已保留断点，下次可继续。' }
+    } catch { try { $request.Abort() } catch {}; throw }
+    finally { if ($outputStream) {$outputStream.Dispose()}; if ($inputStream) {$inputStream.Dispose()}; if ($response) {$response.Dispose()} }
+}
+
+# FILE_LOCK_PREFLIGHT_V1: report local file errors before any synchronization writes.
+function Format-UpdateError {
+    param($ErrorRecord, [string]$Phase = '更新', [string]$Path = '')
+    $ex = if ($ErrorRecord -is [Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    $code = 0; $kind = '未知错误'; $http = 0; $timeout = $false; $slow = $false
+    while ($null -ne $ex) {
+        $message = [string]$ex.Message
+        if ($message -match '(?s)(\[(?:文件占用|权限不足|空间不足|下载失败|校验失败|替换失败|预检失败|更新失败|获取清单失败|正在更新|状态错误|清单错误|路径错误)\].*)') { return $Matches[1] }
+        $kind = $ex.GetType().Name
+        if ($message -match 'too slow|太慢|过低') { $slow = $true }
+        $native = $ex.HResult -band 65535
+        if ($native -in @(5,32,33,39,112)) { $code = $native }
+        if ($ex -is [Net.WebException]) {
+            $timeout = $ex.Status -eq [Net.WebExceptionStatus]::Timeout
+            if ($ex.Response -is [Net.HttpWebResponse]) { $http = [int]$ex.Response.StatusCode }
+        }
+        if ($ex -is [TimeoutException]) { $timeout = $true }
+        $ex = $ex.InnerException
+    }
+    $target = if ($Path) { "文件：$Path。" } else { '' }
+    if ($code -in @(32,33)) { return "[文件占用] $target 文件正被其他程序使用，原文件已保留。请完全退出 Minecraft（不是返回标题界面），关闭打开此文件的程序，再重新运行更新器。" }
+    if ($code -eq 5) { return "[权限不足] $target 无法访问或写入此位置。请检查文件夹权限及安全软件拦截，再重试。" }
+    if ($code -in @(39,112)) { return "[空间不足] $target 目标磁盘空间不足，请腾出空间后重试。" }
+    if ($Phase -eq '替换') { return "[替换失败] $target 未完成文件替换，请检查文件权限、磁盘和占用情况后重试。（错误类型：$kind）" }
+    if ($Phase -eq '校验') { return "[校验失败] $target 下载内容与清单不一致，未安装该文件。请重新运行更新器。" }
+    if ($Phase -in @('下载','获取清单')) {
+        $reason = if ($http) { "更新源返回 HTTP $http" } elseif ($timeout) { '连接更新源超时' } elseif ($slow) { '下载速度持续过低' } else { '无法取得更新内容' }
+        return "[${Phase}失败] $target $reason。请检查网络或稍后重试。（错误类型：$kind）"
+    }
+    return "[${Phase}失败] $target 操作未完成，请将本窗口截图交给管理员。（错误类型：$kind）"
+}
+
+function Test-LocalUpdateError {
+    param($ErrorRecord)
+    $message = Format-UpdateError -ErrorRecord $ErrorRecord
+    return $message -match '^\[(文件占用|权限不足|空间不足|替换失败|预检失败|路径错误|状态错误)\]'
+}
+
+function Assert-UpdateFilesAvailable {
+    param([string]$Root, $Files)
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @($Files)) {
+        $rel = Normalize-Rel ([string]$file.path)
+        if (-not (Test-RelativePathSafe $rel)) { throw '[预检失败] 更新清单含无效文件路径，请联系管理员。' }
+        # A running batch entry may keep itself open; preserve its existing optional policy.
+        if ((Test-OptionalHelperFile $rel) -or -not $seen.Add($rel)) { continue }
+        $path = Join-SafeRelativePath -Root $Root -Rel $rel
+        if (-not [IO.File]::Exists($path)) { continue }
+        if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) { throw "[预检失败] 文件是链接，无法安全更新：$rel" }
+        $handle = $null
+        try {
+            # Opening for read with no sharing changes neither data nor attributes.
+            $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        } catch { throw (Format-UpdateError -ErrorRecord $_ -Phase '预检' -Path $rel) }
+        finally { if ($handle) { $handle.Dispose() } }
     }
 }
+
 function Install-VerifiedFile {
     param([string]$Temporary,[string]$Destination)
+    Assert-SafeAbsolutePath -Path $Destination
     # Temp is on the destination volume. Never delete the old file to make room.
     if ([IO.Directory]::Exists($Destination)) { throw '更新目标是目录，请检查客户端文件路径。' }
     $oldAttributes = $null
@@ -541,7 +616,7 @@ function Install-VerifiedFile {
         }
     } catch {
         if ($null -ne $oldAttributes -and [IO.File]::Exists($Destination)) { [IO.File]::SetAttributes($Destination,$oldAttributes) }
-        throw ('文件替换失败，旧文件已保留。请完全退出 Minecraft、关闭占用该资源包的程序后重试。' + $_.Exception.Message)
+        throw (Format-UpdateError -ErrorRecord $_ -Phase '替换' -Path $Destination)
     }
 }
 
@@ -581,14 +656,21 @@ function Download-ManifestFile {
         [int]$MinRateBps = 0,
         [switch]$NoBackoff
     )
+    Assert-SafeAbsolutePath -Path $Destination
     New-Item -ItemType Directory -Force (Split-Path -Parent $Destination) | Out-Null
-    $tmp = Join-Path (Split-Path -Parent $Destination) (".portable-sync-" + [System.Guid]::NewGuid().ToString('N') + ".tmp")
+    $tmp = Get-PartialDownloadPath -Destination $Destination -Sha1 $ExpectedSha1
+    $identity = [IO.Path]::GetFileName($tmp).Substring(56)
+    foreach ($stale in @(Get-ChildItem -LiteralPath (Split-Path -Parent $Destination) -Filter ('.portable-part-*' + $identity) -File -Force)) {
+        if ($stale.FullName -ne $tmp) { Assert-SafeAbsolutePath -Path $stale.FullName; [IO.File]::Delete($stale.FullName) }
+    }
+    if ([IO.File]::Exists($tmp) -and (Get-Sha1 $tmp) -eq $ExpectedSha1) { Install-VerifiedFile -Temporary $tmp -Destination $Destination; return }
+    $phase = '下载'
     try {
         $attempt = 0
         $busyAttempt = 0
         while ($true) {
             try {
-                Save-UrlToFile -Url $Url -Path $tmp -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps
+                Save-UrlToFile -Url $Url -Path $tmp -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps -Resume
                 break
             } catch {
                 # BUSY_BACKOFF_V1: 429/5xx means "busy", not "broken"; wait and retry.
@@ -604,12 +686,13 @@ function Download-ManifestFile {
                 Start-Sleep -Seconds 2
             }
         }
+        $phase = '校验'
         $actual = Get-Sha1 -Path $tmp
-        if ($actual -ne $ExpectedSha1.ToLowerInvariant()) { throw "SHA1 mismatch for $(Get-MaskedUrl $Url). expected=$ExpectedSha1 actual=$actual" }
+        if ($actual -ne $ExpectedSha1.ToLowerInvariant()) { [IO.File]::Delete($tmp); throw "SHA1 mismatch for $(Get-MaskedUrl $Url). expected=$ExpectedSha1 actual=$actual" }
+        $phase = '替换'
         Install-VerifiedFile -Temporary $tmp -Destination $Destination
-    } finally {
-        if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force }
-    }
+    } catch { throw (Format-UpdateError -ErrorRecord $_ -Phase $phase -Path $Destination) }
+    # Verified partials survive local lock errors; incomplete downloads resume next run.
 }
 
 # HYBRID_DOWNLOAD_V1: alternate manifests are byte sources, never policy overrides.
@@ -667,7 +750,7 @@ function Download-HybridEntry {
             $rate = if ($script:HybridSources.Count -gt 1) { 65536 } else { 0 }
             Download-ManifestFile -Url (Get-HybridFileUrl $source $Rel) -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 180 -Retries 0 -MinRateBps $rate
             return 'home'
-        } catch { $last = $_; Write-Host '[混合源] 下载失败、低速或校验不符，正在切换备用源。' }
+        } catch { if (Test-LocalUpdateError $_) { throw }; $last = $_; Write-Host '[混合源] 下载失败、低速或校验不符，正在切换备用源。' }
     }
     if ($last) { throw $last }
     throw '本轮所有更新源均不可用，请稍后重试。'
@@ -676,6 +759,7 @@ function Download-HybridEntry {
 
 function Download-ManifestEntry {
     param($File, [Parameter(Mandatory = $true)][string]$BaseUrl, [Parameter(Mandatory = $true)][string]$Destination, [Parameter(Mandatory = $true)][string]$ExpectedSha1, [Parameter(Mandatory = $true)][string]$Rel)
+    if (Install-StagedEntry -Destination $Destination -ExpectedSha1 $ExpectedSha1 -Rel $Rel -File $File) { return 'staged' }
     # Downloads are hash-matched at publication and verified again before install.
     # Failure of one URL must not disable CurseForge or Modrinth for other files.
     foreach ($url in @(Get-OfficialFileUrls $File)) {
@@ -686,6 +770,7 @@ function Download-ManifestEntry {
                 Download-ManifestFile -Url $url -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 8 -Retries 0 -AllowProxy:$useProxy -NoBackoff -MinBytesAfterTimeout $script:OfficialMinBytes -MinRateBps $script:OfficialMinRateBps
                 return 'official'
             } catch {
+                if (Test-LocalUpdateError $_) { throw }
                 Write-Host ("[同步] {0} 不可用（{1}），继续尝试下一下载源：{2}" -f ([Uri]$url).Host, (Get-DownloadFailReason $_.Exception), $Rel)
             }
         }
@@ -729,21 +814,19 @@ function Get-ArrayValue {
 }
 
 function Get-ExistingFileHashIndex {
-    # 一个 SHA1 可能对应多个本地文件（枪包音效在 assets/ccrp、assets/classicr 下重复），
-    # 所以每个哈希存一个路径列表，不能只留第一个——否则同哈希的后续条目会指向已被
-    # 前一次接管移走的路径，Move-Item 报 "does not exist" 崩掉（2026-07-08 玩家实锤）。
     param([string]$Root)
     $map = @{}
-    foreach ($dir in @('mods', 'config', 'defaultconfigs', 'kubejs', 'scripts', 'resourcepacks', 'shaderpacks', 'data')) {
+    foreach ($dir in @('mods','config','defaultconfigs','kubejs','scripts','resourcepacks','shaderpacks','data')) {
         $full = Join-Path $Root $dir
-        if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
-        Get-ChildItem -LiteralPath $full -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            $rel = $_.FullName.Substring($Root.Length).TrimStart('\', '/') -replace '\\', '/'
-            if ($rel -like 'mods/.connector/*' -or $rel -like '*/.connector/*') { return }
-            $digest = Get-Sha1 -Path $_.FullName
-            if (-not $digest) { return }
-            if (-not $map.ContainsKey($digest)) { $map[$digest] = New-Object System.Collections.Generic.List[string] }
-            [void]$map[$digest].Add($_.FullName)
+        if (-not [IO.Directory]::Exists($full)) { continue }
+        if ((Get-Item -LiteralPath $full -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        foreach ($file in @(Get-SafeClientFiles -Root $full)) {
+            $rel = Normalize-Rel ($file.FullName.Substring($Root.Length).TrimStart('\','/'))
+            if ($rel -like 'mods/.connector/*' -or $rel -like '*/.connector/*') { continue }
+            $digest = Get-Sha1 -Path $file.FullName
+            if (-not $digest) { continue }
+            if (-not $map.ContainsKey($digest)) { $map[$digest] = New-Object 'System.Collections.Generic.List[string]' }
+            [void]$map[$digest].Add($file.FullName)
         }
     }
     return $map
@@ -1271,7 +1354,7 @@ function Move-ToDisabledDir {
 
 function Remove-ConnectorRuntimeCache {
     param([string]$Root)
-    $cache = Join-Path $Root 'mods\.connector'
+    $cache = Join-SafeRelativePath -Root $Root -Rel 'mods/.connector'
     if (Test-Path -LiteralPath $cache -PathType Container) {
         Remove-Item -LiteralPath $cache -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host '[修复] 已清理 Connector 运行缓存：mods/.connector'
@@ -1370,8 +1453,217 @@ function Disable-DuplicateMods {
     if ($script:DuplicateMoved -gt $moved) { Write-Host "[修复] 重复 mod 清理完成，移动 $($script:DuplicateMoved - $moved) 个" }
 }
 
+function Assert-SafeAbsolutePath {
+    param([string]$Path, [string]$Boundary = '')
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $Boundary) { $Boundary = $script:SyncRoot }
+    if (-not $Boundary) { $Boundary = [IO.Path]::GetDirectoryName($full) }
+    $root = [IO.Path]::GetFullPath($Boundary).TrimEnd('\')
+    if ($full -ne $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '[路径错误] 更新目标超出允许的目录。' }
+    $cursor = $full
+    while ($cursor -and $cursor.Length -ge $root.Length) {
+        if (Test-Path -LiteralPath $cursor) {
+            if ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "[路径错误] 更新路径经过目录链接或文件链接，请检查：$cursor" }
+        }
+        if ($cursor -eq $root) { break }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+}
+
+function Enter-SyncLock {
+    param([string]$Root)
+    $path = Join-SafeRelativePath -Root $Root -Rel '.portable-sync.lock'
+    try { return [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { throw '[正在更新] 此实例已有更新或后台缓存任务正在运行，请等待其完成后再试。' }
+}
+
+function Exit-SyncLock { param($Handle) if ($Handle) { $Handle.Dispose() } }
+
+function Write-AtomicUtf8 {
+    param([string]$Path, [string]$Value)
+    Assert-SafeAbsolutePath -Path $Path
+    $temp = $Path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [IO.File]::WriteAllText($temp, $Value, [Text.UTF8Encoding]::new($false))
+        Install-VerifiedFile -Temporary $temp -Destination $Path
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+}
+
+function Test-SyncStateData {
+    param($Value)
+    if (-not $Value -or -not ($Value.files -is [Array])) { return $false }
+    foreach ($file in $Value.files) {
+        if (-not $file -or -not $file.path -or -not (Test-RelativePathSafe ([string]$file.path)) -or [string]$file.sha1 -notmatch '^[a-fA-F0-9]{40}$') { return $false }
+    }
+    return $true
+}
+
+function Read-ValidSyncState {
+    param([string]$Path)
+    $previous = Join-Path (Split-Path -Parent $Path) '.portable-sync-state.prev.json'
+    if (-not [IO.File]::Exists($Path) -and -not [IO.File]::Exists($previous)) { return $null }
+    foreach ($candidate in @($Path, $previous)) {
+        if (-not [IO.File]::Exists($candidate)) { continue }
+        Assert-SafeAbsolutePath -Path $candidate
+        try {
+            $data = [IO.File]::ReadAllText($candidate, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if (-not (Test-SyncStateData $data)) { throw 'invalid state' }
+            if ($candidate -ne $Path) { Write-Host '[恢复] 当前同步状态损坏或缺失，已读取上一份有效状态。' }
+            return $data
+        } catch { }
+    }
+    throw '[状态错误] 同步状态损坏且没有有效备份。已停止更新以保护个人修改，请将日志交给管理员。'
+}
+
+function Save-SyncState {
+    param([string]$Path, $Value)
+    $previous = Join-Path (Split-Path -Parent $Path) '.portable-sync-state.prev.json'
+    $old = $null
+    if ([IO.File]::Exists($Path)) {
+        try { $raw = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8); $old = $raw | ConvertFrom-Json; if (-not (Test-SyncStateData $old)) { $old = $null } } catch { $old = $null }
+    }
+    if ($old) { Write-AtomicUtf8 -Path $previous -Value $raw }
+    elseif (-not [IO.File]::Exists($Path) -and -not [IO.File]::Exists($previous)) { Write-AtomicUtf8 -Path $previous -Value (($Value | ConvertTo-Json -Depth 12) + "`n") }
+    Write-AtomicUtf8 -Path $Path -Value (($Value | ConvertTo-Json -Depth 12) + "`n")
+}
+
+function Assert-ManifestFiles {
+    param([string]$Root, $Files, $DeleteGlobs=@())
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @($Files)) {
+        $rel = [string]$file.path
+        if (-not (Test-RelativePathSafe $rel)) { throw '[清单错误] 清单包含无效文件路径。' }
+        $path = Join-SafeRelativePath -Root $Root -Rel $rel
+        if (-not $seen.Add([IO.Path]::GetFullPath($path))) { throw "[清单错误] 清单包含重复文件路径：$rel" }
+        if ([string]$file.sha1 -notmatch '^[a-fA-F0-9]{40}$') { throw "[清单错误] 文件校验值无效：$rel" }
+        if (Test-ProtectedRel $rel) { throw "[清单错误] 清单不能覆盖更新器运行记录：$rel" }
+        if (Test-GlobMatch -Rel $rel -Globs $DeleteGlobs) { throw "[清单错误] 同一路径同时要求安装和删除：$rel" }
+    }
+}
+
+function Initialize-SyncJournal {
+    param([string]$Root, $Manifest, [hashtable]$PreviousMap, [hashtable]$PreviousRelByKey)
+    $script:JournalPath = Join-SafeRelativePath -Root $Root -Rel '.portable-sync-pending.json'
+    $pack = [string](Get-PropertyValue $Manifest 'packId' (Get-PropertyValue $Manifest 'pack' ''))
+    $script:Journal = @{ format=1; packId=$pack; version=[string]$Manifest.version; applied=@{} }
+    if (-not [IO.File]::Exists($script:JournalPath)) { return }
+    try { $old = [IO.File]::ReadAllText($script:JournalPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { throw '[状态错误] 未完成更新的记录损坏，请将日志交给管理员。' }
+    if (-not $old -or $old.format -ne 1 -or [string]$old.packId -cne $pack -or -not $old.PSObject.Properties['applied']) { throw '[状态错误] 未完成更新记录不属于当前整合包或格式无效。' }
+    foreach ($entry in $old.applied.PSObject.Properties) {
+        $rel = [string]$entry.Value.path; $hash = [string]$entry.Value.sha1
+        if (-not (Test-RelativePathSafe $rel) -or $hash -notmatch '^[a-fA-F0-9]{40}$') { throw '[状态错误] 未完成更新记录包含无效路径或校验值。' }
+        $target = Join-SafeRelativePath -Root $Root -Rel $rel
+        if ([IO.File]::Exists($target) -and (Get-Sha1 $target) -eq $hash) {
+            $key = Normalize-RelKey $rel
+            $PreviousMap[$key] = $hash; $PreviousRelByKey[$key] = $rel
+            $script:Journal.applied[$key] = @{path=$rel;sha1=$hash}
+        }
+    }
+    Write-Host '[恢复] 已核对上次未完成更新的文件，将继续同步并保留真正的个人修改。'
+}
+
+function Add-SyncIntent {
+    param([string]$Rel, [string]$Sha1, [switch]$Save)
+    if (-not $script:Journal) { return }
+    $script:Journal.applied[(Normalize-RelKey $Rel)] = @{path=$Rel;sha1=$Sha1}
+    if ($Save) { Save-SyncJournal }
+}
+
+function Save-SyncJournal {
+    if ($script:Journal) { Write-AtomicUtf8 -Path $script:JournalPath -Value (($script:Journal | ConvertTo-Json -Depth 8) + "`n") }
+}
+
+function Write-Host {
+    [CmdletBinding()]
+    param([Parameter(Position=0,ValueFromRemainingArguments=$true)][object[]]$Object,
+          [object]$Separator=' ', [ConsoleColor]$ForegroundColor, [ConsoleColor]$BackgroundColor, [switch]$NoNewline)
+    $text = ($Object | ForEach-Object { [string]$_ }) -join $Separator
+    $safe = [regex]::Replace($text, 'https?://[^\s；，)]+', { param($m) Get-MaskedUrl $m.Value })
+    $arguments = @{Object=$safe;NoNewline=$NoNewline}
+    if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $arguments.ForegroundColor=$ForegroundColor }
+    if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $arguments.BackgroundColor=$BackgroundColor }
+    Microsoft.PowerShell.Utility\Write-Host @arguments
+    if ($script:SyncLogPath) {
+        try { [IO.File]::AppendAllText($script:SyncLogPath, $safe + $(if ($NoNewline) { '' } else { "`n" }), [Text.UTF8Encoding]::new($false)) } catch { }
+    }
+}
+
+function Start-SyncLog {
+    param([string]$Root)
+    $directory = Join-SafeRelativePath -Root $Root -Rel '.portable-sync-logs'
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    $script:SyncLogPath = Join-SafeRelativePath -Root $Root -Rel '.portable-sync-logs/latest.log'
+    if ([IO.File]::Exists($script:SyncLogPath)) { [IO.File]::Copy($script:SyncLogPath, (Join-SafeRelativePath -Root $Root -Rel '.portable-sync-logs/previous.log'), $true) }
+    [IO.File]::WriteAllText($script:SyncLogPath, ('[诊断] 开始同步 ' + (Get-Date -Format o) + "`n"), [Text.UTF8Encoding]::new($false))
+    Write-Host "[诊断] 日志：$script:SyncLogPath"
+}
+
+function Get-PartialDownloadPath {
+    param([string]$Destination, [string]$Sha1)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $id = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFileName($Destination))))).Replace('-','').ToLowerInvariant().Substring(0,16) } finally { $hasher.Dispose() }
+    return Join-Path ([IO.Path]::GetDirectoryName($Destination)) ('.portable-part-' + $Sha1.ToLowerInvariant() + '-' + $id + '.tmp')
+}
+
+function Get-SafeClientFiles {
+    param([string]$Root)
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
+    $queue.Enqueue($Root)
+    while ($queue.Count) {
+        $directory = $queue.Dequeue()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction SilentlyContinue)) {
+            $rel = Normalize-Rel ($item.FullName.Substring($Root.Length).TrimStart('\','/'))
+            if (Test-ProtectedRel ($rel + $(if ($item.PSIsContainer) { '/' } else { '' }))) { continue }
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($item.PSIsContainer) { $queue.Enqueue($item.FullName) } else { $item }
+        }
+    }
+}
+
+function Get-ForceDeleteTargets {
+    param([string]$Root, $Patterns)
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $wildcards = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($pattern in @($Patterns)) {
+        $rel = Normalize-Rel ([string]$pattern)
+        if (-not $rel) { continue }
+        if (-not (Test-RelativePathSafe ($rel.Replace('*','x').Replace('?','x')))) { throw '[清单错误] 删除规则包含无效路径。' }
+        if (Test-ProtectedRel $rel) { continue }
+        if ($rel -match '[*?]') { [void]$wildcards.Add($rel); continue }
+        $path = Join-SafeRelativePath -Root $Root -Rel $rel
+        if ([IO.File]::Exists($path) -and $seen.Add($path)) { Get-Item -LiteralPath $path -Force }
+    }
+    if ($wildcards.Count) {
+        foreach ($item in @(Get-SafeClientFiles -Root $Root)) {
+            $rel = Normalize-Rel ($item.FullName.Substring($Root.Length).TrimStart('\','/'))
+            if ((Test-GlobMatch $rel $wildcards) -and $seen.Add($item.FullName)) { $item }
+        }
+    }
+}
+
+function Install-StagedEntry {
+    param([string]$Destination,[string]$ExpectedSha1,[string]$Rel,$File)
+    if (-not $script:SyncRoot) { return $false }
+    $cached = Join-SafeRelativePath -Root $script:SyncRoot -Rel ('.portable-staging/' + $Rel)
+    if (-not [IO.File]::Exists($cached)) { return $false }
+    if ((Get-Sha1 $cached) -ne $ExpectedSha1) { return $false }
+    if ($File.PSObject.Properties['size'] -and (Get-Item -LiteralPath $cached).Length -ne [int64]$File.size) { return $false }
+    New-Item -ItemType Directory -Force (Split-Path -Parent $Destination) | Out-Null
+    $temp = Get-PartialDownloadPath -Destination $Destination -Sha1 $ExpectedSha1
+    Copy-Item -LiteralPath $cached -Destination $temp -Force
+    if ((Get-Sha1 $temp) -ne $ExpectedSha1) { [IO.File]::Delete($temp); return $false }
+    Install-VerifiedFile -Temporary $temp -Destination $Destination
+    return $true
+}
+
+$syncLock=$null
+$script:SyncLogPath=$null
+try {
 $instanceRoot = Resolve-FullPath $InstanceDir
 New-Item -ItemType Directory -Force $instanceRoot | Out-Null
+$script:SyncRoot=$instanceRoot.TrimEnd('\')
+$syncLock=Enter-SyncLock -Root $instanceRoot
+Start-SyncLog -Root $instanceRoot
 Set-Location -LiteralPath $instanceRoot
 
 # 老系统/未开启强加密的 .NET 默认拿不到 TLS 1.2，https 更新源会直接失败；入口 bat 已设，
@@ -1380,10 +1672,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 
 $manifestUrls = @(Read-UpdateUrls -Root $instanceRoot -Override $ManifestUrl)
 $statePath = Join-Path $instanceRoot '.portable-sync-state.json'
-$state = $null
-if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-    try { $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $state = $null }
-}
+$state = Read-ValidSyncState -Path $statePath
 $lastGood = ''
 if ([string]::IsNullOrWhiteSpace($ManifestUrl) -and $state) {
     $lastGood = [string](Get-PropertyValue -Object $state -Name 'lastManifestUrl' -Default (Get-PropertyValue -Object $state -Name 'manifestUrl' -Default ''))
@@ -1434,7 +1723,7 @@ if (-not $manifest) {
     }
 }
 if (-not $manifest) {
-    throw ("清单获取失败：" + $lastManifestError.Message + "；已尝试 " + $manifestUrls.Count + " 个更新地址。请确认当前更新地址可达，以及路由器已把更新端口转到服机。")
+    throw (Format-UpdateError -ErrorRecord $lastManifestError -Phase '获取清单')
 }
 $manifestUrl = [string]$selectedManifestUrl
 if (-not [string]::IsNullOrWhiteSpace($lastGood) -and $manifestUrl -eq $lastGood) {
@@ -1443,6 +1732,8 @@ if (-not [string]::IsNullOrWhiteSpace($lastGood) -and $manifestUrl -eq $lastGood
     Write-Host "[同步] 已切换到可用备用地址：$(Get-MaskedUrl $manifestUrl)"
 }
 if (-not $manifest.files) { throw 'manifest 缺少 files。' }
+Assert-ManifestFiles -Root $instanceRoot -Files $manifest.files -DeleteGlobs @(Get-ArrayValue -Object $manifest -Name 'forceDeleteGlobs' -Default @())
+Write-Host ('[版本] ' + [string]$manifest.version)
 
 $slash = $manifestUrl.LastIndexOf('/')
 if ($slash -lt 0) { throw "manifest URL 格式异常：$manifestUrl" }
@@ -1460,6 +1751,7 @@ $previousRelByKey = @{}
 foreach ($item in @(Get-PropertyValue -Object $state -Name 'files' -Default @())) {
     if ($item -and $item.path) { $previousRelByKey[(Normalize-RelKey ([string]$item.path))] = Normalize-Rel ([string]$item.path) }
 }
+Initialize-SyncJournal -Root $instanceRoot -Manifest $manifest -PreviousMap $previousMap -PreviousRelByKey $previousRelByKey
 $newMap = ConvertTo-FileMap -Files $manifest.files
 $verified = @{}
 $rawVerified = Get-PropertyValue -Object $state -Name 'verified' -Default $null
@@ -1478,9 +1770,16 @@ $additiveDirs = Get-ArrayValue -Object $manifest -Name 'additiveDirs' -Default @
 $cleanup = Get-PropertyValue -Object $manifest -Name 'cleanup' -Default $null
 $preservePlayerCustomizations = [bool](Get-PropertyValue -Object $manifest -Name 'preservePlayerCustomizations' -Default $true)
 $adoptExistingFiles = [bool](Get-PropertyValue -Object $manifest -Name 'adoptExistingFiles' -Default $true)
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$stamp = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 $backupRoot = Join-Path $instanceRoot (".portable-sync-backups\$stamp")
 
+Write-Host '[预检] 检查现有受管文件是否被占用...'
+$forceDeleteTargets = @(Get-ForceDeleteTargets -Root $instanceRoot -Patterns $forceDeleteGlobs)
+$checkFiles = @($manifest.files) + @($previousRelByKey.Values | ForEach-Object { [pscustomobject]@{path=$_} })
+foreach ($deleteTarget in $forceDeleteTargets) { $checkFiles += [pscustomobject]@{path=(Normalize-Rel $deleteTarget.FullName.Substring($instanceRoot.Length).TrimStart('\','/'))} }
+$optionConfig = Get-PropertyValue $manifest 'playerOptions' $null
+if ($optionConfig) { foreach ($rel in @(Get-PropertyValue $optionConfig 'targets' @('options.txt'))) { $checkFiles += [pscustomobject]@{path=$rel} } }
+Assert-UpdateFilesAvailable -Root $instanceRoot -Files $checkFiles
 if ([bool](Get-PropertyValue -Object $cleanup -Name 'removeConnectorCache' -Default $true)) { Remove-ConnectorRuntimeCache -Root $instanceRoot }
 if ([bool](Get-PropertyValue -Object $cleanup -Name 'disableLauncherRepairIndex' -Default $true)) { Disable-LauncherRepairIndex -Roots @($PSScriptRoot, $instanceRoot) }
 
@@ -1558,6 +1857,8 @@ foreach ($file in @($manifest.files)) {
         $targetFull = [System.IO.Path]::GetFullPath($target)
         $adopt = Get-AdoptSource -Index (Get-AdoptIndex) -Expected $expected -TargetFull $targetFull -ManifestTargets $manifestTargets
         if ($adopt) {
+            Add-SyncIntent -Rel $rel -Sha1 $expected -Save
+            Assert-SafeAbsolutePath -Path $adopt.Path
             New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
             if ($adopt.Mode -eq 'move') {
                 # 同哈希接管通常是官方改名/换名。虽然内容不变，旧路径仍属于玩家本地
@@ -1583,10 +1884,12 @@ foreach ($file in @($manifest.files)) {
         }
     }
     if ($exists) { Backup-FileIfExists -Path $target -Rel $rel -BackupRoot $backupRoot }
+    Add-SyncIntent -Rel $rel -Sha1 $expected
     [void]$downloadJobs.Add([pscustomobject]@{ File=$file; Target=$target; Expected=$expected; Rel=$rel; Key=$relKey; Force=$forceSync })
 }
 
 if ($downloadJobs.Count) {
+    Save-SyncJournal
     $workers = [Math]::Max(1, [Math]::Min(8, [int](Get-PropertyValue -Object $manifest -Name 'downloadWorkers' -Default 4)))
     $workers = [Math]::Min($workers, $downloadJobs.Count)
     Write-Host ("[同步] 需要更新 {0} 个文件（并行 {1}）。" -f $downloadJobs.Count, $workers)
@@ -1608,6 +1911,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 try {
     $script:HybridManifest = $args[2]
     $script:HybridManifestUrl = $args[3]
+    $script:SyncRoot = $args[4]
     $job = $args[0]
     $source = Download-ManifestEntry -File $job.File -BaseUrl $args[1] -Destination $job.Target -ExpectedSha1 $job.Expected -Rel $job.Rel
     [pscustomobject]@{ Job=$job; Source=$source; Record=(Get-FileVerifyRecord -Path $job.Target -Sha1 $job.Expected); Error=$null }
@@ -1623,7 +1927,7 @@ try {
             while ($next -lt $downloadJobs.Count -and $pending.Count -lt $workers) {
                 $ps = [PowerShell]::Create()
                 $ps.RunspacePool = $pool
-                [void]$ps.AddScript($workerCode).AddArgument($downloadJobs[$next]).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl)
+                [void]$ps.AddScript($workerCode).AddArgument($downloadJobs[$next]).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl).AddArgument($instanceRoot)
                 [void]$pending.Add([pscustomobject]@{ Shell=$ps; Handle=$ps.BeginInvoke(); Job=$downloadJobs[$next] })
                 $next++
             }
@@ -1639,13 +1943,13 @@ try {
                     $downloaded++
                     [void]$updatedPaths.Add($job.Rel)
                     if ($job.Force) { [void]$forcedAppliedPaths.Add($job.Rel) }
-                    $label = if ($result.Source -eq 'official') { '[官方源]' } else { '[更新]' }
+                    $label = if ($result.Source -eq 'official') { '[官方源]' } elseif ($result.Source -eq 'staged') { '[缓存]' } else { '[更新]' }
                     Write-Host "$label $($job.Rel)"
                 } catch {
                     if (Test-OptionalHelperFile -Rel $task.Job.Rel) {
                         Write-SyncWarning "辅助脚本未更新：$($task.Job.Rel)"
                         $preserved++
-                    } elseif (-not $hardError) { $hardError = "文件下载失败：$($task.Job.Rel)；$($_.Exception.Message)" }
+                    } elseif (-not $hardError) { $hardError = Format-UpdateError -ErrorRecord $_ -Path $task.Job.Rel }
                 } finally { $task.Shell.Dispose(); [void]$pending.Remove($task) }
             }
             if ($pending.Count) { Start-Sleep -Milliseconds 100 }
@@ -1677,28 +1981,14 @@ foreach ($oldKey in @($previousMap.Keys)) {
     $removed++
 }
 
-foreach ($pattern in $forceDeleteGlobs) {
-    $patternText = Normalize-Rel ([string]$pattern)
-    if ([string]::IsNullOrWhiteSpace($patternText)) { continue }
-    if (-not (Test-RelativePathSafe -Rel ($patternText.Replace('*', 'x').Replace('?', 'x')))) { throw "Unsafe forceDelete glob: $patternText" }
-    $matches = @()
-    if ($patternText -match '[*?]') {
-        $matches = Get-ChildItem -LiteralPath $instanceRoot -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object {
-            $rel = $_.FullName.Substring($instanceRoot.Length).TrimStart('\', '/') -replace '\\', '/'
-            (-not (Test-ProtectedRel -Rel $rel)) -and (Test-GlobMatch -Rel $rel -Globs @($patternText))
-        }
-    } else {
-        if (Test-ProtectedRel -Rel $patternText) { continue }
-        $exact = Join-SafeRelativePath -Root $instanceRoot -Rel $patternText
-        if (Test-Path -LiteralPath $exact -PathType Leaf) { $matches = @(Get-Item -LiteralPath $exact) }
-    }
-    foreach ($match in $matches) {
-        $rel = $match.FullName.Substring($instanceRoot.Length).TrimStart('\', '/') -replace '\\', '/'
-        Backup-FileIfExists -Path $match.FullName -Rel $rel -BackupRoot $backupRoot
-        Remove-Item -LiteralPath $match.FullName -Force
-        Write-Host "[强制删除] $rel"
-        $removed++
-    }
+foreach ($match in $forceDeleteTargets) {
+    $rel = Normalize-Rel $match.FullName.Substring($instanceRoot.Length).TrimStart('\','/')
+    if (-not [IO.File]::Exists($match.FullName)) { continue }
+    Assert-SafeAbsolutePath -Path $match.FullName
+    Backup-FileIfExists -Path $match.FullName -Rel $rel -BackupRoot $backupRoot
+    Remove-Item -LiteralPath $match.FullName -Force
+    Write-Host "[强制删除] $rel"
+    $removed++
 }
 
 foreach ($dir in $additiveDirs) {
@@ -1754,7 +2044,8 @@ $stateOut = [ordered]@{
     files = $manifest.files
     verified = $verifiedOut
 }
-Write-Utf8NoBom -Path $statePath -Value (($stateOut | ConvertTo-Json -Depth 8) + "`r`n")
+Save-SyncState -Path $statePath -Value $stateOut
+if ([IO.File]::Exists($script:JournalPath)) { [IO.File]::Delete($script:JournalPath) }
 $configApplied = @(@($updatedPaths) + @($adoptedPaths) | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })
 $forcedAppliedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($rel in $forcedAppliedPaths) { [void]$forcedAppliedSet.Add($rel) }
@@ -1781,3 +2072,10 @@ if (-not $NoPause) {
     Write-Host '按回车关闭。'
     [void][Console]::ReadLine()
 }
+
+} catch {
+    Write-Host (Format-UpdateError -ErrorRecord $_) -ForegroundColor Red
+    Write-Host '[同步] 更新未完成，请处理上述问题后重新运行；成功前不要启动游戏。' -ForegroundColor Yellow
+    if (-not $NoPause) { Write-Host '按回车关闭。'; [void][Console]::ReadLine() }
+    exit 1
+} finally { Exit-SyncLock -Handle $syncLock }

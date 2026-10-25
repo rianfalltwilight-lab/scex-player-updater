@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import concurrent.futures
+import contextlib
 import datetime as dt
 import fnmatch
 import hashlib
@@ -20,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 
 # 家宽更新源是 DDNS 直连地址，绝不该走系统代理。macOS 上 urllib 会自动读取系统代理
@@ -98,11 +100,9 @@ def sha1(path: pathlib.Path) -> str:
 
 
 def safe_rel(rel: str) -> str:
-    rel = str(rel).replace("\\", "/").strip().lstrip("/")
-    if not rel or rel.startswith("/") or ":" in pathlib.PurePosixPath(rel).parts[0]:
-        raise ValueError(f"unsafe manifest path: {rel}")
+    rel = str(rel).replace("\\", "/").strip()
     parts = rel.split("/")
-    if any(part in ("", ".", "..") for part in parts):
+    if not rel or rel.startswith("/") or any(part in ("", ".", "..") or ":" in part for part in parts):
         raise ValueError(f"unsafe manifest path: {rel}")
     return rel
 
@@ -112,7 +112,16 @@ def rel_key(rel: str) -> str:
 
 
 def join_safe(root: pathlib.Path, rel: str) -> pathlib.Path:
-    return root.joinpath(*safe_rel(rel).split("/"))
+    base = root.absolute()
+    target = base.joinpath(*safe_rel(rel).split("/"))
+    # Do not follow a junction/symlink in any parent, even when the final file
+    # itself has ordinary attributes. Root has already been resolved by main.
+    if os.path.normcase(str(base.resolve())) != os.path.normcase(str(base)):
+        raise LocalFileUpdateError(f"[路径错误] 更新目录经过链接，已停止写入：{root}")
+    resolved = target.resolve()
+    if not resolved.is_relative_to(base) or resolved != target:
+        raise LocalFileUpdateError(f"[路径错误] 更新目标经过链接或越出目录，已停止写入：{rel}")
+    return target
 
 
 _PRIMARY_UPDATE_URL_FILES = (
@@ -220,6 +229,8 @@ def backup_file(path: pathlib.Path, root: pathlib.Path, rel: str, backup_root: p
     if not path.is_file():
         return
     dest = join_safe(backup_root, rel)
+    if dest.exists():
+        return  # Retain the version from before this run's first modification.
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, dest)
 
@@ -398,7 +409,7 @@ def looks_like_current_file(path: pathlib.Path, expected: str, manifest_size, pr
             except (TypeError, ValueError):
                 pass
             return sha1(path) == expected
-        return True
+        return sha1(path) == expected
     if v_sha == expected:
         try:
             if int(verified.get("size", -1)) == size and int(verified.get("mtime", -1)) == int(path.stat().st_mtime):
@@ -483,9 +494,9 @@ def official_urls(item) -> list:
 
 def download_fail_reason(exc: BaseException) -> str:
     msg = str(exc)
-    if "SHA1" in msg:
+    if "SHA1" in msg or "校验失败" in msg:
         return "哈希不符"
-    if "too slow" in msg.lower() or "太慢" in msg:
+    if "too slow" in msg.lower() or "太慢" in msg or "过低" in msg:
         return "太慢"
     if "timed out" in msg.lower() or "timeout" in msg.lower() or "超时" in msg:
         return "超时"
@@ -520,19 +531,121 @@ def copy_response(resp, out, timeout: int, min_bytes_after_timeout: int = 0, min
         next_check = elapsed + max(1.0, float(timeout))
 
 
-def install_verified_file(temporary, destination):
+class UpdateError(RuntimeError):
+    """A player-facing, localized failure with no private endpoint details."""
+
+
+class LocalFileUpdateError(UpdateError):
+    """A local write/replace failure; changing download sources cannot fix it."""
+
+
+def local_file_error(exc, path, phase="写入文件"):
+    code = getattr(exc, "winerror", None)
+    number = getattr(exc, "errno", None)
+    if code in (32, 33):
+        return LocalFileUpdateError(
+            f"[文件占用] {path}\n文件正在被其他程序使用，无法{phase}。原有文件未删除。"
+            "请完全退出 Minecraft（不是返回标题界面），关闭打开该文件的压缩软件；"
+            "若仍失败，请关闭该游戏实例残留的后台进程后重新运行更新器。")
+    if code in (39, 112) or number == 28:
+        return LocalFileUpdateError(f"[空间不足] 无法{phase}：{path}。请清理该磁盘空间后重新更新。")
+    if code == 5 or isinstance(exc, PermissionError):
+        return LocalFileUpdateError(f"[权限不足] 无法{phase}：{path}。请检查文件夹权限和安全软件的拦截记录后重试。")
+    diagnostic = f"系统错误码 {code if code is not None else number}" if code is not None or number is not None else type(exc).__name__
+    return LocalFileUpdateError(f"[替换失败] 无法{phase}：{path}（{diagnostic}）。请检查文件路径和磁盘状态后重试。")
+
+
+def network_error_reason(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        details = {403: "更新源拒绝访问", 404: "更新源没有此文件", 429: "更新服务繁忙"}
+        return details.get(exc.code, "更新服务返回错误") + f"（HTTP {exc.code}）"
+    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if "too slow" in str(cause).lower():
+        return "下载速度持续过低"
+    if isinstance(cause, (TimeoutError, socket.timeout)) or "timed out" in str(cause).lower():
+        return "网络连接或读取超时"
+    if isinstance(cause, socket.gaierror):
+        return "域名解析失败"
+    if "ssl" in type(cause).__name__.lower() or "certificate" in str(cause).lower():
+        return "安全连接失败，请检查网络、代理和系统时间"
+    return "无法连接更新源或连接已中断"
+
+
+def windows_file_probe(path):
+    """Return a Windows open error, if any; never change the tested file."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = api.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    handle = create(str(path), 0x80000000, 0, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        return ctypes.WinError(ctypes.get_last_error())
+    api.CloseHandle(handle)
+    return None
+
+
+def preflight_managed_files(root, files):
+    """Probe Windows sharing locks before edits; POSIX open files differ."""
+    if os.name != "nt":
+        return
+    seen = set()
+    for item in files:
+        rel = safe_rel(str(item["path"]))
+        key = rel.casefold()
+        if key in seen or is_optional_helper(rel):
+            continue  # Entry-point shells may legitimately hold their own scripts.
+        seen.add(key)
+        target = join_safe(root, rel)
+        if not target.is_file():
+            continue
+        exc = windows_file_probe(target)
+        if exc is not None:
+            if exc.winerror in (2, 3):
+                continue  # A file removed between the existence check and open.
+            message = str(local_file_error(exc, rel, "开始同步"))
+            raise LocalFileUpdateError(message + "\n本次预检未通过，尚未开始替换、删除或清理客户端文件。") from None
+
+
+def install_verified_file(temporary, destination, expected_sha1=None):
     # Same-volume atomic replacement; never unlink the previous file first.
     if destination.is_symlink():
-        raise OSError('Refusing to replace a symlink')
+        raise LocalFileUpdateError(f"[路径错误] 更新目标是链接，已停止替换：{destination}")
+    destination = join_safe(destination.parent, destination.name)
+    if _ACTIVE_JOURNAL is not None:
+        try:
+            rel = destination.relative_to(_ACTIVE_JOURNAL.root).as_posix()
+        except ValueError:
+            rel = None
+        if rel is not None:
+            try:
+                _ACTIVE_JOURNAL.record(rel, expected_sha1 or sha1(temporary))
+            except OSError as exc:
+                raise local_file_error(exc, _ACTIVE_JOURNAL.path, "保存恢复记录") from None
     old_mode = destination.stat().st_mode if destination.is_file() else None
     try:
         if os.name == 'nt' and old_mode is not None:
             destination.chmod(old_mode | 0o200)
         os.replace(temporary, destination)
-    except OSError:
+    except OSError as exc:
+        # MoveFileEx may report access denied for an open destination. Confirm a
+        # sharing lock before labeling it a permission problem.
+        if getattr(exc, "winerror", None) == 5:
+            probe_error = windows_file_probe(destination)
+            if probe_error is not None and probe_error.winerror in (32, 33):
+                exc = probe_error
         if old_mode is not None and destination.is_file():
-            destination.chmod(old_mode)
-        raise
+            try:
+                destination.chmod(old_mode)
+            except OSError:
+                pass  # Keep the original failure; never delete the destination.
+        raise local_file_error(exc, destination, "替换文件") from None
 
 
 _BUSY_STATUSES = (429, 500, 502, 503, 504)
@@ -563,47 +676,88 @@ def busy_retry_delay(exc, busy_attempt):
 
 
 def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None, timeout=60, retries=1, min_bytes_after_timeout=0, min_rate_bps=0, backoff=True):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".portable-sync-", suffix=".tmp", dir=dest.parent)
-    os.close(fd)
-    tmp = pathlib.Path(tmp_name)
-    opener = opener or _DIRECT_OPENER
-    req = urllib.request.Request(url, headers={"User-Agent": _SYNC_UA})
+    expected_sha1 = str(expected_sha1).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha1):
+        raise UpdateError("[清单无效] 文件校验值无效，已停止下载。")
     try:
-        last_exc = None
-        attempt = 0
-        busy_attempt = 0
-        while True:
-            try:
-                with opener.open(req, timeout=timeout) as resp, tmp.open("wb") as out:
-                    copy_response(resp, out, timeout, min_bytes_after_timeout, min_rate_bps)
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                # BUSY_BACKOFF_V1: 429/5xx means "busy", not "broken"; wait and retry.
-                delay = busy_retry_delay(exc, busy_attempt) if backoff else None
-                if isinstance(exc, urllib.error.HTTPError):
-                    exc.close()
-                if delay is not None:
-                    busy_attempt += 1
-                    sync_print(f"[同步] 更新服务繁忙（{busy_status(exc)}），{delay:.1f} 秒后重试：{mask_url(url)}")
-                    time.sleep(delay)
-                    continue
-                if attempt < retries:
-                    attempt += 1
-                    time.sleep(2)
-                    continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        remove_obsolete_parts(dest, expected_sha1)
+        tmp = part_path(dest, expected_sha1)
+    except OSError as exc:
+        raise local_file_error(exc, dest, "创建下载临时文件") from None
+    opener = opener or _DIRECT_OPENER
+    if tmp.is_file() and sha1(tmp) == expected_sha1:
+        install_verified_file(tmp, dest, expected_sha1)
+        return
+    attempt = busy_attempt = 0
+    range_restarted = False
+    while True:
+        offset = tmp.stat().st_size if tmp.is_file() else 0
+        headers = {"User-Agent": _SYNC_UA, "Accept-Encoding": "identity"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with opener.open(req, timeout=timeout) as response:
+                status = getattr(response, "status", None) or 200
+                response_headers = getattr(response, "headers", {})
+                content_range = str(response_headers.get("Content-Range", ""))
+                total = None
+                if status == 206:
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+                    if not match or int(match[1]) != offset or int(match[2]) < offset or int(match[3]) <= int(match[2]):
+                        if tmp.exists():
+                            tmp.unlink()
+                        if range_restarted:
+                            raise UpdateError("[下载失败] 更新源返回的续传范围无效，请稍后重试。")
+                        range_restarted = True
+                        continue
+                    total = int(match[3])
+                    mode = "ab"
+                    if offset:
+                        sync_print(f"[续传] {dest.name}：从 {offset} 字节继续下载。")
+                elif status == 200:
+                    mode = "wb"  # A server may ignore Range; never append a full body.
+                    offset = 0
+                else:
+                    raise UpdateError(f"[下载失败] 更新源返回 HTTP {status}，请稍后重试。")
+                with tmp.open(mode) as out:
+                    copy_response(response, out, timeout, min_bytes_after_timeout, min_rate_bps)
+                received = tmp.stat().st_size - offset
+                length = response_headers.get("Content-Length")
+                if (length is not None and received != int(length)) or (total is not None and tmp.stat().st_size != total):
+                    raise ConnectionError("incomplete response")
+            break
+        except Exception as exc:
+            if isinstance(exc, LocalFileUpdateError):
                 raise
-        if last_exc is not None:
-            raise last_exc
-        actual = sha1(tmp)
-        if actual != expected_sha1.lower():
-            raise RuntimeError(f"SHA1 mismatch for {mask_url(url)}. expected={expected_sha1} actual={actual}")
-        install_verified_file(tmp, dest)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+            if isinstance(exc, OSError) and not isinstance(exc, urllib.error.URLError) and (
+                    getattr(exc, "winerror", None) in (5, 32, 33, 39, 112) or getattr(exc, "errno", None) in (13, 28)):
+                raise local_file_error(exc, dest, "写入下载临时文件") from None
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 416 and offset and not range_restarted:
+                exc.close()
+                tmp.unlink(missing_ok=True)
+                range_restarted = True
+                continue
+            delay = busy_retry_delay(exc, busy_attempt) if backoff else None
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+            if delay is not None:
+                busy_attempt += 1
+                sync_print(f"[同步] 更新服务繁忙（{busy_status(exc)}），{delay:.1f} 秒后重试：{mask_url(url)}")
+                time.sleep(delay)
+                continue
+            if attempt < retries:
+                attempt += 1
+                time.sleep(2)
+                continue
+            if isinstance(exc, UpdateError):
+                raise
+            raise UpdateError(f"[下载失败] {dest.name}：{network_error_reason(exc)}。已保留下载进度，请检查网络后重试。") from None
+    if sha1(tmp) != expected_sha1:
+        tmp.unlink(missing_ok=True)
+        raise UpdateError(f"[校验失败] {dest.name}：下载内容与清单不一致，旧文件未替换。请重新更新；反复失败时联系管理员。")
+    install_verified_file(tmp, dest, expected_sha1)
 
 
 # HYBRID_DOWNLOAD_V1: mirrors supply bytes only, never policy or a different release.
@@ -685,6 +839,8 @@ def download_hybrid_entry(item, dest, expected, rel):
                           opener=_DIRECT_OPENER, timeout=home_timeout_sec(item.get("size", 0)), retries=0,
                           min_rate_bps=65536 if len(sources)>1 else 0)
             return 'home'
+        except LocalFileUpdateError:
+            raise
         except Exception as exc:
             error = exc
             sync_print('[混合源] 下载失败、低速或校验不符，正在切换备用源。')
@@ -707,6 +863,8 @@ def download_manifest_entry(item, base_url: str, dest: pathlib.Path, expected_sh
                               min_bytes_after_timeout=_OFFICIAL_MIN_BYTES,
                               min_rate_bps=_OFFICIAL_MIN_RATE, backoff=False)
                 return "official"
+            except LocalFileUpdateError:
+                raise
             except Exception as exc:
                 sync_print(f"[同步] {urllib.parse.urlsplit(url).hostname} 不可用（{download_fail_reason(exc)}），继续尝试下一下载源：{rel}")
     if _HYBRID is not None:
@@ -739,6 +897,10 @@ def existing_hash_index(root: pathlib.Path) -> dict:
             if not path.is_file():
                 continue
             rel = path.relative_to(root).as_posix()
+            try:
+                path = join_safe(root, rel)
+            except LocalFileUpdateError:
+                continue  # A shared/link directory is not an owned adoption source.
             if rel.startswith("mods/.connector/") or "/.connector/" in rel:
                 continue
             digest = sha1(path)
@@ -1366,23 +1528,12 @@ def disable_duplicate_mods(root: pathlib.Path, manifest: dict):
         print(f"[修复] 重复 mod 清理完成，移动 {moved} 个")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Portable Minecraft player updater")
-    parser.add_argument("--instance-dir", default=".")
-    parser.add_argument("--manifest-url", default="")
-    args = parser.parse_args()
-
-    root = pathlib.Path(args.instance_dir).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+def sync_instance(root, args) -> int:
+    global _ACTIVE_JOURNAL
     reset_download_policy()
     manifest_urls = read_update_urls(root, args.manifest_url)
-    state_path = root / ".portable-sync-state.json"
-    state = {}
-    if state_path.is_file():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            state = {}
+    state_path = join_safe(root, ".portable-sync-state.json")
+    state = read_state(root)
     last_good = "" if args.manifest_url else str(state.get("lastManifestUrl") or "")
     if not args.manifest_url:
         manifest_urls = order_manifest_urls(manifest_urls, last_good)
@@ -1431,7 +1582,7 @@ def main() -> int:
             manifest = None
     if manifest is None:
         raise SystemExit(
-            f"[同步] 清单获取失败：{last_exc}。已尝试 {len(manifest_urls)} 个更新地址。"
+            f"[清单获取失败] {network_error_reason(last_exc)}。已尝试 {len(manifest_urls)} 个更新地址。"
             "请确认当前更新地址可达，以及路由器已把更新端口转到服机。"
         )
     manifest_url = selected_manifest_url
@@ -1439,19 +1590,22 @@ def main() -> int:
         print(f"[同步] 沿用上次可用更新地址：{mask_url(manifest_url)}")
     elif manifest_url != manifest_urls[0]:
         print(f"[同步] 已切换到可用备用地址：{mask_url(manifest_url)}")
+    validate_manifest(root, manifest)
     files = manifest.get("files") or []
+    _ACTIVE_JOURNAL = RecoveryJournal(root, manifest)
+    previous_files = _ACTIVE_JOURNAL.previous_files(state.get("files") or [])
     if not files:
         raise SystemExit("清单没有 files 文件列表。")
     base_url = manifest_url.rsplit("/", 1)[0] + "/"
     configure_hybrid(manifest, manifest_url)
-    initial_sync = not bool(state.get("files"))
+    initial_sync = not bool(previous_files)
     previous_version = str(state.get("version") or "")
     current_version = str(manifest.get("version") or "")
     version_changed = previous_version != current_version
-    previous = file_map(state.get("files"))
+    previous = file_map(previous_files)
     # key 是小写化的，删除旧文件时要还原状态文件里的原始大小写（大小写敏感卷才找得到文件）。
     previous_rel = {}
-    for item in state.get("files") or []:
+    for item in previous_files:
         p = item.get("path")
         if p and item.get("sha1"):
             try:
@@ -1480,8 +1634,13 @@ def main() -> int:
     cleanup = manifest.get("cleanup") or {}
     preserve_player = bool(manifest.get("preservePlayerCustomizations", True))
     adopt_existing = bool(manifest.get("adoptExistingFiles", True))
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid.uuid4().hex[:6]
     backup_root = root / ".portable-sync-backups" / stamp
+
+    planned_cleanup = cleanup_candidates(root, force_delete_globs)
+    extra_targets = [{"path": p.relative_to(root).as_posix()} for p in planned_cleanup]
+    extra_targets.extend({"path": str(rel)} for rel in ((manifest.get("playerOptions") or {}).get("targets") or ["options.txt"]))
+    preflight_managed_files(root, list(files) + previous_files + extra_targets)
 
     if cleanup.get("removeConnectorCache", True):
         remove_connector_cache(root)
@@ -1556,6 +1715,7 @@ def main() -> int:
             if picked is not None:
                 src, mode = picked
                 target.parent.mkdir(parents=True, exist_ok=True)
+                _ACTIVE_JOURNAL.record(rel, expected)
                 if mode == "move":
                     # Same-hash adoption is usually a managed rename. Content is unchanged,
                     # but the old local path is still being mutated, so preserve it first.
@@ -1582,14 +1742,19 @@ def main() -> int:
     def run_download_job(job):
         item, target, expected, rel, key, force_sync = job
         try:
-            source = download_manifest_entry(item, base_url, target, expected, rel)
+            if install_stage_cache(root, rel, target, expected):
+                source = "cache"
+            else:
+                source = download_manifest_entry(item, base_url, target, expected, rel)
             ensure_executable_if_needed(target, rel)
-            sync_print(f"[官方源] {rel}" if source == "official" else f"[更新] {rel}")
+            sync_print(f"[预下载缓存] {rel}" if source == "cache" else (f"[官方源] {rel}" if source == "official" else f"[更新] {rel}"))
             return key, rel, force_sync, file_verify_record(target, expected), None
         except Exception as exc:
             if is_optional_helper(rel):
                 sync_print(f"[警告] 辅助脚本未更新：{rel}；{exc}")
                 return key, rel, force_sync, None, "optional"
+            if not isinstance(exc, UpdateError):
+                exc = local_file_error(exc, rel) if isinstance(exc, OSError) else UpdateError(f"[文件更新失败] {rel}。请截图联系管理员（{type(exc).__name__}）。")
             return key, rel, force_sync, None, exc
 
     if download_jobs:
@@ -1642,36 +1807,24 @@ def main() -> int:
         print(f"[删除旧文件] {old_rel}")
         removed += 1
 
-    # 每个 pattern 现场枚举，避免用过期快照对已删文件二次 unlink；
-    # 并跳过同步自身的备份/归档目录。
-    for pattern in force_delete_globs:
-        pattern = str(pattern).replace("\\", "/").lstrip("/")
-        safe_rel(pattern.replace("*", "x").replace("?", "x"))
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(root).as_posix()
-            if is_protected_rel(rel):
-                continue
-            if glob_match(rel, [pattern]):
-                backup_file(path, root, rel, backup_root)
-                path.unlink()
-                print(f"[强制删除] {rel}")
-                removed += 1
+    for path in planned_cleanup:
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        path = join_safe(root, rel)
+        backup_file(path, root, rel, backup_root)
+        path.unlink()
+        print(f"[强制删除] {rel}")
+        removed += 1
 
     # 本平台排除项：清除本地任何匹配文件（含清单外的孤儿，如 macOS 上 YSM 残留的 builtin 模型）。
     if platform_excludes:
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
+        for path in cleanup_candidates(root, platform_excludes):
             rel = path.relative_to(root).as_posix()
-            if is_protected_rel(rel):
-                continue
-            if glob_match(rel, platform_excludes):
-                backup_file(path, root, rel, backup_root)
-                path.unlink()
-                print(f"[跳过本平台并清除] {rel}")
-                removed += 1
+            backup_file(path, root, rel, backup_root)
+            path.unlink()
+            print(f"[跳过本平台并清除] {rel}")
+            removed += 1
 
     for dirname in additive_dirs:
         try:
@@ -1729,7 +1882,8 @@ def main() -> int:
         "files": files,
         "verified": verified,
     }
-    state_path.write_text(json.dumps(state_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    save_state(root, state_out)
+    _ACTIVE_JOURNAL.finish()
     config_applied = [
         rel for rel in updated_paths + adopted_paths
         if rel.lower().startswith(("config/", "defaultconfigs/"))
@@ -1754,8 +1908,302 @@ def main() -> int:
     return 0
 
 
+
+_ACTIVE_JOURNAL = None
+
+
+def atomic_json(path, value):
+    path = join_safe(path.parent, path.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".portable-sync-write-", suffix=".tmp", dir=path.parent)
+    temp = pathlib.Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def read_state_file(path):
+    value = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict) or not isinstance(value.get("files"), list):
+        raise ValueError("invalid state")
+    for item in value["files"]:
+        safe_rel(str(item["path"]))
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", str(item.get("sha1", ""))):
+            raise ValueError("invalid state hash")
+    return value
+
+
+def read_state(root):
+    path = join_safe(root, ".portable-sync-state.json")
+    previous = join_safe(root, ".portable-sync-state.prev.json")
+    if not path.exists() and not previous.exists():
+        return {}
+    for candidate in (path, previous):
+        try:
+            value = read_state_file(candidate)
+            if candidate == previous:
+                sync_print("[恢复] 上次同步状态无法读取，已采用上一份有效状态，继续保留玩家修改和删除。")
+            return value
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    raise UpdateError("[状态损坏] 同步状态及其备份均无法读取。已停止更新，请保留此目录并联系管理员，避免误恢复你删除的文件。")
+
+
+def save_state(root, value):
+    path = join_safe(root, ".portable-sync-state.json")
+    previous = join_safe(root, ".portable-sync-state.prev.json")
+    if path.is_file():
+        try:
+            old = read_state_file(path)
+        except (OSError, ValueError, KeyError, TypeError):
+            old = None
+        if old is not None:
+            atomic_json(previous, old)
+    elif not path.exists() and not previous.exists():
+        atomic_json(previous, value)  # First successful sync also has a recovery point.
+    atomic_json(path, value)
+
+
+@contextlib.contextmanager
+def instance_lock(root):
+    path = join_safe(root, ".portable-sync.lock")
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = api.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        api.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = create(str(path), 0xC0000000, 0, None, 4, 0x80, None)
+        if handle == ctypes.c_void_p(-1).value:
+            code = ctypes.get_last_error()
+            if code in (32, 33):
+                raise UpdateError("[更新器已运行] 此实例已有更新或预下载任务正在处理，请等待它完成后再试。")
+            raise local_file_error(ctypes.WinError(code), path, "取得更新锁")
+        try:
+            yield
+        finally:
+            api.CloseHandle(handle)
+    else:
+        import fcntl
+        with path.open("a+b") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise UpdateError("[更新器已运行] 此实例已有更新或预下载任务正在处理，请等待它完成后再试。") from None
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+class LogTee:
+    def __init__(self, stream, log, mutex):
+        self.stream, self.log, self.mutex = stream, log, mutex
+    def write(self, text):
+        # Logs retain endpoint hosts only, never access-token paths or queries.
+        def hide(match):
+            try:
+                parsed = urllib.parse.urlsplit(match.group(0))
+                return parsed.scheme + "://" + (parsed.hostname or "更新源") + "/***"
+            except ValueError:
+                return "[更新地址已隐藏]"
+        clean = re.sub(r"https?://[^\s；，。]+", hide, str(text))
+        with self.mutex:
+            self.stream.write(text)
+            self.log.write(clean)
+            self.log.flush()
+        return len(text)
+    def flush(self):
+        self.stream.flush()
+        self.log.flush()
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+@contextlib.contextmanager
+def sync_log(root):
+    path = join_safe(root, ".portable-sync-logs/latest.log")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as log:
+        lock = threading.Lock()
+        with contextlib.redirect_stdout(LogTee(sys.stdout, log, lock)), contextlib.redirect_stderr(LogTee(sys.stderr, log, lock)):
+            yield
+
+
+class RecoveryJournal:
+    def __init__(self, root, manifest):
+        self.root = root
+        self.path = join_safe(root, ".portable-sync-pending.json")
+        self.lock = threading.Lock()
+        self.data = {"format": 1, "packId": str(manifest.get("packId") or manifest.get("pack") or ""),
+                     "version": str(manifest.get("version") or ""), "applied": {}}
+        if self.path.is_file():
+            try:
+                old = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                if str(old.get("packId") or "") == self.data["packId"]:
+                    for record in (old.get("applied") or {}).values():
+                        rel = safe_rel(str(record["path"]))
+                        digest = str(record["sha1"]).lower()
+                        if re.fullmatch(r"[0-9a-f]{40}", digest) and sha1(join_safe(root, rel)) == digest:
+                            self.data["applied"][rel.lower()] = {"path": rel, "sha1": digest}
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise UpdateError("[恢复记录损坏] 未完成更新的记录无法读取，已停止更新，请联系管理员。") from None
+    def previous_files(self, files):
+        rows = {rel_key(str(row["path"])): dict(row) for row in files}
+        rows.update(self.data["applied"])
+        if self.data["applied"]:
+            sync_print(f"[恢复] 已识别上次未完成更新写入的 {len(self.data['applied'])} 个文件，将继续按最新清单处理。")
+        return list(rows.values())
+    def record(self, rel, digest):
+        rel = safe_rel(rel)
+        with self.lock:
+            self.data["applied"][rel.lower()] = {"path": rel, "sha1": str(digest).lower()}
+            atomic_json(self.path, self.data)
+    def finish(self):
+        if self.path.exists():
+            self.path.unlink()
+
+
+def validate_manifest(root, manifest):
+    rows = manifest.get("files")
+    if not isinstance(rows, list) or not rows:
+        raise UpdateError("[清单无效] 更新清单没有有效的文件列表，请联系管理员。")
+    seen = set()
+    for row in rows:
+        try:
+            rel = safe_rel(str(row["path"]))
+            join_safe(root, rel)
+            digest = str(row["sha1"])
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", digest):
+                raise ValueError("hash")
+            if "size" in row and int(row["size"]) < 0:
+                raise ValueError("size")
+        except (KeyError, TypeError, ValueError):
+            raise UpdateError("[清单无效] 文件路径、大小或校验值无效，请联系管理员。") from None
+        key = rel.lower()
+        if key in seen:
+            raise UpdateError(f"[清单无效] 文件路径重复：{rel}。已停止更新，请联系管理员。")
+        seen.add(key)
+        if glob_match(rel, manifest.get("forceDeleteGlobs") or []):
+            raise UpdateError(f"[清单无效] 同一文件同时要求安装和删除：{rel}。请联系管理员。")
+    for rel in (manifest.get("playerOptions") or {}).get("targets") or ["options.txt"]:
+        join_safe(root, str(rel))
+
+
+def part_path(destination, expected):
+    suffix = hashlib.sha256(destination.name.encode("utf-8")).hexdigest()[:16]
+    return join_safe(destination.parent, f".portable-part-{expected.lower()}-{suffix}.tmp")
+
+
+def remove_obsolete_parts(destination, expected):
+    current = part_path(destination, expected)
+    suffix = hashlib.sha256(destination.name.encode("utf-8")).hexdigest()[:16]
+    pattern = re.compile(r"\.portable-part-[0-9a-f]{40}-" + suffix + r"\.tmp")
+    if destination.parent.is_dir():
+        for path in destination.parent.glob(f".portable-part-*-{suffix}.tmp"):
+            if path != current and pattern.fullmatch(path.name):
+                join_safe(destination.parent, path.name).unlink(missing_ok=True)
+
+
+def install_stage_cache(root, rel, destination, expected):
+    cached = join_safe(root, ".portable-staging/" + rel)
+    if not cached.is_file() or sha1(cached) != expected:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remove_obsolete_parts(destination, expected)
+    temporary = part_path(destination, expected)
+    shutil.copyfile(cached, temporary)
+    if sha1(temporary) != expected:
+        temporary.unlink()
+        return False
+    install_verified_file(temporary, destination, expected)
+    return True
+
+
+def cleanup_candidates(root, patterns):
+    """Exact paths are direct lookups; wildcard rules share one pruned walk."""
+    found = {}
+    wildcards = []
+    for pattern in patterns or []:
+        pattern = safe_rel(str(pattern))
+        if is_protected_rel(pattern):
+            continue
+        if "*" in pattern or "?" in pattern:
+            wildcards.append(pattern)
+        else:
+            path = join_safe(root, pattern)
+            if path.is_file():
+                found[str(path).lower()] = path
+    if wildcards:
+        for directory, dirs, names in os.walk(root, followlinks=False):
+            base = pathlib.Path(directory)
+            dirs[:] = [name for name in dirs if not name.startswith((".portable-", "_disabled_"))
+                       and not (base / name).is_symlink()
+                       and not getattr(base / name, "is_junction", lambda: False)()]
+            for name in names:
+                path = base / name
+                rel = path.relative_to(root).as_posix()
+                if not is_protected_rel(rel) and glob_match(rel, wildcards):
+                    path = join_safe(root, rel)
+                    if path.is_file():
+                        found[str(path).lower()] = path
+    return sorted(found.values())
+
+
+def main() -> int:
+    global _ACTIVE_JOURNAL
+    parser = argparse.ArgumentParser(description="便携 Minecraft 玩家更新器")
+    parser.add_argument("--instance-dir", default=".")
+    parser.add_argument("--manifest-url", default="")
+    args = parser.parse_args()
+    root = pathlib.Path(args.instance_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with instance_lock(root):
+        with sync_log(root):
+            try:
+                return sync_instance(root, args)
+            except SystemExit as exc:
+                if exc.code:
+                    print(str(exc), file=sys.stderr)
+                raise
+            except Exception as exc:
+                if isinstance(exc, UpdateError):
+                    message = str(exc)
+                elif isinstance(exc, OSError):
+                    message = str(local_file_error(exc, getattr(exc, "filename", None) or "客户端目录"))
+                else:
+                    message = f"[更新失败] 更新未完成，请联系管理员（{type(exc).__name__}）。"
+                print(message, file=sys.stderr)
+                print("[日志] 错误已保存到 .portable-sync-logs/latest.log。", file=sys.stderr)
+                raise UpdateError(message) from None
+            finally:
+                _ACTIVE_JOURNAL = None
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
+        print("[同步已取消] 更新尚未完成，请重新运行更新器后再启动游戏。", file=sys.stderr)
         raise SystemExit(130)
+    except UpdateError as exc:
+        print(str(exc), file=sys.stderr)
+        print("[同步失败] 更新尚未完成，请处理上述问题后重新运行更新器。", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        if isinstance(exc, OSError):
+            message = str(local_file_error(exc, getattr(exc, "filename", None) or "客户端目录"))
+        else:
+            message = f"[更新失败] 更新未完成，请保留截图联系管理员（{type(exc).__name__}）。"
+        print(message, file=sys.stderr)
+        raise SystemExit(1)
