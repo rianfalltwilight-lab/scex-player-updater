@@ -86,7 +86,8 @@ class DownloadRoutingTests(unittest.TestCase):
             self.assertEqual(u.get_proxy_url(), '')
             self.assertIs(u.opener_for_official_url('https://cdn.example/demo.jar'), u._DIRECT_OPENER)
         urls = ['https://first.example/m.json', 'https://second.example/m.json', 'http://192.168.1.2/m.json']
-        self.assertEqual(u.order_manifest_urls(urls), urls)
+        # URL_RULES_V1 (scex): the first public URL, then the listed LAN fallback.
+        self.assertEqual(u.order_manifest_urls(urls), [urls[0], urls[2]])
 
     def test_busy_retry_and_hash_failure_preserve_previous_file(self):
         u = self.updater

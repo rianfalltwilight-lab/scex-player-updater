@@ -1,0 +1,91 @@
+{
+  "rule": "URL_RULES_V1: drop non-http(s) lines and retired hosts (7caiyun.com); use only the first public URL; then the LAN URLs in listed order; duplicates compare case-insensitively; lastGood never reorders.",
+  "implementations": [
+    "tools/player-update-generic.py order_manifest_urls",
+    "tools/portable-stage-daemon.py order_update_urls",
+    "tools/portable-macos-sync.command order_manifest_urls (URL_RULES_BEGIN block)",
+    "tools/player-update-generic.ps1 Get-OrderedManifestUrls",
+    "tools/portable-bootstrap-refresh.ps1 Get-OrderedUpdateUrls",
+    "tools/portable-stage-daemon.ps1 Get-OrderedUpdateUrls"
+  ],
+  "cases": [
+    {
+      "name": "first public then listed LAN",
+      "urls": ["https://a.example/m.json", "http://192.168.1.2/m.json", "https://b.example/m.json"],
+      "lastGood": "",
+      "expected": ["https://a.example/m.json", "http://192.168.1.2/m.json"]
+    },
+    {
+      "name": "last good cannot promote a second public URL",
+      "urls": ["https://a.example/m.json", "http://192.168.1.2/m.json", "https://b.example/m.json"],
+      "lastGood": "https://b.example/m.json",
+      "expected": ["https://a.example/m.json", "http://192.168.1.2/m.json"]
+    },
+    {
+      "name": "LAN only keeps file order",
+      "urls": ["http://192.168.1.2/m.json", "http://10.0.0.5/m.json"],
+      "lastGood": "http://10.0.0.5/m.json",
+      "expected": ["http://192.168.1.2/m.json", "http://10.0.0.5/m.json"]
+    },
+    {
+      "name": "retired cloud host is dropped",
+      "urls": ["https://cdn.7caiyun.com/m.json", "https://a.example/m.json", "http://192.168.1.2/m.json"],
+      "lastGood": "https://cdn.7caiyun.com/m.json",
+      "expected": ["https://a.example/m.json", "http://192.168.1.2/m.json"]
+    },
+    {
+      "name": "only retired hosts leave nothing",
+      "urls": ["https://7caiyun.com/m.json"],
+      "lastGood": "",
+      "expected": []
+    },
+    {
+      "name": "IPv6 ULA is private but an fc-prefixed name is public",
+      "urls": ["http://[fd00::1]:18088/m.json", "https://fcdn.example/m.json"],
+      "lastGood": "",
+      "expected": ["https://fcdn.example/m.json", "http://[fd00::1]:18088/m.json"]
+    },
+    {
+      "name": "IPv4 link-local is private",
+      "urls": ["http://169.254.1.1/m.json", "https://a.example/m.json"],
+      "lastGood": "",
+      "expected": ["https://a.example/m.json", "http://169.254.1.1/m.json"]
+    },
+    {
+      "name": "IPv4-mapped IPv6 LAN address is private",
+      "urls": ["http://[::ffff:192.168.1.5]/m.json", "https://a.example/m.json"],
+      "lastGood": "",
+      "expected": ["https://a.example/m.json", "http://[::ffff:192.168.1.5]/m.json"]
+    },
+    {
+      "name": "duplicates compare case-insensitively",
+      "urls": ["https://A.example/m.json", "https://a.example/m.json", "http://192.168.1.2/m.json"],
+      "lastGood": "",
+      "expected": ["https://A.example/m.json", "http://192.168.1.2/m.json"]
+    },
+    {
+      "name": "localhost and .local names are private",
+      "urls": ["http://localhost:18088/m.json", "http://printer.local/m.json", "https://a.example/m.json"],
+      "lastGood": "",
+      "expected": ["https://a.example/m.json", "http://localhost:18088/m.json", "http://printer.local/m.json"]
+    },
+    {
+      "name": "all of 127/8 is loopback and 172.15 is public",
+      "urls": ["http://127.0.0.2/m.json", "http://172.15.0.1/m.json"],
+      "lastGood": "",
+      "expected": ["http://172.15.0.1/m.json", "http://127.0.0.2/m.json"]
+    },
+    {
+      "name": "non-http lines are ignored",
+      "urls": ["not a url", "ftp://a.example/m.json", "https://a.example/m.json"],
+      "lastGood": "",
+      "expected": ["https://a.example/m.json"]
+    },
+    {
+      "name": "surrounding whitespace is trimmed",
+      "urls": ["  https://a.example/m.json  "],
+      "lastGood": "",
+      "expected": ["https://a.example/m.json"]
+    }
+  ]
+}

@@ -91,7 +91,9 @@ class CloudPublishTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cloud.bridge_source(plan, source, root / 'backups')
 
-    def test_new_configured_source_precedes_retired_last_good(self):
+    def test_new_configured_source_replaces_retired_last_good(self):
+        # URL_RULES_V1 (scex): only the first configured public URL is used, so a
+        # retired last-good address is never probed again.
         new = 'https://cloud.example/server-manifest.json'
         old = 'http://old.example/server-manifest.json'
         for file, function in [('player-update-generic.py', 'order_manifest_urls'),
@@ -101,8 +103,8 @@ class CloudPublishTests(unittest.TestCase):
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             order = getattr(module, function)
-            self.assertEqual(order([new], old), [new, old])
-            self.assertEqual(order([new, old], old), [old, new])
+            self.assertEqual(order([new], old), [new])
+            self.assertEqual(order([new, old], old), [new])
             self.assertEqual(order([new], 'http://192.168.1.2/m.json'), [new])
 
     def test_incremental_last_manifest_and_old_snapshot_retention(self):

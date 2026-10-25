@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @version 13
+# @version 14
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
@@ -137,29 +137,63 @@ else:
             path = root / name
             if path.is_file():
                 manifest_urls.extend(path.read_text(encoding="utf-8-sig").splitlines())
-manifest_urls = list(dict.fromkeys(value.strip() for value in manifest_urls if value.strip() and not value.strip().startswith("#")))
+manifest_urls = [value.strip() for value in manifest_urls if value.strip() and not value.strip().startswith("#")]
+
+# URL_RULES_BEGIN: keep identical to player-update-generic.py (tests/fixtures/url-order-cases.json).
+def is_local_or_private_host(host):
+    host = (host or "").strip().strip("[]").lower().rstrip(".")
+    if host in ("", "localhost") or host.endswith(".local"):
+        return True
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host) and ":" not in host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    b = ip.packed
+    if ip.version == 4:
+        return b[0] in (10, 127) or (b[0] == 172 and 16 <= b[1] <= 31) or (b[0] == 192 and b[1] == 168) or (b[0] == 169 and b[1] == 254)
+    return ip == ipaddress.IPv6Address("::1") or (b[0] & 0xFE) == 0xFC or (b[0] == 0xFE and (b[1] & 0xC0) == 0x80)
 
 def is_private_update_url(url):
-    host = (urllib.parse.urlsplit(url).hostname or "").lower()
-    if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local"):
-        return True
     try:
-        return ipaddress.ip_address(host).is_private
+        return is_local_or_private_host(urllib.parse.urlsplit(str(url).strip()).hostname or "")
     except ValueError:
         return False
 
-last_good = ""
-try:
-    state = json.loads((instance_guess / ".portable-sync-state.json").read_text(encoding="utf-8-sig"))
-    last_good = str(state.get("lastManifestUrl") or state.get("manifestUrl") or "")
-except (OSError, ValueError):
-    pass
-public = [url for url in manifest_urls if not is_private_update_url(url)]
-ordered = ([last_good] if last_good in public else []) + public
-if last_good and not is_private_update_url(last_good):
-    ordered.append(last_good)
-ordered.extend(url for url in manifest_urls if is_private_update_url(url))
-manifest_urls = list(dict.fromkeys(ordered))
+def is_retired_cloud_url(url):
+    try:
+        host = (urllib.parse.urlsplit(str(url)).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == "7caiyun.com" or host.endswith(".7caiyun.com")
+
+def is_usable_update_url(url):
+    """Only absolute http(s) URLs with a host take part in ordering."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url).strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
+def order_manifest_urls(urls, last_good=""):
+    """Drop retired hosts; the first public URL, then listed LAN URLs in file order."""
+    seen = set()
+    out = []
+    usable = [str(url or "").strip() for url in (urls or [])]
+    usable = [url for url in usable if is_usable_update_url(url) and not is_retired_cloud_url(url)]
+    public = [url for url in usable if not is_private_update_url(url)]
+    for url in public[:1] + [url for url in usable if is_private_update_url(url)]:
+        if url.lower() not in seen:
+            seen.add(url.lower())
+            out.append(url)
+    return out
+# URL_RULES_END
+
+manifest_urls = order_manifest_urls(manifest_urls)
 if not manifest_urls:
     print("[更新器] 未找到更新地址，将使用包内同步脚本。")
     raise SystemExit(0)
@@ -196,8 +230,12 @@ def install_bytes(payload, dest, executable=False):
             temp.unlink()
 
 restart = False
+rows_by_path = {}
+for row in selected_manifest["files"]:
+    if isinstance(row, dict) and isinstance(row.get("path"), str):
+        rows_by_path.setdefault(row["path"], []).append(row)
 for name in ("player-update-generic.py", "player-update-generic.ps1", "portable-stage-daemon.py", "portable-stage-daemon.ps1", "portable-bootstrap-refresh.ps1", "Windows-sync.bat", "macOS-sync.command"):
-    entries = [row for row in selected_manifest["files"] if isinstance(row, dict) and row.get("path") == "_updater/" + name]
+    entries = rows_by_path.get("_updater/" + name, [])
     if (len(entries) != 1 or not re.fullmatch(r"[0-9a-fA-F]{40}", str(entries[0].get("sha1", ""))) or
             not isinstance(entries[0].get("size"), int) or entries[0]["size"] < 0):
         print(f"[更新器] 清单未提供有效校验信息，保留本地 {name}。")
@@ -206,12 +244,18 @@ for name in ("player-update-generic.py", "player-update-generic.ps1", "portable-
     dest = script_dir / name
     url = urllib.parse.urljoin(base, "_updater/" + urllib.parse.quote(name)) + "?t=" + str(int(time.time() * 1000))
     try:
-        payload = fetch_bytes(url, timeout=12)
-        if len(payload) != entry["size"] or hashlib.sha1(payload).hexdigest() != entry["sha1"].lower():
-            raise ValueError("清单大小或 SHA1 校验失败")
-        if name.endswith(".py"):
-            compile(payload.decode("utf-8-sig"), name, "exec")  # Parse only; never execute downloaded code.
-        if not dest.is_file() or dest.read_bytes() != payload:
+        # SELF_REFRESH_LOCAL_FIRST_V1: a local copy matching the manifest needs no download.
+        payload = dest.read_bytes() if dest.is_file() else None
+        if payload is not None and (len(payload) != entry["size"] or hashlib.sha1(payload).hexdigest() != entry["sha1"].lower()):
+            payload = None
+        fresh = payload is None
+        if fresh:
+            payload = fetch_bytes(url, timeout=12)
+            if len(payload) != entry["size"] or hashlib.sha1(payload).hexdigest() != entry["sha1"].lower():
+                raise ValueError("清单大小或 SHA1 校验失败")
+            if name.endswith(".py"):
+                compile(payload.decode("utf-8-sig"), name, "exec")  # Parse only; never execute downloaded code.
+        if fresh:
             install_bytes(payload, dest, executable=name.endswith(".command"))
             print(f"[更新器] 已刷新 {name}")
         else:
@@ -303,3 +347,5 @@ exit "$status"
 # 版本号头在 v9 过渡期曾暂时冻结，避免旧代 copy2 原地覆盖脚本后按旧字节偏移
 # 继续解析而出现 unexpected EOF。当前自更新已改成同目录临时文件 + os.replace，
 # v12 用于把“公开更新源优先 + 状态复用”安全推送到存量 Mac 客户端。
+# v14：地址规则与主同步器统一（只用第一个公网地址，再试局域网，过滤已退役云端）；
+# 自刷新先比对本地哈希，一致就不下载。

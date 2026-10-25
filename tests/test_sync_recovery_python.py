@@ -260,7 +260,9 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual((self.root / 'mods/test.jar').read_bytes(), b'new')
         self.assertEqual((self.root / 'config/custom.txt').read_bytes(), b'USER')
-        self.assertTrue((self.root / '.portable-staging/mods/test.jar').exists())
+        # STAGE_CLEANUP_V1: a successful sync consumes or supersedes every staged file.
+        self.assertFalse((self.root / '.portable-staging/mods/test.jar').exists())
+        self.assertFalse((self.root / '.portable-staging/config/custom.txt').exists())
 
     def test_wrong_stage_cache_is_rejected_and_exact_current_payload_downloaded(self):
         write(self.root, '.portable-staging/mods/test.jar', b'old')

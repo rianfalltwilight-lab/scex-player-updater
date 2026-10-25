@@ -116,7 +116,7 @@ class HelperFallbackTests(unittest.TestCase):
             self.assertTrue(report['serverReachable'])
             self.assertEqual(report['okCount'], 1)
 
-    def test_bootstrap_keeps_public_alternatives_then_explicit_lan_fallback(self):
+    def test_bootstrap_uses_first_public_then_explicit_lan_fallback(self):
         with tempfile.TemporaryDirectory(prefix='updater-bootstrap-order-') as tmp:
             root = Path(tmp)
             urls = ['https://updates.example.invalid/manifest.json',
@@ -130,7 +130,8 @@ class HelperFallbackTests(unittest.TestCase):
                               '\n$InstanceDir = $PSScriptRoot; $ScriptDir = $PSScriptRoot; $ManifestUrl = ""\n' +
                               ordering + '\nConvertTo-Json -InputObject @($urls) -Compress\n', encoding='utf-8-sig')
             output = run([PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)], root)
-            self.assertEqual(json.loads(output.decode('utf-8-sig')), [urls[0], urls[2], urls[1]])
+            # URL_RULES_V1 (scex): the first public URL only, then the listed LAN fallback.
+            self.assertEqual(json.loads(output.decode('utf-8-sig')), [urls[0], urls[1]])
 
 
 class ServiceLifecycleTests(unittest.TestCase):
@@ -160,7 +161,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             listener.listen()
             result = subprocess.run(
                 [sys.executable, str(ROOT / 'tools/secure-update-server.py'), '--directory', str(root),
-                 '--port', str(listener.getsockname()[1]), '--token', 'test-token',
+                 '--port', str(listener.getsockname()[1]), '--token', 'test-token', '--bind', '127.0.0.1',
                  '--pid-file', str(pidfile)], cwd=root, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, timeout=10)
             self.assertNotEqual(result.returncode, 0)

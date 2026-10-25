@@ -12,7 +12,7 @@
       3) 只在 manifest 文本变化时才做文件 diff；idle 轮询近乎零开销（一次 GET + 字符串比较）。
       4) 生命周期自管：游戏由 PCL/HMCL 独立进程启动，本 daemon 靠"检测 java 进程 + 最大时长 + 单例锁"自退，
          不残留后台进程。
-      5) 编码/换行按仓库铁律：UTF-8 无 BOM 保存；本文件是 PowerShell，CRLF 或 LF 均可，但保存时勿加 BOM。
+      5) Windows PowerShell 5.1 使用 UTF-8 BOM 识别中文；CRLF 或 LF 均可。
 #>
 param(
     [string]$InstanceDir = ".",
@@ -111,16 +111,56 @@ function Test-RetiredCloudUrl {
     try { $hostName = ([Uri]$Url).Host.ToLowerInvariant().TrimEnd('.') ; return ($hostName -eq '7caiyun.com' -or $hostName.EndsWith('.7caiyun.com')) } catch { return $false }
 }
 
+# URL_RULES_V1: keep identical to player-update-generic.ps1 (tests/fixtures/url-order-cases.json).
+function Test-LocalOrPrivateHost {
+    param([string]$HostName)
+    $h = ([string]$HostName).Trim().Trim('[', ']').ToLowerInvariant().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($h) -or $h -eq 'localhost' -or $h.EndsWith('.local')) { return $true }
+    if ($h -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -and -not $h.Contains(':')) { return $false }
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse(($h -split '%')[0], [ref]$ip)) { return $false }
+    if ($ip.IsIPv4MappedToIPv6) { $ip = $ip.MapToIPv4() }
+    $b = $ip.GetAddressBytes()
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+        return ($b[0] -eq 10 -or $b[0] -eq 127 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 169 -and $b[1] -eq 254))
+    }
+    return ($ip.Equals([Net.IPAddress]::IPv6Loopback) -or (($b[0] -band 0xFE) -eq 0xFC) -or ($b[0] -eq 0xFE -and ($b[1] -band 0xC0) -eq 0x80))
+}
+
 function Test-PrivateUpdateUrl {
     param([string]$Url)
-    try { $hostName = ([Uri]$Url).Host.ToLowerInvariant() } catch { return $false }
-    if ($hostName -in @('localhost', '127.0.0.1', '::1') -or $hostName.EndsWith('.local')) { return $true }
-    if ($hostName -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)') { return $true }
-    if ($hostName -match '^(fc|fd|fe80:)') { return $true }
-    return $false
+    try { return (Test-LocalOrPrivateHost ([Uri]$Url).Host) } catch { return $false }
+}
+
+function Test-UsableUpdateUrl {
+    param([string]$Url)
+    $uri = $null
+    if (-not [Uri]::TryCreate(([string]$Url).Trim(), [UriKind]::Absolute, [ref]$uri)) { return $false }
+    return ($uri.Scheme -in @('http', 'https') -and -not [string]::IsNullOrEmpty($uri.Host))
+}
+
+function Get-OrderedUpdateUrls {
+    # Same order as the main updater: drop retired hosts, the first public URL,
+    # then listed LAN URLs in file order. LastGood cannot reorder.
+    param([string[]]$Urls, [string]$LastGood = '')
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $out = New-Object System.Collections.Generic.List[string]
+    $usable = @($Urls | ForEach-Object { ([string]$_).Trim() } | Where-Object { (Test-UsableUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
+    $public = @($usable | Where-Object { -not (Test-PrivateUpdateUrl $_) })
+    foreach ($u in (@($public | Select-Object -First 1) + @($usable | Where-Object { Test-PrivateUpdateUrl $_ }))) {
+        if ($seen.Add($u)) { [void]$out.Add($u) }
+    }
+    return @($out.ToArray())
 }
 
 function Test-ManifestUrl {
+    param([string]$Url, [int]$TimeoutSec = 8)
+    return ($null -ne (Get-ManifestProbe -Url $Url -TimeoutSec $TimeoutSec))
+}
+
+function Get-ManifestProbe {
+    # Probe once and require a JSON manifest; the first watch round reuses this
+    # download and its Last-Modified instead of fetching the manifest again.
     param([string]$Url, [int]$TimeoutSec = 8)
     $request = $null
     $response = $null
@@ -136,10 +176,17 @@ function Test-ManifestUrl {
         $response = $request.GetResponse()
         $stream = $response.GetResponseStream()
         $reader = New-Object -TypeName System.IO.StreamReader -ArgumentList @($stream, (New-Object System.Text.UTF8Encoding($false)), $true)
-        $manifest = $reader.ReadToEnd() | ConvertFrom-Json
-        return ($null -ne $manifest -and $null -ne $manifest.files)
+        $text = $reader.ReadToEnd().TrimStart([char]0xFEFF)
+        $manifest = $text | ConvertFrom-Json
+        if ($null -eq $manifest -or $null -eq $manifest.files) { return $null }
+        $lastModified = $null
+        $lm = $response.Headers['Last-Modified']
+        if (-not [string]::IsNullOrWhiteSpace($lm)) {
+            try { $lastModified = [DateTime]::Parse($lm, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } catch {}
+        }
+        return [pscustomobject]@{ Text = $text; LastModified = $lastModified }
     } catch {
-        return $false
+        return $null
     } finally {
         if ($reader) { $reader.Dispose() }
         if ($stream) { $stream.Dispose() }
@@ -211,7 +258,6 @@ function Get-DownloadFailReason {
 
 $script:StageProxyUrl = $null
 $script:StageProxyResolved = $false
-$script:OfficialSkip = $false
 
 function Get-StageProxyUrl {
     if ($script:StageProxyResolved) { return [string]$script:StageProxyUrl }
@@ -370,24 +416,13 @@ if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         elseif ($st.manifestUrl) { $lastGood = [string]$st.manifestUrl }
     } catch {}
 }
-$ordered = New-Object System.Collections.Generic.List[string]
-$seenUrl = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-$addUrl = {
-    param([string]$Value)
-    $v = ([string]$Value).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($v) -and $seenUrl.Add($v)) { [void]$ordered.Add($v) }
-}
-$publicUrls = @($manifestUrls | Where-Object { -not (Test-PrivateUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
-$candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($manifestUrls | Where-Object { -not (Test-RetiredCloudUrl $_) }) }
-if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood) -and -not (Test-RetiredCloudUrl $lastGood)) { & $addUrl $lastGood }
-foreach ($u in $candidates) { & $addUrl $u }
-if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood) -and -not (Test-RetiredCloudUrl $lastGood)) { & $addUrl $lastGood }
-foreach ($u in @($manifestUrls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
-$manifestUrls = @($ordered)
+$manifestUrls = @(Get-OrderedUpdateUrls -Urls $manifestUrls -LastGood $lastGood)
 $manifestUrl = ""
 $selectedIndex = -1
+$probe = $null
 for ($i = 0; $i -lt $manifestUrls.Count; $i++) {
-    if (Test-ManifestUrl -Url ([string]$manifestUrls[$i]) -TimeoutSec 8) {
+    $probe = Get-ManifestProbe -Url ([string]$manifestUrls[$i]) -TimeoutSec 8
+    if ($null -ne $probe) {
         $manifestUrl = [string]$manifestUrls[$i]
         $selectedIndex = $i
         break
@@ -405,12 +440,25 @@ Write-Log ("暂存 daemon 启动 (PID $PID)，间隔 ${IntervalSeconds}s，最�
 # 本地 sha1 缓存：key = "rel|size|mtimeTicks"，避免每轮重算数百 MB 的哈希。
 $script:LocalShaCache = @{}
 function Get-LocalSha1Cached {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
-    $fi = Get-Item -LiteralPath $Path
+    param([string]$Path, $Record = $null)
+    if (-not [IO.File]::Exists($Path)) { return "" }
+    $fi = New-Object IO.FileInfo $Path
     $key = ("{0}|{1}|{2}" -f $Path.ToLowerInvariant(), $fi.Length, $fi.LastWriteTimeUtc.Ticks)
     if ($script:LocalShaCache.ContainsKey($key)) { return $script:LocalShaCache[$key] }
-    $h = Get-Sha1 -Path $Path
+    # DAEMON_VERIFIED_V1: the sync that started this watcher just proved most files;
+    # trust its size+mtime record instead of re-reading ~1 GB right at game launch.
+    $h = $null
+    if ($Record) {
+        $recorded = ''; $recordedSize = [int64]-1; $recordedMtime = [int64]-1
+        try { $recorded = ([string]$Record.sha1).ToLowerInvariant(); $recordedSize = [int64]$Record.size; $recordedMtime = [int64]$Record.mtime } catch {}
+        # Same acceptance as player-update-generic.ps1: true Unix seconds (truncated or
+        # rounded) and the rounded local-epoch value older PowerShell versions wrote.
+        $seconds = ($fi.LastWriteTimeUtc - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
+        $legacySeconds = $fi.LastWriteTimeUtc.Subtract([datetime]'1970-01-01Z').TotalSeconds
+        $mtimeMatches = $recordedMtime -in @([int64][Math]::Floor($seconds), [int64][Math]::Round($seconds, [MidpointRounding]::ToEven), [int64][Math]::Round($legacySeconds, [MidpointRounding]::ToEven))
+        if ($recorded -match '^[0-9a-f]{40}$' -and $recordedSize -eq $fi.Length -and $mtimeMatches) { $h = $recorded }
+    }
+    if (-not $h) { $h = Get-Sha1 -Path $Path }
     $script:LocalShaCache[$key] = $h
     return $h
 }
@@ -493,23 +541,49 @@ function Save-StagedFile {
     }
 }
 
+function Test-CountsAgainstSource {
+    # Hash mismatches and HTTP 4xx (except 408/429) are file-specific, not host failures.
+    param($ErrorRecord)
+    $ex = $ErrorRecord.Exception
+    if ([string]$ex.Message -match 'SHA1 mismatch') { return $false }
+    while ($null -ne $ex) {
+        if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
+            $status = 0
+            try { $status = [int]$ex.Response.StatusCode } catch {}
+            return -not ($status -ge 400 -and $status -lt 500 -and $status -notin @(408, 429))
+        }
+        $ex = $ex.InnerException
+    }
+    return $true
+}
+
+# OFFICIAL_BREAKER_V1 for one watch round, same rule as the main updater: a host
+# failing for 3 consecutive files is skipped for the rest of the round; a success
+# resets it. Reset at the start of every round.
+$script:OfficialFailureLimit = 3
+$script:OfficialFailures = @{}
+$script:OfficialTripped = @{}
+
 function Save-StagedEntry {
     param($File, [string]$BaseUrl, [string]$Destination, [string]$ExpectedSha1, [string]$Rel)
-    $urls = @()
-    if (-not $script:OfficialSkip) { $urls = @(Get-OfficialFileUrls $File) }
-    foreach ($url in $urls) {
+    foreach ($url in @(Get-OfficialFileUrls $File)) {
+        $officialHost = ([Uri]$url).Host.ToLowerInvariant()
+        if ($script:OfficialTripped.ContainsKey($officialHost)) { continue }
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $useProxy = Test-StageShouldUseProxy $url
         try {
             Save-StagedFile -Url $url -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 8 -AllowProxy:$useProxy -MinBytesAfterTimeout (1MB)
+            $script:OfficialFailures[$officialHost] = 0
             return 'official'
         } catch {
             Write-Log ("[预下载] 官方源不可用（{0:N1}s，{1}），改走更新服务：{2}" -f $sw.Elapsed.TotalSeconds, (Get-DownloadFailReason $_.Exception), $Rel)
-            if (-not $script:OfficialSkip) {
-                $script:OfficialSkip = $true
-                Write-Log '[预下载] 官方源本轮不再尝试，其余文件直接走更新服务。'
+            if (Test-CountsAgainstSource $_) {
+                $script:OfficialFailures[$officialHost] = 1 + [int]$script:OfficialFailures[$officialHost]
+                if ($script:OfficialFailures[$officialHost] -ge $script:OfficialFailureLimit) {
+                    $script:OfficialTripped[$officialHost] = $true
+                    Write-Log ("[预下载] 官方源 {0} 连续 {1} 个文件下载失败，本轮不再尝试，其余文件直接走更新服务。" -f $officialHost, $script:OfficialFailureLimit)
+                }
             }
-            break
         }
     }
     $remote = $Rel
@@ -582,6 +656,8 @@ function Show-ReadyNotice {
 
 $startTime = Get-Date
 $lastManifestText = ""
+$pendingManifestText = $probe.Text
+if ($probe.LastModified) { $script:LastModified = $probe.LastModified }
 $idleGameChecks = 0
 $stagedTotal = 0
 $firstIteration = $true
@@ -608,8 +684,14 @@ try {
         $syncLock = Enter-SyncLock -Root $instanceRoot
         if ($null -eq $syncLock) { Write-Log '主更新器正在同步，跳过本轮预下载。'; continue }
         # 条件请求拉清单：304（未变化）或失败都跳过本轮，几乎零负担。
+        # 首轮直接使用启动探测时已下载的清单，不再重复下载。
         $mres = $null
-        try { $mres = Get-ManifestIfChanged -Url $manifestUrl } catch { Write-Log ("清单获取失败：" + $_.Exception.Message); continue }
+        if ($null -ne $pendingManifestText) {
+            $mres = [pscustomobject]@{ Changed = $true; Text = $pendingManifestText }
+            $pendingManifestText = $null
+        } else {
+            try { $mres = Get-ManifestIfChanged -Url $manifestUrl } catch { Write-Log ("清单获取失败：" + $_.Exception.Message); continue }
+        }
         if (-not $mres.Changed) { continue }
         $manifestText = [string]$mres.Text
         if ([string]::IsNullOrWhiteSpace($manifestText)) { continue }
@@ -631,6 +713,7 @@ try {
         if ($manifest.PSObject.Properties['preservePlayerCustomizations']) { $preservePlayerCustomizations = [bool]$manifest.preservePlayerCustomizations }
         # 基线 = 上次同步的清单哈希：本地文件与基线不符即玩家改过，不预下载（与 Promote 同一防线）。
         $baseline = @{}
+        $verifiedRecords = @{}
         $syncStatePath = Join-Path $instanceRoot '.portable-sync-state.json'
         if (Test-Path -LiteralPath $syncStatePath -PathType Leaf) {
             try {
@@ -638,8 +721,13 @@ try {
                 foreach ($item in @($syncState.files)) {
                     if ($item -and $item.path -and $item.sha1) { $baseline[(Normalize-Rel ([string]$item.path)).ToLowerInvariant()] = ([string]$item.sha1).ToLowerInvariant() }
                 }
+                if ($syncState.PSObject.Properties['verified'] -and $syncState.verified) {
+                    foreach ($prop in $syncState.verified.PSObject.Properties) { $verifiedRecords[([string]$prop.Name).ToLowerInvariant()] = $prop.Value }
+                }
             } catch {}
         }
+        $script:OfficialFailures = @{}
+        $script:OfficialTripped = @{}
 
         Write-Log "检测到新清单，开始比对并后台预下载……"
         $newStaged = 0
@@ -656,7 +744,7 @@ try {
             if (-not $isForceSync -and (Test-GlobMatch -Rel $rel -Globs $preserveChangeGlobs)) { continue }
 
             $localPath = Join-SafeRel -Root $instanceRoot -Rel $rel
-            $localHash = Get-LocalSha1Cached -Path $localPath
+            $localHash = Get-LocalSha1Cached -Path $localPath -Record $verifiedRecords[$rel.ToLowerInvariant()]
             if ($localHash -eq $expected) { continue }  # 本地已是最新，无需暂存
             $baseHash = if ($baseline.ContainsKey($rel.ToLowerInvariant())) { [string]$baseline[$rel.ToLowerInvariant()] } else { '' }
             # 与 player-update-generic.ps1 保持同一语义：已在上次清单中、

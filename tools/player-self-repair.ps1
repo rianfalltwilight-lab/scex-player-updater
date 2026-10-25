@@ -348,7 +348,7 @@ foreach ($candidateUrl in @($manifestUrls)) {
         }
         $raw = Strip-JsonComments $raw
         $candidateManifest = $raw | ConvertFrom-Json
-        if (-not $candidateManifest.files) { throw 'manifest 缺少 files。' }
+        if ($null -eq $candidateManifest -or $null -eq $candidateManifest.files) { throw 'manifest 缺少 files。' }
         $manifest = $candidateManifest
         $manifestUrl = $candidateUrl
         $fileBaseUrl = $candidateBaseUrl

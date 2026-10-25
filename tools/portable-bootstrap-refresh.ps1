@@ -87,13 +87,54 @@ function Read-UpdateUrls {
     return @($urls.ToArray())
 }
 
+# URL_RULES_V1: keep identical to player-update-generic.ps1 (tests/fixtures/url-order-cases.json).
+function Test-LocalOrPrivateHost {
+    param([string]$HostName)
+    $h = ([string]$HostName).Trim().Trim('[', ']').ToLowerInvariant().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($h) -or $h -eq 'localhost' -or $h.EndsWith('.local')) { return $true }
+    if ($h -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -and -not $h.Contains(':')) { return $false }
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse(($h -split '%')[0], [ref]$ip)) { return $false }
+    if ($ip.IsIPv4MappedToIPv6) { $ip = $ip.MapToIPv4() }
+    $b = $ip.GetAddressBytes()
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+        return ($b[0] -eq 10 -or $b[0] -eq 127 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 169 -and $b[1] -eq 254))
+    }
+    return ($ip.Equals([Net.IPAddress]::IPv6Loopback) -or (($b[0] -band 0xFE) -eq 0xFC) -or ($b[0] -eq 0xFE -and ($b[1] -band 0xC0) -eq 0x80))
+}
+
 function Test-PrivateUpdateUrl {
     param([string]$Url)
-    try { $hostName = ([Uri]$Url).Host.ToLowerInvariant() } catch { return $false }
-    if ($hostName -in @('localhost', '127.0.0.1', '::1') -or $hostName.EndsWith('.local')) { return $true }
-    if ($hostName -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)') { return $true }
-    if ($hostName -match '^(fc|fd|fe80:)') { return $true }
-    return $false
+    try { return (Test-LocalOrPrivateHost ([Uri]$Url).Host) } catch { return $false }
+}
+
+function Test-RetiredCloudUrl {
+    param([string]$Url)
+    try {
+        $hostName = ([Uri]$Url).Host.ToLowerInvariant().TrimEnd('.')
+        return ($hostName -eq '7caiyun.com' -or $hostName.EndsWith('.7caiyun.com'))
+    } catch { return $false }
+}
+
+function Test-UsableUpdateUrl {
+    param([string]$Url)
+    $uri = $null
+    if (-not [Uri]::TryCreate(([string]$Url).Trim(), [UriKind]::Absolute, [ref]$uri)) { return $false }
+    return ($uri.Scheme -in @('http', 'https') -and -not [string]::IsNullOrEmpty($uri.Host))
+}
+
+function Get-OrderedUpdateUrls {
+    # Drop retired hosts, the first public URL only, then listed LAN URLs in file order.
+    param([string[]]$Urls, [string]$LastGood = '')
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $out = New-Object System.Collections.Generic.List[string]
+    $usable = @($Urls | ForEach-Object { ([string]$_).Trim() } | Where-Object { (Test-UsableUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
+    $public = @($usable | Where-Object { -not (Test-PrivateUpdateUrl $_) })
+    # LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
+    foreach ($u in (@($public | Select-Object -First 1) + @($usable | Where-Object { Test-PrivateUpdateUrl $_ }))) {
+        if ($seen.Add($u)) { [void]$out.Add($u) }
+    }
+    return @($out.ToArray())
 }
 
 function Save-DirectFile {
@@ -190,21 +231,7 @@ if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         elseif ($state.manifestUrl) { $lastGood = [string]$state.manifestUrl }
     } catch {}
 }
-$ordered = New-Object System.Collections.Generic.List[string]
-$seenUrl = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-$addUrl = {
-    param([string]$Value)
-    $v = ([string]$Value).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($v) -and $seenUrl.Add($v)) { [void]$ordered.Add($v) }
-}
-$publicUrls = @($urls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
-$candidates = if ($publicUrls.Count -gt 0) { @($publicUrls[0]) } else { @($urls) }
-if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
-foreach ($u in $candidates) { & $addUrl $u }
-
-# LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
-foreach ($u in @($urls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
-$urls = @($ordered)
+$urls = @(Get-OrderedUpdateUrls -Urls $urls -LastGood $lastGood)
 $selected = ''
 $selectedManifest = $null
 $selectedIndex = -1
@@ -224,8 +251,17 @@ if ([string]::IsNullOrWhiteSpace($selected)) {
 if ($selectedIndex -gt 0) { Write-Host '[更新器] 已切换到备用更新地址。' }
 $base = $selected.Substring(0, $selected.LastIndexOf('/'))
 $names = @('player-update-generic.ps1', 'player-update-generic.py', 'portable-stage-daemon.ps1', 'portable-stage-daemon.py', 'portable-bootstrap-refresh.ps1', 'macOS-sync.command', 'Windows-sync.bat')
+# One pass over the manifest instead of a Where-Object scan per helper.
+$rowsByPath = @{}
+foreach ($row in @($selectedManifest.files)) {
+    $key = ([string]$row.path).Replace('\', '/').ToLowerInvariant()
+    if (-not $rowsByPath.ContainsKey($key)) { $rowsByPath[$key] = New-Object System.Collections.Generic.List[object] }
+    [void]$rowsByPath[$key].Add($row)
+}
 foreach ($name in $names) {
-    $entries = @($selectedManifest.files | Where-Object { ([string]$_.path).Replace('\', '/') -ieq ('_updater/' + $name) })
+    $entries = @()
+    $key = ('_updater/' + $name).ToLowerInvariant()
+    if ($rowsByPath.ContainsKey($key)) { $entries = @($rowsByPath[$key].ToArray()) }
     if ($entries.Count -ne 1 -or ([string]$entries[0].sha1) -notmatch '^[0-9a-fA-F]{40}$' -or ([string]$entries[0].size) -notmatch '^\d+$') {
         Write-Host "[更新器] 清单未提供有效校验信息，保留本地 $name。"
         continue
@@ -234,6 +270,11 @@ foreach ($name in $names) {
     $expectedSize = [long]$entries[0].size
     $url = $base + '/_updater/' + [Uri]::EscapeDataString($name) + '?t=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $destination = Join-Path $toolsRoot $name
+    # SELF_REFRESH_LOCAL_FIRST_V1: a local copy matching the manifest needs no download.
+    if ([IO.File]::Exists($destination) -and (Get-Item -LiteralPath $destination).Length -eq $expectedSize -and (Get-Sha1 -Path $destination) -eq $expectedHash) {
+        Write-Host "[更新器] 已是最新 $name"
+        continue
+    }
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('portable-refresh-' + [guid]::NewGuid().ToString('N') + '.tmp')
     $done = $false
     try {

@@ -21,10 +21,12 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -38,7 +40,6 @@ _OFFICIAL_MIN_BYTES = 1024 * 1024
 _OFFICIAL_MIN_RATE = 128 * 1024
 _PROXY_URL = None
 _PROXY_OPENER = None
-_OFFICIAL_SKIP = False
 
 
 META_SKIP = {"server-manifest.json", "update-log.txt"}
@@ -112,17 +113,31 @@ def read_update_url(root: pathlib.Path, override: str) -> str:
     return urls[0] if urls else ""
 
 
-def is_private_update_url(url: str) -> bool:
-    try:
-        host = (urllib.parse.urlparse(str(url).strip()).hostname or "").lower()
-    except Exception:
-        return False
-    if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local"):
+def is_local_or_private_host(host: str) -> bool:
+    # URL_RULES_V1: identical to player-update-generic.py (tests/fixtures/url-order-cases.json).
+    host = (host or "").strip().strip("[]").lower().rstrip(".")
+    if host in ("", "localhost") or host.endswith(".local"):
         return True
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host) and ":" not in host:
+        return False
     try:
-        return ipaddress.ip_address(host).is_private
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
         return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    b = ip.packed
+    if ip.version == 4:
+        return b[0] in (10, 127) or (b[0] == 172 and 16 <= b[1] <= 31) or (b[0] == 192 and b[1] == 168) or (b[0] == 169 and b[1] == 254)
+    return ip == ipaddress.IPv6Address("::1") or (b[0] & 0xFE) == 0xFC or (b[0] == 0xFE and (b[1] & 0xC0) == 0x80)
+
+
+def is_private_update_url(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(str(url).strip()).hostname or ""
+    except Exception:
+        return False
+    return is_local_or_private_host(host)
 
 
 def is_retired_cloud_url(url: str) -> bool:
@@ -130,31 +145,27 @@ def is_retired_cloud_url(url: str) -> bool:
     return host == "7caiyun.com" or host.endswith(".7caiyun.com")
 
 
+def is_usable_update_url(url):
+    """Only absolute http(s) URLs with a host take part in ordering."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url).strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
 def order_update_urls(urls: list, last_good: str = "") -> list:
+    """URL_RULES_V1: same order as the main updater: drop retired hosts, the
+    first public URL, then listed LAN URLs. ``last_good`` cannot reorder."""
     seen = set()
     out = []
-
-    def add(url):
-        key = str(url or "").strip()
-        if not key:
-            return
-        low = key.lower()
-        if low in seen:
-            return
-        seen.add(low)
-        out.append(key)
-
-    public = [url for url in (urls or []) if not is_private_update_url(url) and not is_retired_cloud_url(url)]
-    candidates = public or [url for url in (urls or []) if not is_retired_cloud_url(url)]
-    if last_good in candidates and not is_private_update_url(last_good) and not is_retired_cloud_url(last_good):
-        add(last_good)
-    for url in candidates:
-        add(url)
-    if last_good and not is_private_update_url(last_good) and not is_retired_cloud_url(last_good):
-        add(last_good)
-    for url in urls or []:
-        if is_private_update_url(url):
-            add(url)
+    usable = [str(url or "").strip() for url in (urls or [])]
+    usable = [url for url in usable if is_usable_update_url(url) and not is_retired_cloud_url(url)]
+    public = [url for url in usable if not is_private_update_url(url)]
+    for url in public[:1] + [url for url in usable if is_private_update_url(url)]:
+        if url.lower() not in seen:
+            seen.add(url.lower())
+            out.append(url)
     return out
 
 
@@ -162,18 +173,27 @@ def probe_timeout_for_url(url: str) -> float:
     return 8
 
 
-def probe_manifest_url(url: str) -> bool:
-    """Probe once and require a JSON manifest before starting a long-lived daemon."""
+def fetch_manifest_probe(url: str):
+    """Probe once and require a JSON manifest before starting a long-lived daemon.
+    Returns (text, last_modified) so the first watch round reuses this download."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": _STAGE_UA, "Cache-Control": "no-cache"})
         with _DIRECT_OPENER.open(req, timeout=probe_timeout_for_url(url)) as resp:
             if getattr(resp, "status", 200) != 200:
-                return False
+                return None
             payload = resp.read()
-        manifest = json.loads(payload.decode("utf-8-sig", errors="ignore"))
-        return isinstance(manifest, dict) and isinstance(manifest.get("files"), list)
+            last_modified = resp.headers.get("Last-Modified") if getattr(resp, "headers", None) else None
+        text = payload.decode("utf-8-sig", errors="ignore")
+        manifest = json.loads(text)
+        if isinstance(manifest, dict) and isinstance(manifest.get("files"), list):
+            return text, last_modified
     except Exception:
-        return False
+        pass
+    return None
+
+
+def probe_manifest_url(url: str) -> bool:
+    return fetch_manifest_probe(url) is not None
 
 
 def log(log_path: pathlib.Path, msg: str):
@@ -394,10 +414,45 @@ def download_fail_reason(exc: BaseException) -> str:
     return "连接失败"
 
 
-def download_staged_entry(item, base: str, dest: pathlib.Path, expected: str, rel: str, log_path: pathlib.Path) -> str:
-    global _OFFICIAL_SKIP
-    urls = [] if _OFFICIAL_SKIP else official_urls(item if isinstance(item, dict) else {})
-    for url in urls:
+class OfficialBreaker:
+    """OFFICIAL_BREAKER_V1 for one watch round, same rule as the main updater:
+    a host failing for LIMIT consecutive files is skipped for the rest of the
+    round; a success resets it; file-specific failures do not count."""
+    LIMIT = 3
+
+    def __init__(self):
+        self.failures = {}
+        self.tripped = set()
+
+    def allowed(self, host: str) -> bool:
+        return host not in self.tripped
+
+    def record(self, host: str, ok: bool, counted: bool = True) -> bool:
+        """Record one file's outcome; True when this failure trips the host."""
+        if ok:
+            self.failures[host] = 0
+            return False
+        if not counted:
+            return False
+        self.failures[host] = self.failures.get(host, 0) + 1
+        if self.failures[host] >= self.LIMIT and host not in self.tripped:
+            self.tripped.add(host)
+            return True
+        return False
+
+
+def counts_against_source(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return not (400 <= exc.code < 500 and exc.code not in (408, 429))
+    return "SHA1 mismatch" not in str(exc)
+
+
+def download_staged_entry(item, base: str, dest: pathlib.Path, expected: str, rel: str, log_path: pathlib.Path, breaker=None) -> str:
+    breaker = breaker if breaker is not None else OfficialBreaker()
+    for url in official_urls(item if isinstance(item, dict) else {}):
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if not breaker.allowed(host):
+            continue
         started = time.time()
         try:
             download_verify(
@@ -407,13 +462,12 @@ def download_staged_entry(item, base: str, dest: pathlib.Path, expected: str, re
                 min_bytes_after_timeout=_OFFICIAL_MIN_BYTES,
                 min_rate_bps=_OFFICIAL_MIN_RATE,
             )
+            breaker.record(host, True)
             return "official"
         except Exception as exc:
             log(log_path, f"[预下载] 官方源不可用（{time.time() - started:.1f}s，{download_fail_reason(exc)}），改走更新服务：{rel}")
-            if not _OFFICIAL_SKIP:
-                _OFFICIAL_SKIP = True
-                log(log_path, "[预下载] 官方源本轮不再尝试，其余文件直接走更新服务。")
-            break
+            if breaker.record(host, False, counts_against_source(exc)):
+                log(log_path, f"[预下载] 官方源 {host} 连续 {OfficialBreaker.LIMIT} 个文件下载失败，本轮不再尝试，其余文件直接走更新服务。")
     remote = item.get("downloadPath", rel) if isinstance(item, dict) else rel
     if remote != rel and not re.fullmatch(r"blobs/[0-9a-f]{64}", str(remote)):
         raise ValueError("Invalid cloud downloadPath")
@@ -442,6 +496,26 @@ def load_sync_baseline(instance_root: pathlib.Path) -> dict:
         except Exception:
             pass
     return baseline
+
+
+def load_sync_verified(instance_root: pathlib.Path) -> dict:
+    """size/mtime/sha1 records the main updater wrote for files it just proved."""
+    state_path = instance_root / ".portable-sync-state.json"
+    try:
+        records = json.loads(state_path.read_text(encoding="utf-8-sig")).get("verified") or {}
+    except Exception:
+        return {}
+    return {str(key).lower(): value for key, value in records.items() if isinstance(value, dict)} if isinstance(records, dict) else {}
+
+
+def verified_record_matches(verified, size: int, mtime: float) -> bool:
+    """Same rule as player-update-generic.py: truncated or rounded whole seconds."""
+    try:
+        v_size = int(verified.get("size", -1))
+        v_mtime = int(verified.get("mtime", -1))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return v_size == size and v_mtime in (int(mtime), int(round(mtime)))
 
 
 def run_promote(instance_root: pathlib.Path, stage_root: pathlib.Path, notice_path: pathlib.Path):
@@ -497,7 +571,8 @@ class SyncLock:
 
 
 def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log_path,
-              manifest_url, interval, max_runtime_min, grace_min, idle_exit_checks):
+              manifest_url, interval, max_runtime_min, grace_min, idle_exit_checks,
+              initial_text=None, initial_last_modified=None):
     # 单例锁
     if lock_path.is_file():
         try:
@@ -519,18 +594,30 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
 
     local_cache = {}
 
-    def local_sha(path: pathlib.Path) -> str:
-        if not path.is_file():
+    def local_sha(path: pathlib.Path, record=None) -> str:
+        try:
+            st = path.stat()
+        except OSError:
             return ""
-        st = path.stat()
+        if not stat.S_ISREG(st.st_mode):
+            return ""
         key = (str(path), st.st_size, st.st_mtime_ns)
         if key in local_cache:
             return local_cache[key]
-        h = sha1(path)
+        # DAEMON_VERIFIED_V1: the sync that started this watcher just proved most
+        # files; trust its size+mtime record instead of re-reading ~1 GB at launch.
+        recorded = str(record.get("sha1") or "").lower() if isinstance(record, dict) else ""
+        if re.fullmatch(r"[0-9a-f]{40}", recorded) and verified_record_matches(record, st.st_size, st.st_mtime):
+            h = recorded
+        else:
+            h = sha1(path)
         local_cache[key] = h
         return h
 
     manifest = Manifest()
+    if initial_last_modified:
+        manifest.last_modified = initial_last_modified
+    pending_text = initial_text
     start = time.time()
     last_text = ""
     idle = 0
@@ -558,11 +645,15 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
                 if not sync_lock.acquire():
                     log(log_path, "主更新器正在同步，跳过本轮预下载。")
                     continue
-                try:
-                    changed, text = manifest.if_changed(manifest_url)
-                except Exception as exc:
-                    log(log_path, f"清单获取失败：{exc}")
-                    continue
+                if pending_text is not None:
+                    # The startup probe already downloaded this manifest.
+                    changed, text, pending_text = True, pending_text, None
+                else:
+                    try:
+                        changed, text = manifest.if_changed(manifest_url)
+                    except Exception as exc:
+                        log(log_path, f"清单获取失败：{exc}")
+                        continue
                 if not changed or not text:
                     continue
                 if text == last_text:
@@ -585,6 +676,8 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
                 platform_excludes = (data.get("platformExcludeGlobs") or {}).get(plat) or []
                 # 基线 = 上次同步的清单哈希：本地文件与基线不符即玩家改过，不预下载（与 Promote 同一防线）。
                 baseline = load_sync_baseline(instance_root)
+                verified = load_sync_verified(instance_root)
+                breaker = OfficialBreaker()
 
                 log(log_path, "检测到新清单，开始比对并后台预下载……")
                 new_staged = 0
@@ -604,7 +697,7 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
                         continue
                     if platform_excludes and glob_match(rel, platform_excludes):
                         continue
-                    local_hash = local_sha(join_safe(instance_root, rel))
+                    local_hash = local_sha(join_safe(instance_root, rel), verified.get(rel.lower()))
                     if local_hash == expected:
                         continue
                     base_hash = baseline.get(rel.lower(), "")
@@ -629,7 +722,7 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
                     if stage_path.is_file() and sha1(stage_path) == expected:
                         continue
                     try:
-                        source = download_staged_entry(item, base, stage_path, expected, rel, log_path)
+                        source = download_staged_entry(item, base, stage_path, expected, rel, log_path, breaker)
                         log(log_path, f"[预下载/官方源] {rel}" if source == "official" else f"[预下载] {rel}")
                         new_staged += 1
                         staged_list.append(rel)
@@ -704,8 +797,10 @@ def main() -> int:
     manifest_urls = order_update_urls(manifest_urls, last_good)
     manifest_url = ""
     selected_index = -1
+    probe = None
     for index, candidate in enumerate(manifest_urls):
-        if probe_manifest_url(candidate):
+        probe = fetch_manifest_probe(candidate)
+        if probe is not None:
             manifest_url = candidate
             selected_index = index
             break
@@ -716,7 +811,8 @@ def main() -> int:
         log(log_path, "已切换到备用更新地址。")
     run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log_path,
               manifest_url, args.interval_seconds, args.max_runtime_minutes,
-              args.grace_minutes, args.idle_exit_checks)
+              args.grace_minutes, args.idle_exit_checks,
+              initial_text=probe[0], initial_last_modified=probe[1])
     return 0
 
 

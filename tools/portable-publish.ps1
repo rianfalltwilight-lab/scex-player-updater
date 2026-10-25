@@ -649,7 +649,13 @@ Get-ChildItem -LiteralPath $publishDir -Recurse -File -Force | Sort-Object FullN
     }
     [void]$fileRows.Add($row)
 }
-$freshMap = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'official-source-index.py')) { @{} } else { Get-ModrinthUrlMap -Sha1List @($lookupHashes) }
+$sourceConfig = Get-ConfigValue -Object $config -Name 'officialSources' -Default $null
+$officialEnabled = [bool](Get-ConfigValue -Object $sourceConfig -Name 'enabled' -Default $true)
+$sourceIndexTool = Join-Path $PSScriptRoot 'official-source-index.py'
+$sourcePython = [string](Get-ConfigValue -Object $config.update -Name 'pythonExe' -Default 'python.exe')
+$useSourceIndex = $officialEnabled -and (Test-Path -LiteralPath $sourceIndexTool) -and [bool](Get-Command $sourcePython -ErrorAction SilentlyContinue)
+# Preserve the PowerShell-only publishing path when Python is not installed.
+$freshMap = if ($officialEnabled -and -not $useSourceIndex) { Get-ModrinthUrlMap -Sha1List @($lookupHashes) } else { @{} }
 $officialEligible = 0
 $officialReused = 0
 $officialFresh = 0
@@ -666,11 +672,12 @@ foreach ($row in $fileRows) {
     }
     $files += [pscustomobject]$row
 }
-Write-Host ("[便携] Modrinth 官方源：命中 {0} / {1}（沿用 {2}，新查 {3}）。未命中的汉化/私有文件仍走自建更新服务。" -f ($officialReused + $officialFresh), $officialEligible, $officialReused, $officialFresh)
+$officialMatched = $officialReused + $officialFresh
 
 $manifest = [ordered]@{
     format = 2
     updaterRevision = [string](Get-ConfigValue -Object $config -Name 'updaterRevision' -Default '2026.10.07-official-parallel')
+    downloadWorkers = [Math]::Max(1, [Math]::Min(8, [int](Get-ConfigValue -Object $config -Name 'downloadWorkers' -Default 4)))
     packId = $packId
     pack = $packId
     packName = $packName
@@ -707,17 +714,15 @@ $manifestNextPath = Join-Path $publishDir '.server-manifest.json.next'
 $manifestText = (($manifest | ConvertTo-Json -Depth 10) + "`r`n")
 try {
     Write-Utf8NoBom -Path $manifestNextPath -Value $manifestText
-    # Resolve exact-hash official mirrors before publishing the new manifest.
-    $sourceIndexTool = Join-Path $PSScriptRoot 'official-source-index.py'
-    if (Test-Path -LiteralPath $sourceIndexTool) {
-        $sourcePython = [string](Get-ConfigValue -Object $config.update -Name 'pythonExe' -Default 'python.exe')
+    # Resolve exact-hash official sources before switching the public manifest.
+    if ($useSourceIndex) {
         $sourceArgs = @($sourceIndexTool, '--manifest', $manifestNextPath, '--directory', $publishDir, '--cache', (Join-Path $PSScriptRoot 'cache\official-source-index.json'))
-        $sourceConfig = Get-ConfigValue -Object $config -Name 'officialSources' -Default $null
         $cfKeyFile = [string](Get-ConfigValue -Object $sourceConfig -Name 'curseforgeKeyFile' -Default '')
-        if ($cfKeyFile) { $sourceArgs += @('--curseforge-key-file', $cfKeyFile) }
+        if ($cfKeyFile) { $sourceArgs += @('--curseforge-key-file', (Resolve-AnyPath -Path $cfKeyFile)) }
         & $sourcePython @sourceArgs
         if ($LASTEXITCODE -ne 0) { throw 'Official-source indexing failed; previous manifest retained' }
         $manifest = Get-Content -LiteralPath $manifestNextPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $officialMatched = [int]$manifest.downloadSourceStatus.official_unique
     }
     Assert-PublishedManifestIntegrity -Manifest $manifest -PublishRoot $publishDir
     Copy-FileWithRetry -Source $manifestNextPath -Dest $manifestPath
@@ -731,7 +736,8 @@ try {
 } finally {
     if (Test-Path -LiteralPath $manifestNextPath -PathType Leaf) { Remove-Item -LiteralPath $manifestNextPath -Force -ErrorAction SilentlyContinue }
 }
-Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n文件数量：$($files.Count)`r`n官方源命中：$($officialReused + $officialFresh) / $officialEligible`r`n"
+Write-Host ("[便携] 官方源：命中 {0} / {1}。未命中的汉化/私有文件仍走自建更新服务。" -f $officialMatched, $officialEligible)
+Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n文件数量：$($files.Count)`r`n官方源命中：$officialMatched / $officialEligible`r`n"
 Write-Host "[便携] 已发布 $packName $Version"
 Write-Host "[便携] 源客户端：$sourceClient"
 Write-Host "[便携] 发布目录：$publishDir"

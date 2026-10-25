@@ -282,14 +282,14 @@ def main():
     handler = functools.partial(SecureUpdateHandler, directory=args.directory, token=args.token, kitdir=args.kitdir)
     server_class = DualStackThreadingHTTPServer if ":" in args.bind else QuietThreadingHTTPServer
     with server_class((args.bind, args.port), handler) as httpd:
-        # Only publish the PID after the socket bind succeeds. A failed start
-        # must not replace a useful PID record with a process that immediately exits.
-        install_pid_file(args.pid_file)
         if args.certfile:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(args.certfile, args.keyfile or None)
             httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        # Publish the PID only after bind and TLS setup succeed, so a failed
+        # start never replaces a useful PID record.
+        install_pid_file(args.pid_file)
         httpd.serve_forever()
 
 

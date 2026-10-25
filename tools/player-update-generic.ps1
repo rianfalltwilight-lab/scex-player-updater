@@ -30,7 +30,8 @@ function Test-RelativePathSafe {
 function Join-SafeRelativePath {
     param([Parameter(Mandatory=$true)][string]$Root,[Parameter(Mandatory=$true)][string]$Rel)
     if (-not (Test-RelativePathSafe $Rel)) { throw "[路径错误] 无效更新路径：$Rel" }
-    $target = [IO.Path]::GetFullPath((Join-Path $Root $Rel.Replace('/','\')))
+    # [IO.Path]::Combine instead of Join-Path: same result for a validated relative path, no cmdlet cost.
+    $target = [IO.Path]::GetFullPath([IO.Path]::Combine($Root, $Rel.Replace('/','\')))
     Assert-SafeAbsolutePath -Path $target -Boundary $Root
     if ($script:SyncRoot -and $target.StartsWith($script:SyncRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) { Assert-SafeAbsolutePath -Path $target -Boundary $script:SyncRoot }
     return $target
@@ -145,8 +146,10 @@ function Backup-FileIfExists {
 
 $script:ProxyUrl = $null
 $script:ProxyResolved = $false
-$script:OfficialSkip = $false
-$script:OfficialSkipNotified = $false
+# OFFICIAL_BREAKER_V1: shared with download runspaces; see Register-OfficialResult.
+$script:OfficialFailureLimit = 3
+$script:OfficialBreaker = [hashtable]::Synchronized(@{})
+$script:LastSourceFailureCounts = $true
 $script:OfficialMinBytes = 1MB
 $script:OfficialMinRateBps = 128KB
 $script:PrivateProbeTimeoutSec = 2
@@ -221,25 +224,22 @@ function Get-ProxyDescription {
     } catch { return $Url }
 }
 
+# URL_RULES_V1: same classification and order in every updater entry point
+# (tests/fixtures/url-order-cases.json): loopback, RFC 1918, link-local,
+# IPv6 ULA/link-local, localhost and mDNS .local names are private.
 function Test-LocalOrPrivateHost {
     param([string]$HostName)
-    $h = ([string]$HostName).Trim().Trim('[', ']').ToLowerInvariant()
-    if ([string]::IsNullOrWhiteSpace($h)) { return $true }
-    if ($h -in @('localhost', '127.0.0.1', '::1')) { return $true }
-    $parts = $h.Split('.')
-    if ($parts.Count -eq 4) {
-        $nums = @()
-        foreach ($p in $parts) {
-            $n = 0
-            if (-not [int]::TryParse($p, [ref]$n)) { return $false }
-            $nums += $n
-        }
-        $a = $nums[0]; $b = $nums[1]
-        if ($a -eq 127 -or $a -eq 10) { return $true }
-        if ($a -eq 192 -and $b -eq 168) { return $true }
-        if ($a -eq 172 -and $b -ge 16 -and $b -le 31) { return $true }
+    $h = ([string]$HostName).Trim().Trim('[', ']').ToLowerInvariant().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($h) -or $h -eq 'localhost' -or $h.EndsWith('.local')) { return $true }
+    if ($h -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -and -not $h.Contains(':')) { return $false }
+    $ip = $null
+    if (-not [Net.IPAddress]::TryParse(($h -split '%')[0], [ref]$ip)) { return $false }
+    if ($ip.IsIPv4MappedToIPv6) { $ip = $ip.MapToIPv4() }
+    $b = $ip.GetAddressBytes()
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+        return ($b[0] -eq 10 -or $b[0] -eq 127 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 169 -and $b[1] -eq 254))
     }
-    return $false
+    return ($ip.Equals([Net.IPAddress]::IPv6Loopback) -or (($b[0] -band 0xFE) -eq 0xFC) -or ($b[0] -eq 0xFE -and ($b[1] -band 0xC0) -eq 0x80))
 }
 
 function Test-UrlBypassesProxy {
@@ -288,28 +288,37 @@ function Test-RetiredCloudUrl {
     } catch { return $false }
 }
 
+function Test-UsableUpdateUrl {
+    param([string]$Url)
+    $uri = $null
+    if (-not [Uri]::TryCreate(([string]$Url).Trim(), [UriKind]::Absolute, [ref]$uri)) { return $false }
+    return ($uri.Scheme -in @('http', 'https') -and -not [string]::IsNullOrEmpty($uri.Host))
+}
+
 function Get-OrderedManifestUrls {
+    # URL_RULES_V1: drop retired hosts, the first public URL only, then the LAN URLs
+    # listed in the URL files in file order. Old public addresses in legacy files
+    # are never probed. LastGood is kept for compatibility and cannot reorder.
     param([string[]]$Urls, [string]$LastGood = '')
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $out = New-Object System.Collections.Generic.List[string]
-    $add = {
-        param([string]$Value)
-        $v = ([string]$Value).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($v) -and $seen.Add($v)) { [void]$out.Add($v) }
-    }
-    $public = @($Urls | Where-Object { -not (Test-PrivateUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
-    $candidates = if ($public.Count -gt 0) { @($public[0]) } else { @($Urls | Where-Object { -not (Test-RetiredCloudUrl $_) }) }
-    if ($candidates -contains $LastGood -and -not (Test-PrivateUpdateUrl $LastGood) -and -not (Test-RetiredCloudUrl $LastGood)) { & $add $LastGood }
-    foreach ($u in $candidates) { & $add $u }
+    $usable = @($Urls | ForEach-Object { ([string]$_).Trim() } | Where-Object { (Test-UsableUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
+    $public = @($usable | Where-Object { -not (Test-PrivateUpdateUrl $_) })
     # LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
-    foreach ($u in @($Urls | Where-Object { (Test-PrivateUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })) { & $add $u }
-    return @($out)
+    foreach ($u in (@($public | Select-Object -First 1) + @($usable | Where-Object { Test-PrivateUpdateUrl $_ }))) {
+        if ($seen.Add($u)) { [void]$out.Add($u) }
+    }
+    return @($out.ToArray())
 }
 
 function Get-FileVerifyRecord {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Sha1)
-    $item = Get-Item -LiteralPath $Path
-    return [ordered]@{ sha1 = $Sha1.ToLowerInvariant(); size = [int64]$item.Length; mtime = [int64][double]$item.LastWriteTimeUtc.Subtract([datetime]'1970-01-01Z').TotalSeconds }
+    $item = [IO.FileInfo]::new($Path)  # no cmdlet per file; throws like Get-Item if it vanished
+    if (-not $item.Exists) { throw "文件不存在：$Path" }
+    # MTIME_RECORD_V1: true Unix seconds, truncated like the Python updater's int(st_mtime).
+    # ([datetime]'1970-01-01Z' is a Local value, so the old formula was off by the time zone.)
+    $seconds = ($item.LastWriteTimeUtc - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
+    return [ordered]@{ sha1 = $Sha1.ToLowerInvariant(); size = [int64]$item.Length; mtime = [int64][Math]::Floor($seconds) }
 }
 
 function Test-LooksLikeCurrentFile {
@@ -318,11 +327,14 @@ function Test-LooksLikeCurrentFile {
         [Parameter(Mandatory = $true)][string]$Expected,
         $ManifestSize,
         [string]$PreviousHash,
-        $Verified
+        $Verified,
+        # Receives the computed SHA1 when the file had to be read, so callers never hash it twice.
+        [ref]$HashOut
     )
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if ($HashOut) { $HashOut.Value = $null }
     if ([string]::IsNullOrWhiteSpace($Expected)) { return $false }
-    $item = Get-Item -LiteralPath $Path
+    $item = [IO.FileInfo]::new($Path)
+    if (-not $item.Exists) { return $false }
     $size = [int64]$item.Length
     if ($null -ne $ManifestSize -and [string]$ManifestSize -ne '' -and [string]$ManifestSize -ne '0') {
         try { if ($size -ne [int64]$ManifestSize) { return $false } } catch {}
@@ -337,16 +349,15 @@ function Test-LooksLikeCurrentFile {
         try { $vSize = [int64]$Verified.size } catch {}
         try { $vMtime = [int64]$Verified.mtime } catch {}
     }
-    $mtime = [int64][double]$item.LastWriteTimeUtc.Subtract([datetime]'1970-01-01Z').TotalSeconds
-    if ($previous -eq $expected) {
-        if ($vSha -eq $expected) {
-            if ($vSize -eq $size -and $vMtime -eq $mtime) { return $true }
-            return ((Get-Sha1 -Path $Path) -eq $expected)
-        }
-        return ((Get-Sha1 -Path $Path) -eq $expected)
-    }
-    if ($vSha -eq $expected -and $vSize -eq $size -and $vMtime -eq $mtime) { return $true }
-    return ((Get-Sha1 -Path $Path) -eq $expected)
+    # Accept true Unix seconds truncated (Python, PowerShell 2.27.22+) or rounded, and the rounded
+    # local-epoch value written by PowerShell before 2.27.22, so no update re-hashes everything.
+    $seconds = ($item.LastWriteTimeUtc - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
+    $legacySeconds = $item.LastWriteTimeUtc.Subtract([datetime]'1970-01-01Z').TotalSeconds
+    $mtimeMatches = $vMtime -in @([int64][Math]::Floor($seconds), [int64][Math]::Round($seconds, [MidpointRounding]::ToEven), [int64][Math]::Round($legacySeconds, [MidpointRounding]::ToEven))
+    if ($vSha -eq $expected -and $vSize -eq $size -and $mtimeMatches) { return $true }
+    $digest = Get-Sha1 -Path $Path
+    if ($HashOut) { $HashOut.Value = $digest }
+    return ($digest -eq $expected)
 }
 
 function New-DirectHttpRequest {
@@ -674,6 +685,7 @@ function Download-ManifestFile {
         if ($stale.FullName -ne $tmp) { Assert-SafeAbsolutePath -Path $stale.FullName; [IO.File]::Delete($stale.FullName) }
     }
     if ([IO.File]::Exists($tmp) -and (Get-Sha1 $tmp) -eq $ExpectedSha1) { Install-VerifiedFile -Temporary $tmp -Destination $Destination; return }
+    $script:LastSourceFailureCounts = $true
     $phase = '下载'
     try {
         $attempt = 0
@@ -701,16 +713,54 @@ function Download-ManifestFile {
         if ($actual -ne $ExpectedSha1.ToLowerInvariant()) { [IO.File]::Delete($tmp); throw "SHA1 mismatch for $(Get-MaskedUrl $Url). expected=$ExpectedSha1 actual=$actual" }
         $phase = '替换'
         Install-VerifiedFile -Temporary $tmp -Destination $Destination
-    } catch { throw (Format-UpdateError -ErrorRecord $_ -Phase $phase -Path $Destination) }
+    } catch {
+        $script:LastSourceFailureCounts = Test-CountsAgainstSource $_
+        throw (Format-UpdateError -ErrorRecord $_ -Phase $phase -Path $Destination)
+    }
     # Verified partials survive local lock errors; incomplete downloads resume next run.
 }
 
-function Set-OfficialSkip {
-    $script:OfficialSkip = $true
-    if (-not $script:OfficialSkipNotified) {
-        $script:OfficialSkipNotified = $true
-        Write-Host '[同步] 官方源本轮不再尝试，其余文件直接走更新服务。'
+function Test-CountsAgainstSource {
+    # True when a failure says the host is unreachable, slow or overloaded.
+    # Hash mismatches, bad ranges and HTTP 4xx (except 408/429) are file-specific.
+    param($ErrorRecord)
+    $ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    if ($null -eq $ex) { return $true }
+    $message = [string]$ex.Message
+    if ($message -match 'SHA1 mismatch|无效续传范围') { return $false }
+    $status = 0
+    $cursor = $ex
+    while ($null -ne $cursor) {
+        if ($cursor -is [System.Net.WebException] -and $null -ne $cursor.Response) {
+            try { $status = [int]$cursor.Response.StatusCode } catch {}
+            break
+        }
+        $cursor = $cursor.InnerException
     }
+    if ($status -eq 0 -and $message -match 'HTTP (\d{3}) from official proxy download') { $status = [int]$Matches[1] }
+    return -not ($status -ge 400 -and $status -lt 500 -and $status -notin @(408, 429))
+}
+
+function Test-OfficialHostTripped {
+    param([string]$HostName)
+    if ($null -eq $script:OfficialBreaker) { return $false }
+    return $script:OfficialBreaker.ContainsKey('trip:' + $HostName)
+}
+
+function Register-OfficialResult {
+    # A host failing for OfficialFailureLimit consecutive files is skipped for the
+    # rest of this run; one success resets its count. The main loop reports trips.
+    param([string]$HostName, [bool]$Ok, [bool]$Counted = $true)
+    $breaker = $script:OfficialBreaker
+    if ($null -eq $breaker) { return }
+    [System.Threading.Monitor]::Enter($breaker.SyncRoot)
+    try {
+        if ($Ok) { $breaker['fail:' + $HostName] = 0; return }
+        if (-not $Counted) { return }
+        $count = 1 + [int]$breaker['fail:' + $HostName]
+        $breaker['fail:' + $HostName] = $count
+        if ($count -ge $script:OfficialFailureLimit) { $breaker['trip:' + $HostName] = $true }
+    } finally { [System.Threading.Monitor]::Exit($breaker.SyncRoot) }
 }
 
 # HYBRID_DOWNLOAD_V1: alternate manifests are byte sources, never policy overrides.
@@ -781,17 +831,23 @@ function Download-ManifestEntry {
     # Downloads are hash-matched at publication and verified again before install.
     # Failure of one URL must not disable CurseForge or Modrinth for other files.
     foreach ($url in @(Get-OfficialFileUrls $File)) {
+        $officialHost = ([Uri]$url).Host.ToLowerInvariant()
+        if (Test-OfficialHostTripped $officialHost) { continue }
         $attempts = @($false)
         if (Test-ShouldUseProxyForOfficial $url) { $attempts += $true }
+        $counted = $true
         foreach ($useProxy in $attempts) {
             try {
                 Download-ManifestFile -Url $url -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 8 -Retries 0 -AllowProxy:$useProxy -NoBackoff -MinBytesAfterTimeout $script:OfficialMinBytes -MinRateBps $script:OfficialMinRateBps
+                Register-OfficialResult -HostName $officialHost -Ok $true
                 return 'official'
             } catch {
                 if (Test-LocalUpdateError $_) { throw }
-                Write-Host ("[同步] {0} 不可用（{1}），继续尝试下一下载源：{2}" -f ([Uri]$url).Host, (Get-DownloadFailReason $_.Exception), $Rel)
+                $counted = $counted -and [bool]$script:LastSourceFailureCounts
+                Write-Host ("[同步] {0} 不可用（{1}），继续尝试下一下载源：{2}" -f $officialHost, (Get-DownloadFailReason $_.Exception), $Rel)
             }
         }
+        Register-OfficialResult -HostName $officialHost -Ok $false -Counted $counted
     }
     if ($script:HybridManifest) { return Download-HybridEntry -File $File -Destination $Destination -ExpectedSha1 $ExpectedSha1 -Rel $Rel }
     $homeTimeout = 180
@@ -832,13 +888,16 @@ function Get-ArrayValue {
 }
 
 function Get-ExistingFileHashIndex {
-    param([string]$Root)
+    # ADOPT_SIZE_FILTER_V1: only files whose size equals a missing entry can match,
+    # so with -Sizes only those are hashed. $null means "hash everything".
+    param([string]$Root, $Sizes = $null)
     $map = @{}
     foreach ($dir in @('mods','config','defaultconfigs','kubejs','scripts','resourcepacks','shaderpacks','data')) {
         $full = Join-Path $Root $dir
         if (-not [IO.Directory]::Exists($full)) { continue }
         if ((Get-Item -LiteralPath $full -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
         foreach ($file in @(Get-SafeClientFiles -Root $full)) {
+            if ($null -ne $Sizes -and -not $Sizes.Contains([int64]$file.Length)) { continue }
             $rel = Normalize-Rel ($file.FullName.Substring($Root.Length).TrimStart('\','/'))
             if ($rel -like 'mods/.connector/*' -or $rel -like '*/.connector/*') { continue }
             $digest = Get-Sha1 -Path $file.FullName
@@ -1471,6 +1530,7 @@ function Disable-DuplicateMods {
     if ($script:DuplicateMoved -gt $moved) { Write-Host "[修复] 重复 mod 清理完成，移动 $($script:DuplicateMoved - $moved) 个" }
 }
 
+$script:SafeDirCache = @{}
 function Assert-SafeAbsolutePath {
     param([string]$Path, [string]$Boundary = '')
     $full = [IO.Path]::GetFullPath($Path)
@@ -1478,14 +1538,32 @@ function Assert-SafeAbsolutePath {
     if (-not $Boundary) { $Boundary = [IO.Path]::GetDirectoryName($full) }
     $root = [IO.Path]::GetFullPath($Boundary).TrimEnd('\')
     if ($full -ne $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '[路径错误] 更新目标超出允许的目录。' }
+    # PATH_CACHE_V1: directories already proven link-free up to this boundary are
+    # not read again; the target itself is always checked. One attribute call per
+    # component replaces Test-Path + Get-Item (about 17 ms per file before).
+    if ($null -eq $script:SafeDirCache) { $script:SafeDirCache = @{} }  # download runspaces
+    $cacheKey = $root.ToLowerInvariant()
+    $cache = $script:SafeDirCache[$cacheKey]
+    if ($null -eq $cache) {
+        $cache = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $script:SafeDirCache[$cacheKey] = $cache
+    }
+    $checked = New-Object 'System.Collections.Generic.List[string]'
     $cursor = $full
+    $isTarget = $true
     while ($cursor -and $cursor.Length -ge $root.Length) {
-        if (Test-Path -LiteralPath $cursor) {
-            if ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "[路径错误] 更新路径经过目录链接或文件链接，请检查：$cursor" }
+        if (-not $isTarget -and $cache.Contains($cursor)) { break }
+        $attributes = $null
+        try { $attributes = [IO.File]::GetAttributes($cursor) } catch { $attributes = $null }
+        if ($null -ne $attributes) {
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw "[路径错误] 更新路径经过目录链接或文件链接，请检查：$cursor" }
+            if ($attributes -band [IO.FileAttributes]::Directory) { [void]$checked.Add($cursor) }
         }
         if ($cursor -eq $root) { break }
         $cursor = [IO.Path]::GetDirectoryName($cursor)
+        $isTarget = $false
     }
+    foreach ($dir in $checked) { [void]$cache.Add($dir) }
 }
 
 function Enter-SyncLock {
@@ -1674,6 +1752,61 @@ function Install-StagedEntry {
     return $true
 }
 
+function Clear-TreeNoFollow {
+    # Delete regular files and empty folders below Directory; never follow or delete
+    # links or other reparse points. Returns the number of files removed.
+    param([string]$Directory, [string[]]$KeepNames = @())
+    $removed = 0
+    $entries = @()
+    try { $entries = @([IO.Directory]::GetFileSystemEntries($Directory)) } catch { return 0 }
+    foreach ($entry in $entries) {
+        if ($KeepNames -contains [IO.Path]::GetFileName($entry)) { continue }
+        try {
+            $attributes = [IO.File]::GetAttributes($entry)
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($attributes -band [IO.FileAttributes]::Directory) {
+                $removed += Clear-TreeNoFollow -Directory $entry
+                [IO.Directory]::Delete($entry, $false)
+            } else {
+                if ($attributes -band [IO.FileAttributes]::ReadOnly) { [IO.File]::SetAttributes($entry, ($attributes -band (-bnot [IO.FileAttributes]::ReadOnly))) }
+                [IO.File]::Delete($entry)
+                $removed++
+            }
+        } catch { }  # A locked leftover is harmless; the next sync tries again.
+    }
+    return $removed
+}
+
+function Remove-OldSyncBackups {
+    # BACKUP_RETENTION_V1: keep only the newest backup. A run that backed up
+    # nothing keeps the previous one, so a rollback point always survives.
+    param([string]$Root, [string]$Keep)
+    if (-not [IO.Directory]::Exists($Keep)) { return 0 }
+    $backups = Join-SafeRelativePath -Root $Root -Rel '.portable-sync-backups'
+    $keepName = [IO.Path]::GetFileName($Keep.TrimEnd('\'))
+    $pruned = 0
+    foreach ($dir in @([IO.Directory]::GetDirectories($backups))) {
+        $name = [IO.Path]::GetFileName($dir)
+        if ($name -ieq $keepName -or $name -cnotmatch '^\d{8}-\d{6}(-[0-9A-Za-z]+)*$') { continue }
+        if ([IO.File]::GetAttributes($dir) -band [IO.FileAttributes]::ReparsePoint) { continue }
+        [void](Clear-TreeNoFollow -Directory $dir)
+        try { [IO.Directory]::Delete($dir, $false); $pruned++ } catch { }
+    }
+    return $pruned
+}
+
+function Clear-StageCache {
+    # STAGE_CLEANUP_V1: after a successful sync every staged file is installed or
+    # superseded; keep only the watcher's lock and log, and drop the ready notice.
+    param([string]$Root)
+    $stage = Join-SafeRelativePath -Root $Root -Rel '.portable-staging'
+    if (-not [IO.Directory]::Exists($stage)) { return 0 }
+    $removed = Clear-TreeNoFollow -Directory $stage -KeepNames @('daemon.lock', 'daemon.log')
+    $notice = Join-SafeRelativePath -Root $Root -Rel '更新已就绪.txt'
+    if ([IO.File]::Exists($notice)) { try { [IO.File]::Delete($notice) } catch { } }
+    return $removed
+}
+
 $syncLock=$null
 $script:SyncLogPath=$null
 try {
@@ -1697,6 +1830,7 @@ if ([string]::IsNullOrWhiteSpace($ManifestUrl) -and $state) {
 }
 if ([string]::IsNullOrWhiteSpace($ManifestUrl)) {
     $manifestUrls = @(Get-OrderedManifestUrls -Urls $manifestUrls -LastGood $lastGood)
+    if ($manifestUrls.Count -eq 0) { throw '[清单获取失败] UPDATE-URL.txt 里没有可用的 http/https 更新地址，请重新获取玩家包。' }
 }
 Write-Host ("[同步] 清单候选：" + (($manifestUrls | ForEach-Object { Get-MaskedUrl $_ }) -join '；'))
 $detectedProxy = Get-SystemProxyUrl
@@ -1804,10 +1938,23 @@ if ([bool](Get-PropertyValue -Object $cleanup -Name 'disableLauncherRepairIndex'
 # 接管索引惰性构建：日常同步通常没有缺失文件，这时不必对 mods/config/resourcepacks 等
 # 目录做全量 SHA1 扫描（大包一次要几十秒）。只在真的遇到缺失文件需要接管时才建一次。
 $script:AdoptIndexCache = $null
+function Get-MissingEntrySizes {
+    # Sizes of manifest entries absent locally; $null when one has no usable size.
+    $sizes = New-Object 'System.Collections.Generic.HashSet[long]'
+    foreach ($row in @($manifest.files)) {
+        $rowRel = Normalize-Rel ([string]$row.path)
+        if (-not (Test-RelativePathSafe -Rel $rowRel)) { continue }
+        if ([IO.File]::Exists((Join-Path $instanceRoot $rowRel.Replace('/', '\')))) { continue }
+        $size = [long]0
+        if (-not $row.PSObject.Properties['size'] -or -not [long]::TryParse([string]$row.size, [ref]$size)) { return $null }
+        [void]$sizes.Add($size)
+    }
+    return ,$sizes
+}
 function Get-AdoptIndex {
     if ($null -eq $script:AdoptIndexCache) {
         Write-Host '[同步] 有文件缺失，正在建立本地文件哈希索引（仅本次需要）...'
-        $script:AdoptIndexCache = Get-ExistingFileHashIndex -Root $instanceRoot
+        $script:AdoptIndexCache = Get-ExistingFileHashIndex -Root $instanceRoot -Sizes (Get-MissingEntrySizes)
     }
     return $script:AdoptIndexCache
 }
@@ -1836,19 +1983,20 @@ foreach ($file in @($manifest.files)) {
     if (-not (Test-RelativePathSafe -Rel $rel)) { throw "Unsafe manifest path: $rel" }
     $target = Join-SafeRelativePath -Root $instanceRoot -Rel $rel
     $expected = ([string]$file.sha1).ToLowerInvariant()
-    $exists = Test-Path -LiteralPath $target -PathType Leaf
+    $exists = [IO.File]::Exists($target)
     $hadPrevious = $previousMap.ContainsKey($relKey)
     $previousHash = if ($hadPrevious) { [string]$previousMap[$relKey] } else { "" }
     $manifestSize = $null
     if ($file.PSObject.Properties['size']) { $manifestSize = $file.size }
     $verifiedEntry = $null
     if ($verified.ContainsKey($relKey)) { $verifiedEntry = $verified[$relKey] }
-    if ($exists -and (Test-LooksLikeCurrentFile -Path $target -Expected $expected -ManifestSize $manifestSize -PreviousHash $previousHash -Verified $verifiedEntry)) {
+    $computedHash = $null
+    if ($exists -and (Test-LooksLikeCurrentFile -Path $target -Expected $expected -ManifestSize $manifestSize -PreviousHash $previousHash -Verified $verifiedEntry -HashOut ([ref]$computedHash))) {
         $verified[$relKey] = Get-FileVerifyRecord -Path $target -Sha1 $expected
         $skipped++
         continue
     }
-    $currentHash = if ($exists) { Get-Sha1 -Path $target } else { "" }
+    $currentHash = if (-not $exists) { "" } elseif ($computedHash) { [string]$computedHash } else { Get-Sha1 -Path $target }
     if ($exists -and $currentHash -eq $expected) {
         $verified[$relKey] = Get-FileVerifyRecord -Path $target -Sha1 $expected
         $skipped++
@@ -1923,6 +2071,8 @@ $script:ProxyResolved = $false
 $script:ProxyUrl = $null
 $script:OfficialMinBytes = 1MB
 $script:OfficialMinRateBps = 128KB
+$script:OfficialFailureLimit = 3
+$script:LastSourceFailureCounts = $true
 $script:HybridManifest = $null
 $script:HybridSources = $null
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
@@ -1930,6 +2080,7 @@ try {
     $script:HybridManifest = $args[2]
     $script:HybridManifestUrl = $args[3]
     $script:SyncRoot = $args[4]
+    $script:OfficialBreaker = $args[5]
     $job = $args[0]
     $source = Download-ManifestEntry -File $job.File -BaseUrl $args[1] -Destination $job.Target -ExpectedSha1 $job.Expected -Rel $job.Rel
     [pscustomobject]@{ Job=$job; Source=$source; Record=(Get-FileVerifyRecord -Path $job.Target -Sha1 $job.Expected); Error=$null }
@@ -1938,6 +2089,7 @@ try {
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $workers)
     $pool.Open()
     $pending = New-Object 'System.Collections.Generic.List[object]'
+    $reportedTrips = New-Object 'System.Collections.Generic.HashSet[string]'
     $next = 0
     $hardError = $null
     try {
@@ -1945,7 +2097,7 @@ try {
             while ($next -lt $downloadJobs.Count -and $pending.Count -lt $workers) {
                 $ps = [PowerShell]::Create()
                 $ps.RunspacePool = $pool
-                [void]$ps.AddScript($workerCode).AddArgument($downloadJobs[$next]).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl).AddArgument($instanceRoot)
+                [void]$ps.AddScript($workerCode).AddArgument($downloadJobs[$next]).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl).AddArgument($instanceRoot).AddArgument($script:OfficialBreaker)
                 [void]$pending.Add([pscustomobject]@{ Shell=$ps; Handle=$ps.BeginInvoke(); Job=$downloadJobs[$next] })
                 $next++
             }
@@ -1969,6 +2121,13 @@ try {
                         $preserved++
                     } elseif (-not $hardError) { $hardError = Format-UpdateError -ErrorRecord $_ -Path $task.Job.Rel }
                 } finally { $task.Shell.Dispose(); [void]$pending.Remove($task) }
+            }
+            [System.Threading.Monitor]::Enter($script:OfficialBreaker.SyncRoot)
+            try { $breakerKeys = @($script:OfficialBreaker.Keys) } finally { [System.Threading.Monitor]::Exit($script:OfficialBreaker.SyncRoot) }
+            foreach ($tripKey in @($breakerKeys | Where-Object { ([string]$_).StartsWith('trip:') })) {
+                if ($reportedTrips.Add([string]$tripKey)) {
+                    Write-Host ("[同步] 官方源 {0} 连续 {1} 个文件下载失败，本轮不再尝试，其余文件直接走更新服务。" -f ([string]$tripKey).Substring(5), $script:OfficialFailureLimit)
+                }
             }
             if ($pending.Count) { Start-Sleep -Milliseconds 100 }
         }
@@ -2064,6 +2223,14 @@ $stateOut = [ordered]@{
 }
 Save-SyncState -Path $statePath -Value $stateOut
 if ([IO.File]::Exists($script:JournalPath)) { [IO.File]::Delete($script:JournalPath) }
+try {
+    $prunedBackups = Remove-OldSyncBackups -Root $instanceRoot -Keep $backupRoot
+    if ($prunedBackups -gt 0) { Write-Host "[清理] 已删除 $prunedBackups 份旧备份，只保留本次备份。" }
+} catch { Write-Host '[清理] 旧备份未能清理，不影响本次更新。' }
+try {
+    $clearedStage = Clear-StageCache -Root $instanceRoot
+    if ($clearedStage -gt 0) { Write-Host "[清理] 已清理预下载缓存 $clearedStage 个文件。" }
+} catch { Write-Host '[清理] 预下载缓存未能清理，不影响本次更新。' }
 $configApplied = @(@($updatedPaths) + @($adoptedPaths) | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })
 $forcedAppliedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($rel in $forcedAppliedPaths) { [void]$forcedAppliedSet.Add($rel) }

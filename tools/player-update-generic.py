@@ -6,6 +6,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import pathlib
@@ -13,6 +14,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import struct
 import sys
 import tempfile
@@ -26,7 +28,7 @@ import zipfile
 
 # 家宽更新源是 DDNS 直连地址，绝不该走系统代理。macOS 上 urllib 会自动读取系统代理
 # （如 Clash 的“设为系统代理”），而代理节点到不了 18088 端口就会对每个请求整齐回 503。
-# 官方 CDN（cdn.modrinth.com）相反：国内直连经常能通但很慢，有系统代理就该走代理。
+# 官方 CDN 优先直连；仅在当前请求失败或持续低速后尝试现有代理。
 # 默认 opener 仍强制直连，避免清单/家宽误入代理；官方源单独选 opener。
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 urllib.request.install_opener(_DIRECT_OPENER)
@@ -40,11 +42,18 @@ _PRIVATE_PROBE_TIMEOUT_SEC = 1.2
 _PUBLIC_PROBE_TIMEOUT_SEC = 8
 _DOWNLOAD_WORKERS = 4
 _PRINT_LOCK = threading.Lock()
-_OFFICIAL_LOCK = threading.Lock()
 _PROXY_URL = None
 _PROXY_OPENER = None
-_OFFICIAL_SKIP = False
-_OFFICIAL_SKIP_NOTIFIED = False
+# OFFICIAL_BREAKER_V1: per-run, per-host circuit breaker for official sources.
+# A host that fails for this many consecutive files is skipped for the rest of
+# the run; one success resets its count. File-specific failures (hash mismatch,
+# HTTP 4xx other than 408/429) neither count nor reset.
+_OFFICIAL_FAILURE_LIMIT = 3
+_OFFICIAL_LOCK = threading.Lock()
+_OFFICIAL_FAILURES = {}
+_OFFICIAL_TRIPPED = set()
+# Directories already proven link-free during this run (see join_safe).
+_LINK_SAFE_DIRS = set()
 
 
 def fetch_bytes(url: str, timeout: float = 20) -> bytes:
@@ -114,16 +123,41 @@ def rel_key(rel: str) -> str:
     return safe_rel(rel).lower()
 
 
+def _is_link_or_reparse(path: pathlib.Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
 def join_safe(root: pathlib.Path, rel: str) -> pathlib.Path:
     base = root.absolute()
     target = base.joinpath(*safe_rel(rel).split("/"))
     # Do not follow a junction/symlink in any parent, even when the final file
     # itself has ordinary attributes. Root has already been resolved by main.
-    if os.path.normcase(str(base.resolve())) != os.path.normcase(str(base)):
-        raise LocalFileUpdateError(f"[路径错误] 更新目录经过链接，已停止写入：{root}")
-    resolved = target.resolve()
-    if not resolved.is_relative_to(base) or resolved != target:
-        raise LocalFileUpdateError(f"[路径错误] 更新目标经过链接或越出目录，已停止写入：{rel}")
+    # PATH_CACHE_V1: a manifest has thousands of files but few directories, so
+    # each existing directory is resolved once per run instead of once per file.
+    base_key = os.path.normcase(str(base))
+    if base_key not in _LINK_SAFE_DIRS:
+        if os.path.normcase(str(base.resolve())) != base_key:
+            raise LocalFileUpdateError(f"[路径错误] 更新目录经过链接，已停止写入：{root}")
+        if base.is_dir():
+            _LINK_SAFE_DIRS.add(base_key)
+    parent = target.parent
+    parent_key = os.path.normcase(str(parent))
+    if parent_key not in _LINK_SAFE_DIRS:
+        resolved_parent = parent.resolve()
+        if not resolved_parent.is_relative_to(base) or resolved_parent != parent:
+            raise LocalFileUpdateError(f"[路径错误] 更新目标经过链接或越出目录，已停止写入：{rel}")
+        if parent.is_dir():
+            _LINK_SAFE_DIRS.add(parent_key)
+    # Plain files need no resolve; links and other reparse points (including
+    # cloud placeholders) keep the original full-resolution check.
+    if _is_link_or_reparse(target):
+        resolved = target.resolve()
+        if not resolved.is_relative_to(base) or resolved != target:
+            raise LocalFileUpdateError(f"[路径错误] 更新目标经过链接或越出目录，已停止写入：{rel}")
     return target
 
 
@@ -250,12 +284,14 @@ def is_official_https_url(url: str) -> bool:
 
 
 def reset_download_policy():
-    """测试和每次 main() 开头清空缓存，避免上次运行的跳过/代理结果串台。"""
-    global _PROXY_URL, _PROXY_OPENER, _OFFICIAL_SKIP, _OFFICIAL_SKIP_NOTIFIED
+    """测试和每次 main() 开头清空缓存，避免上次运行的熔断/代理/路径结果串台。"""
+    global _PROXY_URL, _PROXY_OPENER
     _PROXY_URL = None
     _PROXY_OPENER = None
-    _OFFICIAL_SKIP = False
-    _OFFICIAL_SKIP_NOTIFIED = False
+    with _OFFICIAL_LOCK:
+        _OFFICIAL_FAILURES.clear()
+        _OFFICIAL_TRIPPED.clear()
+    _LINK_SAFE_DIRS.clear()
 
 
 def normalize_proxy_url(raw: str) -> str:
@@ -336,15 +372,24 @@ def describe_proxy(url: str = "") -> str:
 
 
 def is_local_or_private_host(host: str) -> bool:
-    host = (host or "").lower().strip("[]")
-    if host in ("", "localhost", "127.0.0.1", "::1"):
+    # URL_RULES_V1: same classification in every updater entry point
+    # (tests/fixtures/url-order-cases.json): loopback, RFC 1918, link-local,
+    # IPv6 ULA/link-local, localhost and mDNS .local names.
+    host = (host or "").strip().strip("[]").lower().rstrip(".")
+    if host in ("", "localhost") or host.endswith(".local"):
         return True
-    parts = host.split(".")
-    if len(parts) == 4 and all(part.isdigit() for part in parts):
-        a, b = int(parts[0]), int(parts[1])
-        if a == 127 or a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31):
-            return True
-    return False
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host) and ":" not in host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    b = ip.packed
+    if ip.version == 4:
+        return b[0] in (10, 127) or (b[0] == 172 and 16 <= b[1] <= 31) or (b[0] == 192 and b[1] == 168) or (b[0] == 169 and b[1] == 254)
+    return ip == ipaddress.IPv6Address("::1") or (b[0] & 0xFE) == 0xFC or (b[0] == 0xFE and (b[1] & 0xC0) == 0x80)
 
 
 def is_private_update_url(url: str) -> bool:
@@ -361,32 +406,30 @@ def is_retired_cloud_url(url: str) -> bool:
     return host == "7caiyun.com" or host.endswith(".7caiyun.com")
 
 
+def is_usable_update_url(url):
+    """Only absolute http(s) URLs with a host take part in ordering."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url).strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
 def order_manifest_urls(urls, last_good: str = "") -> list:
-    """Public addresses only. Never auto-insert a LAN IP for WAN players."""
+    """URL_RULES_V1: drop retired hosts, use only the first public URL, then the
+    LAN URLs listed in the URL files, in file order. Old public addresses left in
+    legacy files are never probed. Never invents a LAN address. ``last_good`` is
+    accepted for compatibility; with one public candidate it cannot reorder."""
     seen = set()
     out = []
-
-    def add(url):
-        key = str(url or "").strip()
-        if not key:
-            return
-        low = key.lower()
-        if low in seen:
-            return
-        seen.add(low)
-        out.append(key)
-
-    public = [url for url in (urls or []) if not is_private_update_url(url) and not is_retired_cloud_url(url)]
-    # 玩家自己把 UPDATE-URL 写成局域网地址时保留；自动探测产生的 192.168 一律丢掉。
-    candidates = public[:1] or [url for url in (urls or []) if not is_retired_cloud_url(url)][:1]
-    if last_good in candidates and not is_private_update_url(last_good) and not is_retired_cloud_url(last_good):
-        add(last_good)
-    for url in candidates:
-        add(url)
+    usable = [str(url or "").strip() for url in (urls or [])]
+    usable = [url for url in usable if is_usable_update_url(url) and not is_retired_cloud_url(url)]
+    public = [url for url in usable if not is_private_update_url(url)]
     # LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
-    for url in (urls or []):
-        if is_private_update_url(url) and not is_retired_cloud_url(url):
-            add(url)
+    for url in public[:1] + [url for url in usable if is_private_update_url(url)]:
+        if url.lower() not in seen:
+            seen.add(url.lower())
+            out.append(url)
     return out
 
 
@@ -395,37 +438,43 @@ def file_verify_record(path: pathlib.Path, digest: str) -> dict:
     return {"sha1": str(digest).lower(), "size": int(st.st_size), "mtime": int(st.st_mtime)}
 
 
-def looks_like_current_file(path: pathlib.Path, expected: str, manifest_size, previous_hash: str, verified=None) -> bool:
-    """Skip SHA1 when last completed sync already proved this exact file."""
-    if not path.is_file() or not expected:
+def verified_record_matches(verified, size: int, mtime: float) -> bool:
+    """Size + whole-second mtime fast path. Python truncates mtime; a rounded
+    value is accepted too. (PowerShell records before 2.27.22 were also shifted
+    by the local time zone; those miss this fast path and are hashed once.)"""
+    try:
+        v_size = int(verified.get("size", -1))
+        v_mtime = int(verified.get("mtime", -1))
+    except (TypeError, ValueError, AttributeError):
         return False
-    size = path.stat().st_size
+    return v_size == size and v_mtime in (int(mtime), int(round(mtime)))
+
+
+def current_file_state(path: pathlib.Path, expected: str, manifest_size, previous_hash: str = "", verified=None):
+    """Return (is_current, sha1). sha1 is the expected hash when the last sync's
+    size/mtime record proved the file, the computed hash when it had to be read,
+    and None when the size already rules the file out. Callers reuse it instead
+    of hashing the same file twice."""
+    if not path.is_file() or not expected:
+        return False, None
+    st = path.stat()
     if manifest_size not in (None, "", 0, "0"):
         try:
-            if size != int(manifest_size):
-                return False
+            if st.st_size != int(manifest_size):
+                return False, None
         except (TypeError, ValueError):
             pass
     expected = str(expected).lower()
-    previous_hash = str(previous_hash or "").lower()
-    verified = verified or {}
-    v_sha = str(verified.get("sha1") or "").lower()
-    if previous_hash == expected:
-        if v_sha == expected:
-            try:
-                if int(verified.get("size", -1)) == size and int(verified.get("mtime", -1)) == int(path.stat().st_mtime):
-                    return True
-            except (TypeError, ValueError):
-                pass
-            return sha1(path) == expected
-        return sha1(path) == expected
-    if v_sha == expected:
-        try:
-            if int(verified.get("size", -1)) == size and int(verified.get("mtime", -1)) == int(path.stat().st_mtime):
-                return True
-        except (TypeError, ValueError):
-            pass
-    return sha1(path) == expected
+    verified = verified if isinstance(verified, dict) else {}
+    if str(verified.get("sha1") or "").lower() == expected and verified_record_matches(verified, st.st_size, st.st_mtime):
+        return True, expected
+    digest = sha1(path)
+    return digest == expected, digest
+
+
+def looks_like_current_file(path: pathlib.Path, expected: str, manifest_size, previous_hash: str, verified=None) -> bool:
+    """Skip SHA1 when last completed sync already proved this exact file."""
+    return current_file_state(path, expected, manifest_size, previous_hash, verified)[0]
 
 
 def home_timeout_sec(size=0) -> int:
@@ -687,7 +736,7 @@ def busy_retry_delay(exc, busy_attempt):
 def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None, timeout=60, retries=1, min_bytes_after_timeout=0, min_rate_bps=0, backoff=True):
     expected_sha1 = str(expected_sha1).lower()
     if not re.fullmatch(r"[0-9a-f]{40}", expected_sha1):
-        raise UpdateError("[清单无效] 文件校验值无效，已停止下载。")
+        raise file_specific_error("[清单无效] 文件校验值无效，已停止下载。")
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         remove_obsolete_parts(dest, expected_sha1)
@@ -718,7 +767,7 @@ def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None,
                         if tmp.exists():
                             tmp.unlink()
                         if range_restarted:
-                            raise UpdateError("[下载失败] 更新源返回的续传范围无效，请稍后重试。")
+                            raise file_specific_error("[下载失败] 更新源返回的续传范围无效，请稍后重试。")
                         range_restarted = True
                         continue
                     total = int(match[3])
@@ -762,21 +811,60 @@ def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None,
                 continue
             if isinstance(exc, UpdateError):
                 raise
-            raise UpdateError(f"[下载失败] {dest.name}：{network_error_reason(exc)}。已保留下载进度，请检查网络后重试。") from None
+            error = UpdateError(f"[下载失败] {dest.name}：{network_error_reason(exc)}。已保留下载进度，请检查网络后重试。")
+            error.http_status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+            raise error from None
     if sha1(tmp) != expected_sha1:
         tmp.unlink(missing_ok=True)
-        raise UpdateError(f"[校验失败] {dest.name}：下载内容与清单不一致，旧文件未替换。请重新更新；反复失败时联系管理员。")
+        raise file_specific_error(f"[校验失败] {dest.name}：下载内容与清单不一致，旧文件未替换。请重新更新；反复失败时联系管理员。")
     install_verified_file(tmp, dest, expected_sha1)
 
 
-def mark_official_skip():
-    global _OFFICIAL_SKIP, _OFFICIAL_SKIP_NOTIFIED
+def file_specific_error(message: str) -> UpdateError:
+    """A failure tied to one file or manifest row, not to the source host."""
+    error = UpdateError(message)
+    error.file_specific = True
+    return error
+
+
+def counts_against_source(exc: BaseException) -> bool:
+    """True when a failure says the host is unreachable, slow or overloaded."""
+    if isinstance(exc, LocalFileUpdateError) or getattr(exc, "file_specific", False):
+        return False
+    code = getattr(exc, "http_status", None)
+    if code is None and isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    return not (code is not None and 400 <= code < 500 and code not in (408, 429))
+
+
+def official_host(url: str) -> str:
+    return (urllib.parse.urlsplit(str(url)).hostname or "").lower()
+
+
+def official_host_tripped(host: str) -> bool:
     with _OFFICIAL_LOCK:
-        _OFFICIAL_SKIP = True
-        notify = not _OFFICIAL_SKIP_NOTIFIED
-        _OFFICIAL_SKIP_NOTIFIED = True
-    if notify:
-        sync_print("[同步] 官方源本轮不再尝试，其余文件直接走更新服务。")
+        return host in _OFFICIAL_TRIPPED
+
+
+def record_official_result(host: str, ok: bool, counted: bool = True) -> None:
+    tripped = False
+    with _OFFICIAL_LOCK:
+        if ok:
+            _OFFICIAL_FAILURES[host] = 0
+            return
+        if not counted:
+            return
+        count = _OFFICIAL_FAILURES.get(host, 0) + 1
+        _OFFICIAL_FAILURES[host] = count
+        if count >= _OFFICIAL_FAILURE_LIMIT and host not in _OFFICIAL_TRIPPED:
+            _OFFICIAL_TRIPPED.add(host)
+            tripped = True
+    if tripped:
+        sync_print(f"[同步] 官方源 {host} 连续 {_OFFICIAL_FAILURE_LIMIT} 个文件下载失败，本轮不再尝试，其余文件直接走更新服务。")
 
 
 # HYBRID_DOWNLOAD_V1: mirrors supply bytes only, never policy or a different release.
@@ -833,7 +921,9 @@ def prepare_hybrid():
                     with _DIRECT_OPENER.open(request, timeout=3) as response:
                         data = response.read(131072)
                     source['score'] = len(data) / max(time.monotonic()-started, 0.001)
-                except Exception:
+                except Exception as exc:
+                    if isinstance(exc, urllib.error.HTTPError):
+                        exc.close()
                     pass  # keep an unmeasured source as last-resort fallback
                 sources.append(source)
             except Exception:
@@ -869,21 +959,28 @@ def download_hybrid_entry(item, dest, expected, rel):
 def download_manifest_entry(item, base_url: str, dest: pathlib.Path, expected_sha1: str, rel: str) -> str:
     # Prefer official exact-hash URLs, then the pack server/mirrors.
     for url in official_urls(item if isinstance(item, dict) else {}):
+        host = official_host(url)
+        if official_host_tripped(host):
+            continue
         openers = [_DIRECT_OPENER]
         proxy = opener_for_official_url(url)
         if proxy is not _DIRECT_OPENER:
             openers.append(proxy)
+        counted = True
         for opener in openers:
             try:
                 download_file(url, dest, expected_sha1, opener=opener,
                               timeout=_OFFICIAL_TIMEOUT_SEC, retries=0,
                               min_bytes_after_timeout=_OFFICIAL_MIN_BYTES,
                               min_rate_bps=_OFFICIAL_MIN_RATE, backoff=False)
+                record_official_result(host, True)
                 return "official"
             except LocalFileUpdateError:
                 raise
             except Exception as exc:
-                sync_print(f"[同步] {urllib.parse.urlsplit(url).hostname} 不可用（{download_fail_reason(exc)}），继续尝试下一下载源：{rel}")
+                counted = counted and counts_against_source(exc)
+                sync_print(f"[同步] {host} 不可用（{download_fail_reason(exc)}），继续尝试下一下载源：{rel}")
+        record_official_result(host, False, counted)
     if _HYBRID is not None:
         return download_hybrid_entry(item, dest, expected_sha1, rel)
     size = 0
@@ -899,12 +996,14 @@ def download_manifest_entry(item, base_url: str, dest: pathlib.Path, expected_sh
     return "home"
 
 
-def existing_hash_index(root: pathlib.Path) -> dict:
+def existing_hash_index(root: pathlib.Path, sizes=None) -> dict:
     # One SHA1 can map to several local files (TACZ gun-pack sounds are duplicated
     # across assets/ccrp and assets/classicr), so keep a list per hash instead of
     # only the first. Keeping only one made later entries with the same hash point
     # at a path an earlier adopt had already moved away -> "does not exist" crash
     # (2026-07-08 player-reported).
+    # ADOPT_SIZE_FILTER_V1: a file can only match a missing entry of equal size,
+    # so when the missing sizes are known only same-size files are hashed.
     out = {}
     for dirname in ("mods", "config", "defaultconfigs", "kubejs", "scripts", "resourcepacks", "shaderpacks", "data"):
         base = root / dirname
@@ -913,6 +1012,12 @@ def existing_hash_index(root: pathlib.Path) -> dict:
         for path in base.rglob("*"):
             if not path.is_file():
                 continue
+            if sizes is not None:
+                try:
+                    if path.stat().st_size not in sizes:
+                        continue
+                except OSError:
+                    continue
             rel = path.relative_to(root).as_posix()
             try:
                 path = join_safe(root, rel)
@@ -1554,6 +1659,8 @@ def sync_instance(root, args) -> int:
     last_good = "" if args.manifest_url else str(state.get("lastManifestUrl") or "")
     if not args.manifest_url:
         manifest_urls = order_manifest_urls(manifest_urls, last_good)
+        if not manifest_urls:
+            raise SystemExit("[清单获取失败] UPDATE-URL.txt 里没有可用的 http/https 更新地址，请重新获取玩家包。")
     print("[同步] 清单候选：" + "；".join(mask_url(url) for url in manifest_urls))
     proxy = get_proxy_url()
     if proxy:
@@ -1668,18 +1775,34 @@ def sync_instance(root, args) -> int:
     # 目录做全量 SHA1 扫描（大包一次要几十秒）。只在真的遇到缺失文件需要接管时才建一次。
     existing = None
 
+    def missing_entry_sizes():
+        """Sizes of entries absent locally, or None if any of them has no size."""
+        sizes = set()
+        for row in files:
+            try:
+                row_rel = safe_rel(str(row["path"]))
+                if platform_excludes and glob_match(row_rel, platform_excludes):
+                    continue
+                if join_safe(root, row_rel).is_file():
+                    continue
+                sizes.add(int(row["size"]))
+            except (KeyError, TypeError, ValueError):
+                return None
+        return sizes
+
     def adopt_index():
         nonlocal existing
         if existing is None:
             print("[同步] 有文件缺失，正在建立本地文件哈希索引（仅本次需要）...")
-            existing = existing_hash_index(root)
+            existing = existing_hash_index(root, missing_entry_sizes())
         return existing
     # All manifest target paths: lets adopt tell a spare copy (movable) from a twin
-    # the manifest still needs elsewhere (copy instead of steal).
+    # the manifest still needs elsewhere (copy instead of steal). join_safe has
+    # already rejected links, so the joined path is the resolved path.
     manifest_targets = set()
     for item in files:
         try:
-            manifest_targets.add(str(join_safe(root, str(item["path"])).resolve()).lower())
+            manifest_targets.add(str(join_safe(root, str(item["path"]))).lower())
         except (ValueError, KeyError):
             continue
     downloaded = adopted = skipped = preserved = removed = 0
@@ -1701,12 +1824,14 @@ def sync_instance(root, args) -> int:
             continue
         had_previous = key in previous
         previous_hash = previous.get(key, "")
-        if exists and looks_like_current_file(target, expected, item.get("size"), previous_hash, verified.get(key)):
+        is_current, current = current_file_state(target, expected, item.get("size"), previous_hash, verified.get(key)) if exists else (False, "")
+        if is_current:
             ensure_executable_if_needed(target, rel)
             verified[key] = file_verify_record(target, expected)
             skipped += 1
             continue
-        current = sha1(target) if exists else ""
+        if exists and current is None:
+            current = sha1(target)  # size differs from the manifest; hash once for the three-way check
         if exists and current == expected:
             ensure_executable_if_needed(target, rel)
             verified[key] = file_verify_record(target, expected)
@@ -1775,8 +1900,15 @@ def sync_instance(root, args) -> int:
             return key, rel, force_sync, None, exc
 
     if download_jobs:
-        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {_DOWNLOAD_WORKERS}）。")
+        # JOURNAL_BATCH_V1: record every intended file once before downloading.
+        # Recovery keeps only entries whose on-disk hash matches, so intents that
+        # never completed are ignored; installs then add nothing new to write.
+        try:
+            _ACTIVE_JOURNAL.record_many((job[3], job[2]) for job in download_jobs)
+        except OSError as exc:
+            raise local_file_error(exc, _ACTIVE_JOURNAL.path, "保存恢复记录") from None
         workers = max(1, min(8, int(manifest.get("downloadWorkers", _DOWNLOAD_WORKERS)), len(download_jobs)))
+        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {workers}）。")
         if workers == 1:
             results = [run_download_job(job) for job in download_jobs]
         else:
@@ -1901,6 +2033,7 @@ def sync_instance(root, args) -> int:
     }
     save_state(root, state_out)
     _ACTIVE_JOURNAL.finish()
+    tidy_after_sync(root, backup_root)
     config_applied = [
         rel for rel in updated_paths + adopted_paths
         if rel.lower().startswith(("config/", "defaultconfigs/"))
@@ -2082,10 +2215,19 @@ class RecoveryJournal:
             sync_print(f"[恢复] 已识别上次未完成更新写入的 {len(self.data['applied'])} 个文件，将继续按最新清单处理。")
         return list(rows.values())
     def record(self, rel, digest):
-        rel = safe_rel(rel)
+        self.record_many([(rel, digest)])
+    def record_many(self, rows):
+        """Add entries and write the journal once; already-recorded entries are free."""
         with self.lock:
-            self.data["applied"][rel.lower()] = {"path": rel, "sha1": str(digest).lower()}
-            atomic_json(self.path, self.data)
+            changed = False
+            for rel, digest in rows:
+                rel = safe_rel(rel)
+                entry = {"path": rel, "sha1": str(digest).lower()}
+                if self.data["applied"].get(rel.lower()) != entry:
+                    self.data["applied"][rel.lower()] = entry
+                    changed = True
+            if changed or not self.path.is_file():
+                atomic_json(self.path, self.data)
     def finish(self):
         if self.path.exists():
             self.path.unlink()
@@ -2145,6 +2287,91 @@ def install_stage_cache(root, rel, destination, expected):
         return False
     install_verified_file(temporary, destination, expected)
     return True
+
+
+_BACKUP_DIR_NAME = re.compile(r"\d{8}-\d{6}(?:-[0-9A-Za-z]+)*")
+_STAGE_KEEP = {"daemon.lock", "daemon.log"}
+READY_NOTICE_NAME = "更新已就绪.txt"
+
+
+def _clear_tree(directory: pathlib.Path, keep_names=()) -> int:
+    """Delete regular files and empty folders below directory; never follow or
+    delete links or other reparse points. Returns the number of files removed."""
+    removed = 0
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return 0
+    for entry in entries:
+        path = pathlib.Path(entry.path)
+        if entry.name in keep_names or _is_link_or_reparse(path):
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                removed += _clear_tree(path)
+                path.rmdir()
+                continue
+            try:
+                path.unlink()
+            except PermissionError:
+                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+                path.unlink()
+            removed += 1
+        except OSError:
+            continue  # A locked leftover is harmless; the next sync tries again.
+    return removed
+
+
+def prune_old_backups(root: pathlib.Path, keep: pathlib.Path) -> int:
+    """BACKUP_RETENTION_V1: keep only the newest backup. A run that backed up
+    nothing keeps the previous one, so a rollback point always survives."""
+    if not keep.is_dir():
+        return 0
+    backups = join_safe(root, ".portable-sync-backups")
+    pruned = 0
+    for entry in sorted(backups.iterdir()):
+        if entry.name == keep.name or not _BACKUP_DIR_NAME.fullmatch(entry.name):
+            continue
+        if _is_link_or_reparse(entry) or not entry.is_dir():
+            continue
+        _clear_tree(entry)
+        try:
+            entry.rmdir()
+            pruned += 1
+        except OSError:
+            pass
+    return pruned
+
+
+def clear_stage_cache(root: pathlib.Path) -> int:
+    """STAGE_CLEANUP_V1: after a successful sync every staged file is either
+    installed or superseded; keep only the watcher's lock and log."""
+    stage = join_safe(root, ".portable-staging")
+    if not stage.is_dir():
+        return 0
+    removed = _clear_tree(stage, _STAGE_KEEP)
+    notice = join_safe(root, READY_NOTICE_NAME)
+    if notice.is_file():
+        try:
+            notice.unlink()
+        except OSError:
+            pass
+    return removed
+
+
+def tidy_after_sync(root: pathlib.Path, backup_root: pathlib.Path) -> None:
+    try:
+        pruned = prune_old_backups(root, backup_root)
+        if pruned:
+            print(f"[清理] 已删除 {pruned} 份旧备份，只保留本次备份。")
+    except (OSError, UpdateError) as exc:
+        print(f"[清理] 旧备份未能清理，不影响本次更新：{type(exc).__name__}")
+    try:
+        cleared = clear_stage_cache(root)
+        if cleared:
+            print(f"[清理] 已清理预下载缓存 {cleared} 个文件。")
+    except (OSError, UpdateError) as exc:
+        print(f"[清理] 预下载缓存未能清理，不影响本次更新：{type(exc).__name__}")
 
 
 def cleanup_candidates(root, patterns):
