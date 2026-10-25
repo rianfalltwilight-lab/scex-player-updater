@@ -2,6 +2,9 @@
 import argparse
 import atexit
 import functools
+import gzip
+import hashlib
+import io
 import datetime
 import email.utils
 import os
@@ -36,6 +39,48 @@ def install_pid_file(path):
             pass
 
     atexit.register(cleanup)
+
+
+class AccessLog:
+    """UPDATE_ADOPTION_V1: one line per manifest request (time, status, a daily visitor
+    hash, User-Agent) so the admin can see which updater versions players run. The salt
+    lives only in memory and changes every day: IP addresses are never written and
+    visitors cannot be linked across days. Files older than KEEP_DAYS are removed."""
+    KEEP_DAYS = 30
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.lock = threading.Lock()
+        self.day = None
+        self.salt = b""
+
+    def record(self, status, user_agent, address):
+        if not self.folder:
+            return
+        now = datetime.datetime.now()
+        day = now.strftime("%Y%m%d")
+        agent = re.sub(r"[\x00-\x1f\x7f]+", " ", str(user_agent or "-"))[:160]
+        with self.lock:
+            if day != self.day:
+                self.day, self.salt = day, os.urandom(16)
+                self._prune(now)
+            visitor = hashlib.sha256(self.salt + str(address).encode("utf-8")).hexdigest()[:12]
+            os.makedirs(self.folder, exist_ok=True)
+            with open(os.path.join(self.folder, "update-access-" + day + ".log"), "a", encoding="utf-8") as handle:
+                handle.write("{}\t{}\t{}\t{}\n".format(now.isoformat(timespec="seconds"), status, visitor, agent))
+
+    def _prune(self, now):
+        cutoff = (now - datetime.timedelta(days=self.KEEP_DAYS)).strftime("%Y%m%d")
+        try:
+            for name in os.listdir(self.folder):
+                match = re.fullmatch(r"update-access-(\d{8})\.log", name)
+                if match and match.group(1) < cutoff:
+                    os.remove(os.path.join(self.folder, name))
+        except OSError:
+            pass
+
+
+ACCESS_LOG = AccessLog("")
 
 
 class SecureUpdateHandler(SimpleHTTPRequestHandler):
@@ -129,6 +174,11 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
             stat = os.fstat(handle.fileno())
             size = stat.st_size
             etag = '"{:x}-{:x}-{:x}"'.format(stat.st_ino, stat.st_mtime_ns, size)
+            # MANIFEST_CACHE_V1: JSON (the manifest) may be sent gzip-compressed; that
+            # representation has its own ETag, and either ETag matches If-None-Match.
+            gzip_etag = etag[:-1] + '-gz"'
+            use_gzip = (path.endswith('.json') and 1024 <= size <= self._GZIP_CAP and not self.headers.get('Range')
+                        and 'gzip' in (self.headers.get('Accept-Encoding') or '').lower())
             modified = datetime.datetime.fromtimestamp(int(stat.st_mtime), datetime.timezone.utc)
 
             def date_matches(value):
@@ -143,17 +193,30 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
             none_match = self.headers.get('If-None-Match')
             unchanged = False
             if none_match:
-                unchanged = any(value.strip().removeprefix('W/') in ('*', etag)
+                unchanged = any(value.strip().removeprefix('W/') in ('*', etag, gzip_etag)
                                 for value in none_match.split(','))
             elif self.headers.get('If-Modified-Since'):
                 unchanged = date_matches(self.headers['If-Modified-Since'])
             if unchanged:
                 self.send_response(HTTPStatus.NOT_MODIFIED)
-                self.send_header('ETag', etag)
+                self.send_header('ETag', gzip_etag if use_gzip else etag)
                 self.send_header('Last-Modified', self.date_time_string(stat.st_mtime))
                 self.end_headers()
                 handle.close()
                 return None
+
+            if use_gzip:
+                body = self._gzip_body(path, etag, handle)
+                handle.close()
+                self.send_response(HTTPStatus.OK)
+                self.send_header('Content-type', self.guess_type(path))
+                self.send_header('Content-Encoding', 'gzip')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Last-Modified', self.date_time_string(stat.st_mtime))
+                self.send_header('ETag', gzip_etag)
+                self.send_header('Vary', 'Accept-Encoding')
+                self.end_headers()
+                return io.BytesIO(body)
 
             byte_range = self.headers.get('Range')
             if_range = self.headers.get('If-Range')
@@ -196,6 +259,24 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
         except BaseException:
             handle.close()
             raise
+
+    _GZIP_CAP = 16 * 1024 * 1024
+    _gzip_lock = threading.Lock()
+    _gzip_cache = {}
+
+    @classmethod
+    def _gzip_body(cls, path, etag, handle):
+        """Compress once per manifest version; later requests reuse the bytes."""
+        with cls._gzip_lock:
+            cached = cls._gzip_cache.get(path)
+            if cached and cached[0] == etag:
+                return cached[1]
+        body = gzip.compress(handle.read(), 6)
+        with cls._gzip_lock:
+            if len(cls._gzip_cache) > 8:
+                cls._gzip_cache.clear()
+            cls._gzip_cache[path] = (etag, body)
+        return body
 
     # Read the whole file into memory and close the handle immediately instead of
     # streaming from the open handle for the entire (possibly slow) transfer.
@@ -247,6 +328,14 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def log_request(self, code='-', size='-'):
+        try:
+            if urlsplit(self.path).path.endswith('/server-manifest.json'):
+                ACCESS_LOG.record(int(code) if str(code).isdigit() else code,
+                                  self.headers.get('User-Agent', '') if self.headers else '', self.client_address[0])
+        except Exception:
+            pass  # the adoption log must never break a download
+
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 32
@@ -277,7 +366,18 @@ def main():
     parser.add_argument("--keyfile", default="", help="PEM private key; defaults to certfile if omitted")
     parser.add_argument("--kitdir", default="", help="serve toolkit self-update files at tokenless /kit/ when set")
     parser.add_argument("--pid-file", default="", help="write the serving process PID here")
+    parser.add_argument("--access-log-dir", default="auto",
+                        help="manifest request log folder; 'auto' = <tools>/../logs/update-access, '' = off")
     args = parser.parse_args()
+    folder = args.access_log_dir
+    if folder == "auto":
+        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "logs", "update-access")
+    if folder:
+        folder = os.path.abspath(folder)
+        served = os.path.abspath(args.directory)
+        if os.path.commonpath([folder, served]) == served:
+            folder = ""  # never write logs into the served folder
+    ACCESS_LOG.folder = folder
 
     handler = functools.partial(SecureUpdateHandler, directory=args.directory, token=args.token, kitdir=args.kitdir)
     server_class = DualStackThreadingHTTPServer if ":" in args.bind else QuietThreadingHTTPServer
