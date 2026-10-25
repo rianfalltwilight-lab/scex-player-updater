@@ -54,7 +54,7 @@ class Tests(unittest.TestCase):
    with self.assertRaises(u.LocalFileUpdateError):u.download_manifest_entry({},'http://fallback/',self.dest,'a'*40,'pack.zip')
   self.assertEqual(download.call_count,1)
  def test_http_busy_retry_preserved(self):
-  e=urllib.error.HTTPError('http://secret/',503,'busy',{},None)
+  e=urllib.error.HTTPError('http://secret/',503,'busy',{}, io.BytesIO())
   self.assertIsNotNone(u.busy_retry_delay(e,0));self.assertIsNone(u.busy_retry_delay(e,5))
   self.assertIn('HTTP 503',u.network_error_reason(e));e.close()
  @unittest.skipUnless(WINDOWS, 'Windows sharing-lock behavior')

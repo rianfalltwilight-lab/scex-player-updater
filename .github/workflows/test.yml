@@ -9,12 +9,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
-        python: ['3.10', '3.12']
+        include:
+          # Windows players run whatever Python they installed; 3.9 is also the
+          # macOS Command Line Tools Python.
+          - {os: windows-latest, python: '3.9'}
+          - {os: windows-latest, python: '3.10'}
+          - {os: windows-latest, python: '3.12'}
+          - {os: ubuntu-24.04, python: '3.9'}
+          - {os: ubuntu-latest, python: '3.12'}
+          # Runs the macOS entry script itself (bash, /var -> /private/var temp paths).
+          - {os: macos-latest, python: '3.12'}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Run temporary-client and localhost-service tests

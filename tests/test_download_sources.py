@@ -94,7 +94,7 @@ class DownloadRoutingTests(unittest.TestCase):
         content = b'new content'
         digest = hashlib.sha1(content).hexdigest()
         opener = mock.Mock()
-        opener.open.side_effect = [urllib.error.HTTPError('https://example.test', 503, 'busy', {'Retry-After': '3'}, None), io.BytesIO(content)]
+        opener.open.side_effect = [urllib.error.HTTPError('https://example.test', 503, 'busy', {'Retry-After': '3'}, io.BytesIO()), io.BytesIO(content)]
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'demo.jar'
             dest.write_bytes(b'old content')
@@ -108,9 +108,9 @@ class DownloadRoutingTests(unittest.TestCase):
                 u.download_file('https://example.test/demo', dest, digest, opener=opener)
             self.assertEqual(dest.read_bytes(), content)
             self.assertEqual(list(Path(tmp).glob('.portable-sync-*')), [])
-        with contextlib.closing(urllib.error.HTTPError('u', 404, 'missing', {}, None)) as error:
+        with contextlib.closing(urllib.error.HTTPError('u', 404, 'missing', {}, io.BytesIO())) as error:
             self.assertIsNone(u.busy_retry_delay(error, 0))
-        with contextlib.closing(urllib.error.HTTPError('u', 503, 'busy', {}, None)) as error:
+        with contextlib.closing(urllib.error.HTTPError('u', 503, 'busy', {}, io.BytesIO())) as error:
             self.assertIsNone(u.busy_retry_delay(error, 5))
 
     def test_atomic_replace_failure_keeps_previous_file_and_mode(self):

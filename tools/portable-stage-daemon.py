@@ -180,7 +180,7 @@ def probe_timeout_for_url(url: str) -> float:
 # "manifestSignature": "required" and unsigned or wrongly signed manifests are refused.
 # MANIFEST_CACHE_V1: the last verified manifest and signature are kept with their ETags, so an
 # unchanged manifest costs two small 304 responses; the server may send it gzip-compressed.
-import base64, gzip, hmac, http.client, socket, stat as _trust_stat, urllib.error  # noqa: E401
+import base64, gzip, hmac, http.client, io, socket, stat as _trust_stat, urllib.error  # noqa: E401
 
 UPDATER_VERSION = "2.27.24"
 TRUSTED_MANIFEST_KEYS = {"d95f8fce25c000bb": "36G6hVExT3FYPdPFSYf/TTxIqZ0Q8ybtxLqtR8KXgZ8yc2CNEJA+kW27ZO8vzQB7wrjKG7H58r0bkyHQpFRlcU0JygsWTypUzdCeNioTe5PP9vixwORTM37E4O4Dr+/IaLfxUQK+VsWhVMV30Wn2RWBrjLsVg5d9WeK0HC/Sm/VR2NJfCH8d9PLMFRptpp3z3mAaATBdyIMFh6+wlv241rayh/hLTSj6ZGtTcedlMrbY4lNR/b9VV0C/abhvQxU32qKOgLJEHmSxHh2YdzreW9lMBvzQOPztftnZjr1uCqm1+3H0B53iqHmqwvNf5MpQiajBK5bbm/tkXM/AVwuIe5z9kNDAWgDYr7FxiwlX5Glg5C3i4KQJK5eQn8X8m4GW22e/lfYEggvfPiNNYIn9k2C7itxI3W8jxe8GBuiNKiTuDkzOjw0RoOYfOYW3IGvVqy+MRt51bEp3XoVgw/DyeTi+RDQHR56n4Pkr78ISuVWOQKqHO4R7j4jSIM9maEM5"}
@@ -267,7 +267,7 @@ def _trust_fetch(url, etag, cached, timeout, user_agent, optional=False):
     if status == 404 and optional:
         return None, ""
     if status != 200:
-        raise urllib.error.HTTPError(url, status, f"HTTP {status}", None, None)
+        raise urllib.error.HTTPError(url, status, f"HTTP {status}", None, io.BytesIO(body or b""))
     if "gzip" in str(response_headers.get("content-encoding", "")).lower():
         body = gzip.decompress(body)
     return body, str(response_headers.get("etag", ""))
