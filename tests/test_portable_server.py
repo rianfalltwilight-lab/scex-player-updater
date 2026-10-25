@@ -302,6 +302,20 @@ class StandaloneEntryTests(unittest.TestCase):
             run(batch_command(entry), root, {'PORTABLE_ENTRY_NO_PAUSE': '1'}, expected=7)
             self.assertTrue((instance / '_updater/called.txt').is_file())
 
+    def test_slim_instance_with_url_file_in_updater_is_detected(self):
+        # ROOT_SLIM_V1: SCEX 2.27.23+ packs keep UPDATE-URL.txt in _updater only.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            entry = root / 'Update.bat'
+            shutil.copyfile(ROOT / 'tools/portable-client-entry.bat', entry)
+            instance = self.create_client(root, '.minecraft/versions/Slim')
+            (instance / 'UPDATE-URL.txt').replace(instance / '_updater/UPDATE-URL.txt')
+            out = run(batch_command(entry), root,
+                {'PORTABLE_ENTRY_DETECT_ONLY': '1', 'PORTABLE_ENTRY_NO_PAUSE': '1'})
+            detected = json.loads(out)
+            self.assertEqual(len(detected), 1)
+            self.assertTrue(Path(detected[0]).samefile(instance))
+
     def test_multiple_cancel_and_explicit_selection(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)

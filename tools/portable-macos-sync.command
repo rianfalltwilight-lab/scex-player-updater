@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @version 14
+# @version 15
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
@@ -16,8 +16,13 @@ echo "实例目录: $INSTANCE_DIR"
 echo
 
 MANIFEST_URLS="${PORTABLE_MANIFEST_URL:-}"
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "[错误] 没找到 python3。请先安装 Python 3，或在 Windows 上运行 Windows-sync.bat 更新。"
+# MAC_PYTHON_V1: /usr/bin/python3 exists even without the Command Line Tools; it is a
+# stub that opens the "install command line developer tools" dialog. Probe by running it.
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys' >/dev/null 2>&1; then
+  echo "[需要 Python 3] 这台 Mac 还不能运行更新器。"
+  echo "  如果屏幕上弹出「需要安装命令行开发者工具」的窗口：这是正常的，点「安装」，等它装完（约几分钟）。"
+  echo "  没有弹窗时：到 https://www.python.org/downloads/macos/ 下载安装 Python 3。"
+  echo "  装好后重新双击本文件即可。"
   read -r -p "按回车关闭。"
   exit 1
 fi
@@ -132,7 +137,8 @@ except (OSError, RuntimeError):
 if raw_override:
     manifest_urls = re.split(r"[\r\n\x1f]+", raw_override)
 else:
-    for root in (instance_guess, script_dir):
+    # ROOT_SLIM_V1: since 2.27.23 the URL files live in _updater; older packs keep them in the root.
+    for root in (instance_guess, script_dir, instance_guess / "_updater"):
         for name in ("UPDATE-URL.txt", "PORTABLE-UPDATE-URL.txt", "TFCR-update-url.txt", "UPDATE-URL-LAN.txt"):
             path = root / name
             if path.is_file():
@@ -285,7 +291,7 @@ if [ "$status" != "0" ]; then
 fi
 
 set +e
-python3 "$SCRIPT_DIR/player-update-generic.py" --instance-dir "$INSTANCE_DIR"
+PORTABLE_SYNC_INTERACTIVE=1 python3 "$SCRIPT_DIR/player-update-generic.py" --instance-dir "$INSTANCE_DIR"
 status=$?
 set -e
 for script in "$INSTANCE_DIR/更新mod-Mac端.command" "$INSTANCE_DIR/启动游戏-Mac端.command" "$INSTANCE_DIR/macOS-sync.command" "$INSTANCE_DIR/_updater/macOS-sync.command"; do
@@ -334,6 +340,9 @@ if [ "$status" = "0" ]; then
   fi
 else
   echo "[同步] 失败，退出码 $status。"
+  if [ -f "$INSTANCE_DIR/更新诊断包.zip" ]; then
+    echo "[诊断] 请把实例目录里的「更新诊断包.zip」发给管理员，不需要截图。"
+  fi
 fi
 read -r -p "按回车关闭。"
 exit "$status"
@@ -349,3 +358,5 @@ exit "$status"
 # v12 用于把“公开更新源优先 + 状态复用”安全推送到存量 Mac 客户端。
 # v14：地址规则与主同步器统一（只用第一个公网地址，再试局域网，过滤已退役云端）；
 # 自刷新先比对本地哈希，一致就不下载。
+# v15：缺 python3 时说明命令行开发者工具弹窗；也从 _updater 读取更新地址；
+# 文件被占用时可按回车重试；失败时提示发送「更新诊断包.zip」。

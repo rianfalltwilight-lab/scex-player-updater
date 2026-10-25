@@ -165,7 +165,8 @@ function Get-RepairMaskedUrl([string]$Url) {
 function Read-UpdateUrls([string]$InstanceDir, [string]$KitHome) {
     $result=New-Object 'System.Collections.Generic.List[string]'
     $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach($p in @((Join-Path $InstanceDir 'UPDATE-URL.txt'),(Join-Path $InstanceDir 'PORTABLE-UPDATE-URL.txt'),(Join-Path $InstanceDir 'TFCR-update-url.txt'),(Join-Path $KitHome 'UPDATE-URL.txt'))) {
+    # ROOT_SLIM_V1: since 2.27.23 the URL files live in _updater; older packs keep them in the root.
+    foreach($p in @((Join-Path $InstanceDir 'UPDATE-URL.txt'),(Join-Path $InstanceDir 'PORTABLE-UPDATE-URL.txt'),(Join-Path $InstanceDir 'TFCR-update-url.txt'),(Join-Path $InstanceDir '_updater\UPDATE-URL.txt'),(Join-Path $InstanceDir '_updater\PORTABLE-UPDATE-URL.txt'),(Join-Path $KitHome 'UPDATE-URL.txt'))) {
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
         foreach($line in ((Get-Content -LiteralPath $p -Raw -Encoding UTF8) -split "`r?`n")) {
             $url=([string]$line).Trim()

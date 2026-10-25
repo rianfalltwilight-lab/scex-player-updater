@@ -759,6 +759,26 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
         log(log_path, "暂存 daemon 已退出。")
 
 
+def show_watch_banner():
+    """WATCH_BANNER_V1: on Windows this runs in its own minimized console window;
+    tell the player what it is. On macOS/Linux it runs without a window."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("整合包后台预下载（可以关闭，不影响游戏）")
+    except Exception:
+        pass
+    try:
+        print("=" * 60)
+        print("  这是整合包后台预下载窗口：玩游戏时悄悄下载管理员新发布的更新，")
+        print("  下次启动时就不用再等。可以直接关闭，不影响游戏；下次运行更新器会重新开启。")
+        print("  游戏退出后它会自己结束。")
+        print("=" * 60, flush=True)
+    except (OSError, ValueError, UnicodeError, AttributeError):
+        pass  # redirected to a non-UTF-8 pipe or no console at all: the banner is optional
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Portable staging daemon (macOS/Linux)")
     ap.add_argument("--instance-dir", default=".")
@@ -782,6 +802,7 @@ def main() -> int:
         return 0
 
     stage_root.mkdir(parents=True, exist_ok=True)
+    show_watch_banner()
     manifest_urls = read_update_urls(instance_root, args.manifest_url)
     if not manifest_urls:
         log(log_path, "未找到 UPDATE-URL，暂存 daemon 退出。")

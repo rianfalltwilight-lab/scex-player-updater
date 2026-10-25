@@ -1,7 +1,10 @@
 ﻿param(
     [string]$ConfigPath = ".\tools\portable-pack.json",
     [string]$Version = "",
-    [switch]$NoNotify
+    [switch]$NoNotify,
+    # PUBLISH_PREVIEW_V1: read-only; reports what players would download and the
+    # release notes they would see, without touching the publish directory.
+    [switch]$Preview
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +25,26 @@ function Resolve-AnyPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
     return [System.IO.Path]::GetFullPath((Join-Path $Root $Path))
+}
+
+function Get-PlayerGuideText {
+    # 使用说明.txt in the player instance root (ROOT_SLIM_V1). Keep the text in sync
+    # with tests/test_scex_ux.py, which checks the published bytes.
+    param([string]$PackName, [string]$ServerAddress)
+    $lines = @(
+        "$PackName 更新器使用说明",
+        '',
+        '1. 先完全退出 Minecraft（不是返回标题界面）。',
+        '2. Windows：双击「更新mod-Windows端.bat」。Mac：双击「更新mod-Mac端.command」。',
+        '   更新完成后会自动打开启动器（找得到的话）。',
+        '3. 遇到问题：Windows 双击「一键客户端自助修复.bat」，按提示操作。',
+        '   更新失败时，把这个文件夹里的「更新诊断包.zip」发给管理员。',
+        '',
+        "服务器地址：$ServerAddress",
+        '',
+        '_updater 文件夹里是更新器本身和更新地址，请不要删除或移动。'
+    )
+    return ($lines -join "`r`n") + "`r`n"
 }
 
 function Resolve-InRoot {
@@ -511,11 +534,53 @@ if (-not [string]::IsNullOrWhiteSpace($oldVersion) -and $Version -ne $oldVersion
 # 增量发布：不删除发布目录，逐文件比对写入；过期文件在所有复制完成后统一清理。
 # Local-origin mode: the public 18088 source is authoritative; cloud staging is retired.
 
-New-Item -ItemType Directory -Force $publishDir | Out-Null
-
 $excludeGlobs = Get-ConfigArray -Object $config -Name 'excludeGlobs' -Default @()
 $includeRoots = Get-ConfigArray -Object $config -Name 'includeRoots' -Default @('mods', 'config', 'defaultconfigs', 'data', 'resourcepacks', 'datapacks', 'kubejs', 'scripts')
 $includeFiles = Get-ConfigArray -Object $config -Name 'includeFiles' -Default @('options.txt', 'servers.dat')
+
+if ($Preview) {
+    Write-Host '[预览] 只读预览：不修改发布目录和清单，也不通知玩家。启动器与更新器脚本不计入。'
+    $selected = @{}
+    foreach ($rootName in $includeRoots) {
+        $name = ([string]$rootName).Replace('\', '/')
+        if ([string]::IsNullOrWhiteSpace($name) -or -not (Test-RelativePathSafe -Rel $name)) { continue }
+        $sourceDir = Join-Path $sourceClient $name
+        if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) { continue }
+        Get-ChildItem -LiteralPath $sourceDir -Recurse -File -Force | ForEach-Object {
+            $rel = $name + '/' + ($_.FullName.Substring($sourceDir.Length).TrimStart('\', '/') -replace '\\', '/')
+            if (-not (Test-GlobMatch -Rel $rel -Globs $excludeGlobs)) { $selected[$rel] = $_ }
+        }
+    }
+    foreach ($file in $includeFiles) {
+        $rel = ([string]$file).Replace('\', '/')
+        if (-not (Test-RelativePathSafe -Rel $rel) -or (Test-GlobMatch -Rel $rel -Globs $excludeGlobs)) { continue }
+        $path = Join-Path $sourceClient $rel
+        if (Test-Path -LiteralPath $path -PathType Leaf) { $selected[$rel] = Get-Item -LiteralPath $path }
+    }
+    $changes = New-Object System.Collections.Generic.List[object]
+    foreach ($rel in ($selected.Keys | Sort-Object)) {
+        $sha = Get-FileSha1 -Path $selected[$rel].FullName
+        if (-not $oldFiles.ContainsKey($rel)) { $kind = '新增' } elseif ($oldFiles[$rel] -ne $sha) { $kind = '修改' } else { continue }
+        [void]$changes.Add([pscustomobject]@{ Rel = $rel; Kind = $kind; Size = [long]$selected[$rel].Length; Official = $oldUrlBySha1.ContainsKey($sha) })
+    }
+    $managedRoots = @($includeRoots | ForEach-Object { ([string]$_).Replace('\', '/').TrimEnd('/') + '/' })
+    $removedRels = @($oldFiles.Keys | Where-Object { $k = [string]$_; -not $selected.ContainsKey($k) -and (($includeFiles -contains $k) -or @($managedRoots | Where-Object { $k.StartsWith($_) }).Count) } | Sort-Object)
+    $bytes = [long](($changes | Measure-Object -Property Size -Sum).Sum)
+    $officialBytes = [long](($changes | Where-Object { $_.Official } | Measure-Object -Property Size -Sum).Sum)
+    Write-Host ("[预览] 相对上一版 {0}：新增 {1} 个、修改 {2} 个、删除 {3} 个文件。" -f $oldVersion, @($changes | Where-Object { $_.Kind -eq '新增' }).Count, @($changes | Where-Object { $_.Kind -eq '修改' }).Count, $removedRels.Count)
+    Write-Host ("[预览] 已是上一版的玩家需下载约 {0:N1} MB；其中 {1:N1} MB 已知可走官方源，其余走本服更新服务（正式发布时还会再查一次官方源）。" -f ($bytes / 1MB), ($officialBytes / 1MB))
+    foreach ($change in ($changes | Sort-Object Size -Descending | Select-Object -First 12)) { Write-Host ("  {0} {1}（{2:N1} MB）" -f $change.Kind, $change.Rel, ($change.Size / 1MB)) }
+    foreach ($rel in ($removedRels | Select-Object -First 12)) { Write-Host ("  删除 {0}" -f $rel) }
+    if ($releaseNotes.Count) {
+        Write-Host '[预览] 玩家更新窗口会显示：'
+        Write-Host ("[本版说明] " + $Version)
+        foreach ($note in $releaseNotes) { Write-Host ("  - " + $note) }
+    } else { Write-Host '[预览] portable-pack.json 里还没有填写 releaseNotes。' }
+    if ($script:PublishLockStream) { $script:PublishLockStream.Dispose(); $script:PublishLockStream = $null }
+    exit 0
+}
+
+New-Item -ItemType Directory -Force $publishDir | Out-Null
 $script:CopiedFiles = 0
 foreach ($rootName in $includeRoots) {
     $name = [string]$rootName
@@ -573,38 +638,30 @@ if (-not [string]::IsNullOrWhiteSpace($lanHost)) {
     $lanHost = $lanHost.Trim()
     if ($lanHost -match '[\s/:\\]') { throw "update.lanHost 格式异常：$lanHost" }
     $lanManifestUrl = $scheme + "://" + $lanHost + ":" + $port + "/" + $token + "/server-manifest.json"
-    Write-Utf8NoBom -Path (Join-Path $publishDir 'UPDATE-URL-LAN.txt') -Value ($lanManifestUrl + "`r`n")
-} else {
-    $staleLanUrl = Join-Path $publishDir 'UPDATE-URL-LAN.txt'
-    if (Test-Path -LiteralPath $staleLanUrl -PathType Leaf) { Remove-Item -LiteralPath $staleLanUrl -Force -ErrorAction SilentlyContinue }
 }
+# ROOT_SLIM_V1: the address files live in _updater, so the instance root only shows
+# the two update entries, the self-repair entry and a Chinese 使用说明.txt. Every
+# entry point since 2.27.23 also reads _updater; the syncer then removes the old
+# unchanged root copies like any other file that left the manifest.
 # Publish the public endpoint first, followed by the configured LAN fallback.
 $manifestUrls = @($manifestUrl)
 if ($lanManifestUrl -and $lanManifestUrl -ne $manifestUrl) { $manifestUrls += $lanManifestUrl }
 $manifestUrlsText = ($manifestUrls -join "`r`n") + "`r`n"
-Write-Utf8NoBom -Path (Join-Path $publishDir 'UPDATE-URL.txt') -Value $manifestUrlsText
-Write-Utf8NoBom -Path (Join-Path $publishDir 'PORTABLE-UPDATE-URL.txt') -Value $manifestUrlsText
+Write-Utf8NoBom -Path (Join-Path $updaterRoot 'UPDATE-URL.txt') -Value $manifestUrlsText
+Write-Utf8NoBom -Path (Join-Path $updaterRoot 'PORTABLE-UPDATE-URL.txt') -Value $manifestUrlsText
+if ($lanManifestUrl) { Write-Utf8NoBom -Path (Join-Path $updaterRoot 'UPDATE-URL-LAN.txt') -Value ($lanManifestUrl + "`r`n") }
 $serverName = [string](Get-ConfigValue -Object $config.server -Name 'name' -Default $packName)
 $serverAddress = [string](Get-ConfigValue -Object $config.server -Name 'address' -Default $hostName)
-Write-Utf8NoBom -Path (Join-Path $publishDir 'SERVER.txt') -Value ($serverAddress + "`r`n")
-Write-Utf8NoBom -Path (Join-Path $publishDir 'README-sync.txt') -Value @"
-$packName player sync pack
-
-Windows: run 更新mod-Windows端.bat.
-macOS: run 更新mod-Mac端.command if python3 is available.
-Self repair: run 一键客户端自助修复.bat; use -Fix only when repair is needed.
-Update URL: $manifestUrl
-LAN fallback: $(if ($lanManifestUrl) { $lanManifestUrl } else { 'not configured' })
-Server: $serverAddress
-"@
+# UTF-8 with BOM so Notepad on every Windows version shows the Chinese text.
+[IO.File]::WriteAllText((Join-Path $publishDir '使用说明.txt'), (Get-PlayerGuideText -PackName $packName -ServerAddress $serverAddress), (New-Object Text.UTF8Encoding($true)))
 
 $base = $publishDir.TrimEnd('\', '/')
 
 # 每次发布都重新生成的元文件也算"本次应有"，其余未登记的文件即上一版遗留，统一清理。
-foreach ($meta in @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'SERVER.txt', 'README-sync.txt', 'server-manifest.json', 'update-log.txt')) {
+foreach ($meta in @('_updater/UPDATE-URL.txt', '_updater/PORTABLE-UPDATE-URL.txt', '使用说明.txt', 'server-manifest.json', 'update-log.txt')) {
     Register-PublishedRel -Rel $meta
 }
-if ($lanManifestUrl) { Register-PublishedRel -Rel 'UPDATE-URL-LAN.txt' }
+if ($lanManifestUrl) { Register-PublishedRel -Rel '_updater/UPDATE-URL-LAN.txt' }
 Get-ChildItem -LiteralPath $publishDir -Recurse -File -Force | ForEach-Object {
     $rel = $_.FullName.Substring($base.Length).TrimStart('\', '/') -replace '\\', '/'
     if ($script:DesiredRelKeys.Contains($rel)) { return }
@@ -759,6 +816,10 @@ if ($oldFiles.Count -gt 0) {
         'UPDATE-URL-LAN.txt' = $true
         'SERVER.txt' = $true
         'README-sync.txt' = $true
+        '_updater/UPDATE-URL.txt' = $true
+        '_updater/PORTABLE-UPDATE-URL.txt' = $true
+        '_updater/UPDATE-URL-LAN.txt' = $true
+        '使用说明.txt' = $true
     }
     $newFileMap = @{}
     foreach ($f in $files) {
@@ -1067,6 +1128,17 @@ if ($oldFiles.Count -gt 0) {
         Write-Host ""
         Write-Host "[便携] 变更摘要："
         Write-Host $summaryText
+        Write-Host ""
+        # PUBLISH_PREVIEW_V1: download impact of this release for an up-to-date player.
+        $impactBytes = [long]0; $impactCount = 0; $officialCount = 0; $officialBytes = [long]0
+        foreach ($row in @($manifest.files)) {
+            $p = [string]$row.path
+            if ($metaFiles.ContainsKey($p) -or ($oldFilesFiltered.ContainsKey($p) -and $oldFilesFiltered[$p] -eq [string]$row.sha1)) { continue }
+            $size = [long]0; try { $size = [long]$row.size } catch { }
+            $impactCount++; $impactBytes += $size
+            if ($row.PSObject.Properties['url'] -and [string]$row.url) { $officialCount++; $officialBytes += $size }
+        }
+        Write-Host ("[便携] 玩家下载量：已是上一版的玩家需下载 {0} 个文件、{1:N1} MB；其中 {2} 个（{3:N1} MB）可走官方源，其余 {4:N1} MB 走本服更新服务。" -f $impactCount, ($impactBytes / 1MB), $officialCount, ($officialBytes / 1MB), (($impactBytes - $officialBytes) / 1MB))
         Write-Host ""
 
         if ($NoNotify) {

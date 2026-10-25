@@ -115,10 +115,37 @@ class SourceIndexPublisherTests(unittest.TestCase):
             self.assertEqual(manifest['downloadWorkers'], 6)
             self.assertEqual(manifest['updaterRevision'], 'test-revision')
             self.assertEqual(manifest['downloadSourceStatus']['official_unique'], 0)
-            urls = (public / 'UPDATE-URL.txt').read_text('utf-8').splitlines()
+            urls = (public / '_updater/UPDATE-URL.txt').read_text('utf-8').splitlines()
             self.assertEqual(len(urls), 2)
             self.assertTrue(urls[0].startswith('http://update.example.com:'))
             self.assertTrue(urls[1].startswith('http://192.0.2.10:'))
+            # ROOT_SLIM_V1: address files moved to _updater; the root keeps the
+            # entry points plus 使用说明.txt.
+            for name in ('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'UPDATE-URL-LAN.txt',
+                         'SERVER.txt', 'README-sync.txt'):
+                self.assertFalse((public / name).exists(), name)
+            listed = {row['path'] for row in manifest['files']}
+            for rel in ('_updater/UPDATE-URL.txt', '_updater/PORTABLE-UPDATE-URL.txt',
+                        '_updater/UPDATE-URL-LAN.txt', '使用说明.txt'):
+                self.assertIn(rel, listed)
+            self.assertFalse({'UPDATE-URL.txt', 'SERVER.txt', 'README-sync.txt'} & listed)
+            guide = (public / '使用说明.txt').read_bytes()
+            self.assertTrue(guide.startswith(b'\xef\xbb\xbf'))
+            self.assertEqual(guide.count(b'\n'), guide.count(b'\r\n'))
+            self.assertIn('更新诊断包.zip', guide.decode('utf-8-sig'))
+            # PUBLISH_PREVIEW_V1: -Preview reports and leaves every published byte alone.
+            published = {p.relative_to(public).as_posix(): p.read_bytes()
+                         for p in public.rglob('*') if p.is_file()}
+            write(root, 'main-client/config/added.txt', b'preview only')
+            preview = subprocess.run(command + ['-Version', '1.0.1', '-Preview'], cwd=root,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+            # Console code page differs per machine; only check the ASCII path.
+            text = preview.stdout.decode('utf-8', errors='replace')
+            self.assertEqual(preview.returncode, 0, text)
+            self.assertIn('config/added.txt', text)
+            self.assertEqual({p.relative_to(public).as_posix(): p.read_bytes()
+                              for p in public.rglob('*') if p.is_file()}, published)
+            (root / 'main-client/config/added.txt').unlink()
             (root / 'tools/official-source-index.py').write_text('raise SystemExit(9)\n', encoding='utf-8')
             result = subprocess.run(command + ['-Version', '1.0.1'], cwd=root,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)

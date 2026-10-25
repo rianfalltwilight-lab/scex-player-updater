@@ -5,11 +5,18 @@
     [switch]$Deep,
     [switch]$QqSummary,
     [switch]$Quiet,
-    [switch]$NoPause
+    [switch]$NoPause,
+    # REPAIR_INTERACTIVE_V1: the one-click BAT asks before fixing instead of
+    # requiring a -Fix command line. Also offers to restore kept personal edits
+    # to the server version and to bring back files the last update replaced.
+    [switch]$Interactive,
+    [switch]$RestorePreserved,
+    [switch]$RestoreLastUpdate
 )
 
 # 玩家客户端自助修复：对照清单检查 Java / 更新源 / 模组哈希，可选自动修补。
 # 在玩家实例目录运行；可 -Fix 只重下异常文件。中文输出 + 诊断编号。
+if ($Interactive) { $Deep = $true }  # 问答模式也检查配置，才能找出保留了个人修改的文件
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -231,7 +238,7 @@ function Format-RepairError($ErrorRecord, [string]$Path = '', [string]$Phase = '
     if ($code -eq 5) { return "[权限不足] $Path。请检查文件权限和安全软件拦截后重试。" }
     if ($code -in @(39,112)) { return "[空间不足] $Path。请腾出目标磁盘空间后重试。" }
     if ($Phase -eq '下载') { return "[下载失败] $Path。无法取得更新内容，请检查网络或稍后重试。" }
-    return "[修复失败] $Path。操作未完成，请保留窗口截图联系管理员。"
+    return "[修复失败] $Path。操作未完成，请把实例目录里的 _repair\latest\report.txt 发给管理员。"
 }
 function Assert-RepairPathsAvailable($Paths) {
     $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -264,6 +271,36 @@ function Get-RepairProperty($Object,[string]$Name,$Default=$null) {
 function Test-RepairGlob([string]$Rel,$Globs) {
     foreach($glob in @($Globs)) { if($Rel.Replace('\','/') -like ([string]$glob).Replace('\','/')){return $true} }
     return $false
+}
+function Read-YesNo([string]$Question) {
+    Write-Host ''
+    Write-Host ($Question + ' 输入 Y 后回车确认；直接回车跳过：') -ForegroundColor Yellow -NoNewline
+    $answer = [Console]::ReadLine()
+    return ($null -ne $answer -and $answer.Trim() -match '^(?i:y|yes|是|好)$')
+}
+function Get-LastUpdateBackup([string]$Root) {
+    # Newest .portable-sync-backups\<stamp>; the updater keeps only one since 2.27.22.
+    $backups = Join-Path $Root '.portable-sync-backups'
+    if (-not [IO.Directory]::Exists($backups)) { return $null }
+    return Get-ChildItem -LiteralPath $backups -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d{8}-\d{6}' -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
+        Sort-Object Name -Descending | Select-Object -First 1
+}
+function Get-RestorableBackupFiles($Backup, [string]$Root) {
+    # Only files the update replaced in place, never mods or updater scripts:
+    # restoring a deleted old mod jar next to its new version would load both.
+    if (-not $Backup) { return @() }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($file in @(Get-ChildItem -LiteralPath $Backup.FullName -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        $rel = Normalize-Rel $file.FullName.Substring($Backup.FullName.Length).TrimStart('\', '/')
+        if (($rel -like 'mods/*') -or ($rel -like '_updater/*') -or (($rel -notmatch '/') -and ($rel -match '\.(bat|command|txt)$'))) { continue }
+        $dest = Join-Safe $Root $rel
+        if (-not [IO.File]::Exists($dest)) { continue }
+        if ((Get-Sha1 $dest) -eq (Get-Sha1 $file.FullName)) { continue }
+        [void]$out.Add([pscustomobject]@{ Rel = $rel; Source = $file.FullName; Destination = $dest })
+    }
+    return @($out.ToArray())
 }
 function Get-RepairMaskedUrl([string]$Url) {
     if ($Url -like 'file:*') { return '本地清单' }
@@ -303,7 +340,7 @@ $serverReachable = $false
 $rawUrlValues = New-Object 'System.Collections.Generic.List[string]'
 if (-not [string]::IsNullOrWhiteSpace($explicitManifestUrl)) { [void]$rawUrlValues.Add($explicitManifestUrl) }
 else {
-    foreach ($rel in @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', '_updater\UPDATE-URL.txt')) {
+    foreach ($rel in @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', '_updater\UPDATE-URL.txt', '_updater\PORTABLE-UPDATE-URL.txt')) {
         $urlPath = Join-Path $instanceRoot $rel
         if (Test-Path -LiteralPath $urlPath -PathType Leaf) {
             try { [void]$rawUrlValues.Add((Get-Content -LiteralPath $urlPath -Raw -Encoding UTF8)) } catch { }
@@ -370,6 +407,10 @@ if (-not $manifest -and $errors.Count -eq 0) {
 
 # Preserve the same customization policy as normal synchronization.
 $stateFiles=@();$previousHashes=@{};$preserved=New-Object 'System.Collections.Generic.List[string]'
+$preservedChanged=New-Object System.Collections.Generic.List[object]
+$restoreTargets=New-Object System.Collections.Generic.List[object]
+$restoredToServer=New-Object System.Collections.Generic.List[string]
+$fixProblems=[bool]$Fix
 $statePath=Join-Path $instanceRoot '.portable-sync-state.json'
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     try { $repairState=Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json;$stateFiles=@($repairState.files) } catch { [void]$warnings.Add('同步状态无法读取；不会覆盖符合保留规则的本地修改。') }
@@ -433,7 +474,11 @@ if ($manifest -and $manifest.files) {
             }
             if ($exists -and (Test-RepairGlob $key (Get-RepairProperty $manifest 'preserveLocalChangeGlobs' @()))) {
                 $local=Get-Sha1 $full
-                if ($local -ne $expected -and (-not $previous -or $local -ne $previous)) { [void]$preserved.Add($rel);continue }
+                if ($local -ne $expected -and (-not $previous -or $local -ne $previous)) {
+                    [void]$preserved.Add($rel)
+                    [void]$preservedChanged.Add([pscustomobject]@{ path = $rel; sha1 = $expected })
+                    continue
+                }
             }
         }
         if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
@@ -470,8 +515,30 @@ if ((Test-Path $modsDir) -and $manifest -and $manifest.files) {
     }
 }
 
+# Interactive questions (one-click BAT): fix problems, then restore kept personal edits.
+if ($Interactive -and $manifest) {
+    if ($missing.Count + $mismatch.Count -gt 0) {
+        Write-Host ''
+        Write-Host ('检查完成：{0} 个文件缺失，{1} 个文件损坏或版本不对。' -f $missing.Count, $mismatch.Count) -ForegroundColor Yellow
+        foreach ($m in (@($missing) + @($mismatch) | Select-Object -First 8)) { Write-Host ('  · ' + $m.path) }
+        if (-not $fileBaseUrl) { Write-Host '更新源暂时连不上，现在无法重新下载；请稍后再运行一次。' -ForegroundColor Yellow }
+        elseif (Read-YesNo '是否现在重新下载这些文件？原文件会先备份。') { $fixProblems = $true }
+    } else {
+        Write-Host ''
+        Write-Host '检查完成：模组、配置和更新器文件都和服务器一致。' -ForegroundColor Green
+    }
+    if ($preservedChanged.Count -gt 0 -and $fileBaseUrl) {
+        Write-Host ''
+        Write-Host ('有 {0} 个文件保留了你的个人修改，和服务器版本不同：' -f $preservedChanged.Count)
+        foreach ($p in ($preservedChanged | Select-Object -First 10)) { Write-Host ('  · ' + $p.path) }
+        Write-Host '如果某个模组出现异常，可以把这些文件恢复为服务器版本；不确定时选跳过。'
+        if (Read-YesNo '是否把它们恢复为服务器版本？你的版本会先备份到 _repair 目录。') { foreach ($p in $preservedChanged) { [void]$restoreTargets.Add($p) } }
+    }
+}
+if ($RestorePreserved) { foreach ($p in $preservedChanged) { [void]$restoreTargets.Add($p) } }
+
 # Fix
-if ($Fix -and $fileBaseUrl -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)) {
+if ($fileBaseUrl -and (($fixProblems -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)) -or $restoreTargets.Count -gt 0)) {
     $fileByPath = @{}
     if ($manifest -and $manifest.files) {
         foreach ($f in @($manifest.files)) {
@@ -479,8 +546,12 @@ if ($Fix -and $fileBaseUrl -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)
         }
     }
     $toFix = @()
-    foreach ($m in $missing) { $toFix += [pscustomobject]@{ path = $m.path; sha1 = $m.sha1 } }
-    foreach ($m in $mismatch) { $toFix += [pscustomobject]@{ path = $m.path; sha1 = $m.expected } }
+    if ($fixProblems) {
+        foreach ($m in $missing) { $toFix += [pscustomobject]@{ path = $m.path; sha1 = $m.sha1; restore = $false } }
+        foreach ($m in $mismatch) { $toFix += [pscustomobject]@{ path = $m.path; sha1 = $m.expected; restore = $false } }
+    }
+    foreach ($m in $restoreTargets) { $toFix += [pscustomobject]@{ path = $m.path; sha1 = $m.sha1; restore = $true } }
+    if (-not $Fix) { Assert-RepairPathsAvailable @($toFix | ForEach-Object { Join-Safe $instanceRoot ([string]$_.path) }) }
     foreach ($item in $toFix) {
         try {
             $rel = [string]$item.path
@@ -492,7 +563,7 @@ if ($Fix -and $fileBaseUrl -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)
             }
             $src = $fileByPath[(Normalize-Rel $rel)]
             Download-RepairEntry -File $src -FileBaseUrl $fileBaseUrl -Dest $dest -ExpectedSha1 $item.sha1 -Rel $rel
-            $fixed.Add($rel) | Out-Null
+            if ($item.restore) { $restoredToServer.Add($rel) | Out-Null } else { $fixed.Add($rel) | Out-Null }
         } catch {
             $errors.Add((Format-RepairError $_ ([string]$item.path))) | Out-Null
         }
@@ -500,7 +571,7 @@ if ($Fix -and $fileBaseUrl -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)
 }
 
 # Recheck actual repaired bytes before reporting remaining problems.
-if ($Fix) {
+if ($fixProblems) {
     foreach($item in @($missing.ToArray())) {
         if ((Get-Sha1 (Join-Safe $instanceRoot ([string]$item.path))) -eq $item.sha1) { [void]$missing.Remove($item);$okCount++ }
     }
@@ -546,11 +617,14 @@ if ($mismatch.Count -gt 0) {
 if ($fixed.Count -gt 0) {
     [void]$sb.AppendLine(('已自动修补：{0} 个文件' -f $fixed.Count))
 }
+if ($restoredToServer.Count -gt 0) {
+    [void]$sb.AppendLine(('已恢复为服务器版本：{0} 个文件（你的版本已备份到报告目录 backup）' -f $restoredToServer.Count))
+}
 foreach ($e in $errors) { [void]$sb.AppendLine(('错误：' + $e)) }
 foreach ($w in $warnings) { [void]$sb.AppendLine(('提示：' + $w)) }
 [void]$sb.AppendLine(('风险灯：{0}' -f $level))
-if (-not $Fix -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)) {
-    [void]$sb.AppendLine('建议：再运行一次并加 -Fix 自动重下异常文件；或双击「更新mod-Windows端.bat」完整同步。')
+if (-not $fixProblems -and ($missing.Count -gt 0 -or $mismatch.Count -gt 0)) {
+    [void]$sb.AppendLine('建议：再双击「一键客户端自助修复.bat」并选择修复，或双击「更新mod-Windows端.bat」完整同步。')
 }
 [void]$sb.AppendLine(('报告目录：_repair\{0}' -f $stamp))
 [void]$sb.AppendLine('把诊断编号发给管理员可加快协助。')
@@ -572,8 +646,9 @@ $meta = [ordered]@{
     mismatch = @($mismatch | ForEach-Object { $_.path })
     extraMods = @($extraMods)
     fixed = @($fixed)
+    restoredToServer = @($restoredToServer)
     level = $level
-    fixMode = [bool]$Fix
+    fixMode = [bool]$fixProblems
     generatedAt = (Get-Date).ToString('o')
 }
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
@@ -592,6 +667,41 @@ elseif (-not $Quiet) {
     Write-Host $qqText
     Write-Host ''
     Write-Host ("完整报告: " + (Join-Path $outDir 'report.txt')) -ForegroundColor Cyan
+}
+
+# Bring back files the last update replaced (configs and the like; never mods).
+if ($Interactive -or $RestoreLastUpdate) {
+    $lastBackup = Get-LastUpdateBackup $instanceRoot
+    $restorable = @(Get-RestorableBackupFiles $lastBackup $instanceRoot)
+    if ($restorable.Count -gt 0) {
+        $doRestore = [bool]$RestoreLastUpdate
+        if (-not $doRestore) {
+            Write-Host ''
+            Write-Host ('上次更新（{0}）替换了 {1} 个配置等文件（不含模组）：' -f $lastBackup.Name, $restorable.Count)
+            foreach ($item in ($restorable | Select-Object -First 8)) { Write-Host ('  · ' + $item.Rel) }
+            Write-Host '一般不需要恢复，只在想找回被更新覆盖的个人配置时使用。服务器要求统一的文件，下次更新时仍会更新。'
+            $doRestore = Read-YesNo '是否把这些文件恢复为更新前的版本？当前版本会先备份。'
+        }
+        if ($doRestore) {
+            Assert-RepairPathsAvailable @($restorable | ForEach-Object { $_.Destination })
+            $restoredCount = 0
+            foreach ($item in $restorable) {
+                $tmp = Join-Path (Split-Path -Parent $item.Destination) ('.repair-' + [guid]::NewGuid().ToString('N') + '.tmp')
+                try {
+                    $bak = Join-Safe (Join-Path $outDir 'backup') $item.Rel
+                    New-Item -ItemType Directory -Force (Split-Path $bak) | Out-Null
+                    Copy-Item -LiteralPath $item.Destination -Destination $bak -Force
+                    Copy-Item -LiteralPath $item.Source -Destination $tmp -Force
+                    Install-RepairFile -Temporary $tmp -Destination $item.Destination
+                    $restoredCount++
+                } catch { Write-Host (Format-RepairError $_ $item.Rel) -ForegroundColor Red }
+                finally { if ([IO.File]::Exists($tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+            }
+            Write-Host ('已恢复 {0} 个文件；当前版本备份在 {1}' -f $restoredCount, (Join-Path $outDir 'backup')) -ForegroundColor Green
+        }
+    } elseif ($RestoreLastUpdate) {
+        Write-Host '没有找到可以恢复的上次更新备份。'
+    }
 }
 
 if (-not $NoPause -and -not $QqSummary -and -not $Quiet) {

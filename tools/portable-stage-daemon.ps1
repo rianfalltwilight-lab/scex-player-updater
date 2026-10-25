@@ -386,6 +386,13 @@ try {
     $hwnd = [PortableWin32]::GetConsoleWindow()
     if ($hwnd -ne [System.IntPtr]::Zero) { [void][PortableWin32]::ShowWindow($hwnd, 6) }  # 6 = SW_MINIMIZE
 } catch {}
+# WATCH_BANNER_V1: tell the player what this extra window is before they wonder.
+try { $Host.UI.RawUI.WindowTitle = '整合包后台预下载（可以关闭，不影响游戏）' } catch {}
+Write-Host '============================================================' -ForegroundColor DarkCyan
+Write-Host '  这是整合包后台预下载窗口：玩游戏时悄悄下载管理员新发布的更新，' -ForegroundColor DarkCyan
+Write-Host '  下次启动时就不用再等。可以直接关闭，不影响游戏；下次运行更新器会重新开启。' -ForegroundColor DarkCyan
+Write-Host '  游戏退出后它会自己结束。' -ForegroundColor DarkCyan
+Write-Host '============================================================' -ForegroundColor DarkCyan
 
 New-Item -ItemType Directory -Force $stageRoot | Out-Null
 

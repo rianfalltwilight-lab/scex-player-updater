@@ -41,8 +41,14 @@ function Stop-PreviousWatch {
     $process = if ($oldPid -gt 0) { Get-CimInstance Win32_Process -Filter ("ProcessId=$oldPid") -ErrorAction Stop }
     if ($process) {
         $line = [string]$process.CommandLine
-        $rootPattern = [regex]::Escape(([IO.Path]::GetFullPath($Root)).TrimEnd('\', '/'))
-        $sameInstance = $line -match ('(?i)(?:--instance-dir|-InstanceDir)\s+"?' + $rootPattern + '[\\/]?"?(?:\s|$)')
+        # SHORT_PATH_V1: compare normalized paths. GetFullPath expands 8.3 short names,
+        # so the watch may have been started with a different spelling of the same folder.
+        $sameInstance = $false
+        $wanted = ([IO.Path]::GetFullPath($Root)).TrimEnd('\', '/')
+        if ($line -match '(?i)(?:--instance-dir|-InstanceDir)\s+(?:"([^"]+)"|(\S+))') {
+            $given = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            try { $sameInstance = ([IO.Path]::GetFullPath($given)).TrimEnd('\', '/') -ieq $wanted } catch { $sameInstance = $false }
+        }
         if ($line -match '(?i)portable-stage-daemon\.(?:ps1|py)(?:"|\s|$)' -and $sameInstance -and $line -match '(?i)(?:--mode|-Mode)\s+"?watch(?:"|\s|$)') {
             Stop-Process -Id $oldPid -Force -ErrorAction Stop
             Wait-Process -Id $oldPid -Timeout 5 -ErrorAction SilentlyContinue
@@ -75,7 +81,8 @@ function Read-UpdateUrls {
     $relative = @(
         'UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', 'UPDATE-URL-LAN.txt'
     )
-    foreach ($base in @($Root, $ToolsRoot)) {
+    # ROOT_SLIM_V1: since 2.27.23 the URL files live in _updater; older packs keep them in the root.
+    foreach ($base in @($Root, $ToolsRoot, (Join-Path $Root '_updater'))) {
         foreach ($rel in $relative) {
             $path = Join-Path $base $rel
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }

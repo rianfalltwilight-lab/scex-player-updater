@@ -585,7 +585,7 @@ function Format-UpdateError {
         $reason = if ($http) { "更新源返回 HTTP $http" } elseif ($timeout) { '连接更新源超时' } elseif ($slow) { '下载速度持续过低' } else { '无法取得更新内容' }
         return "[${Phase}失败] $target $reason。请检查网络或稍后重试。（错误类型：$kind）"
     }
-    return "[${Phase}失败] $target 操作未完成，请将本窗口截图交给管理员。（错误类型：$kind）"
+    return "[${Phase}失败] $target 操作未完成，请把实例目录里的「更新诊断包.zip」发给管理员。（错误类型：$kind）"
 }
 
 function Test-LocalUpdateError {
@@ -682,7 +682,8 @@ function Download-ManifestFile {
     $tmp = Get-PartialDownloadPath -Destination $Destination -Sha1 $ExpectedSha1
     $identity = [IO.Path]::GetFileName($tmp).Substring(56)
     foreach ($stale in @(Get-ChildItem -LiteralPath (Split-Path -Parent $Destination) -Filter ('.portable-part-*' + $identity) -File -Force)) {
-        if ($stale.FullName -ne $tmp) { Assert-SafeAbsolutePath -Path $stale.FullName; [IO.File]::Delete($stale.FullName) }
+        # SHORT_PATH_V1: compare names; Get-ChildItem reports long names even for an 8.3 short directory path.
+        if ($stale.Name -ne [IO.Path]::GetFileName($tmp)) { Assert-SafeAbsolutePath -Path $stale.FullName; [IO.File]::Delete($stale.FullName) }
     }
     if ([IO.File]::Exists($tmp) -and (Get-Sha1 $tmp) -eq $ExpectedSha1) { Install-VerifiedFile -Temporary $tmp -Destination $Destination; return }
     $script:LastSourceFailureCounts = $true
@@ -1752,6 +1753,86 @@ function Install-StagedEntry {
     return $true
 }
 
+$script:DiagnosticName = '更新诊断包.zip'
+
+function Get-UpdateErrorCode {
+    # DIAGNOSTIC_V1: short codes the player can quote (same table as the Python updater).
+    param([string]$Message)
+    $table = @(
+        @('[文件占用]','E-LOCK'), @('[权限不足]','E-PERM'), @('[空间不足]','E-DISK'), @('[替换失败]','E-REPLACE'),
+        @('[路径错误]','E-PATH'), @('[校验失败]','E-HASH'), @('[下载失败]','E-NET'), @('[获取清单失败]','E-FETCH'),
+        @('[清单获取失败]','E-FETCH'), @('[清单错误]','E-MANIFEST'), @('[清单无效]','E-MANIFEST'), @('[状态错误]','E-STATE'),
+        @('[正在更新]','E-BUSY'), @('[预检失败]','E-PRECHECK'))
+    foreach ($row in $table) { if (([string]$Message).Contains($row[0])) { return $row[1] } }
+    return 'E-OTHER'
+}
+
+function Get-MaskedText {
+    param([string]$Text)
+    return [regex]::Replace([string]$Text, 'https?://[^\s；，。"'']+', { param($m) try { $u = [Uri]$m.Value; $u.Scheme + '://' + $u.Host + '/***' } catch { '[更新地址已隐藏]' } })
+}
+
+function Write-SyncDetail {
+    # PROGRESS_V1: per-file details go to the log; the console shows progress lines.
+    param([string]$Text)
+    if ($script:SyncLogPath) {
+        try { [IO.File]::AppendAllText($script:SyncLogPath, (Get-MaskedText $Text) + "`n", [Text.UTF8Encoding]::new($false)) } catch { }
+    } else { Write-Host $Text }
+}
+
+function Test-InteractiveSession {
+    # Only the player entry points opt in; tests and scripted runs never wait.
+    try { return ($env:PORTABLE_SYNC_INTERACTIVE -eq '1' -and -not [Console]::IsInputRedirected) } catch { return $false }
+}
+
+function Format-Duration {
+    param([double]$Seconds)
+    $s = [Math]::Max(0, [int][Math]::Round($Seconds))
+    if ($s -lt 60) { return ('{0} 秒' -f [Math]::Max(1, $s)) }
+    $m = [int][Math]::Ceiling($s / 60.0)
+    if ($m -lt 60) { return ('{0} 分钟' -f $m) }
+    return ('{0} 小时 {1} 分钟' -f [int][Math]::Floor($m / 60), ($m % 60))
+}
+
+function Write-DiagnosticPackage {
+    # Zip the masked logs and a short summary into the instance root. Never throws.
+    param([string]$Root, [string]$Code, [string]$Message)
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $target = Join-Path $Root $script:DiagnosticName
+        $temporary = $target + '.tmp'
+        if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+        $summary = [ordered]@{ errorCode = $Code; message = (Get-MaskedText $Message); engine = 'powershell'
+            powershell = $PSVersionTable.PSVersion.ToString(); os = [Environment]::OSVersion.VersionString; createdAt = (Get-Date).ToString('o') }
+        try {
+            $state = [IO.File]::ReadAllText((Join-Path $Root '.portable-sync-state.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+            $summary.packId = [string]$state.packId; $summary.syncedVersion = [string]$state.version
+            $summary.syncedAt = [string]$state.syncedAt; $summary.managedFiles = @($state.files).Count
+        } catch { $summary.syncedVersion = $null }
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew)
+        try {
+            $zip = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                $add = {
+                    param([string]$Name, [string]$Text)
+                    $entry = $zip.CreateEntry($Name)
+                    $writer = New-Object IO.StreamWriter($entry.Open(), [Text.UTF8Encoding]::new($false))
+                    try { $writer.Write($Text) } finally { $writer.Dispose() }
+                }
+                & $add 'summary.json' (($summary | ConvertTo-Json -Depth 4) + "`n")
+                foreach ($rel in @('.portable-sync-logs\latest.log', '.portable-sync-logs\previous.log', '.portable-staging\daemon.log')) {
+                    $path = Join-Path $Root $rel
+                    if ([IO.File]::Exists($path)) { & $add ($rel.Replace('\', '/')) (Get-MaskedText ([IO.File]::ReadAllText($path, [Text.Encoding]::UTF8))) }
+                }
+            } finally { $zip.Dispose() }
+        } finally { $stream.Dispose() }
+        if ([IO.File]::Exists($target)) { [IO.File]::Delete($target) }
+        [IO.File]::Move($temporary, $target)
+        return $target
+    } catch { return $null }
+}
+
 function Clear-TreeNoFollow {
     # Delete regular files and empty folders below Directory; never follow or delete
     # links or other reparse points. Returns the number of files removed.
@@ -1931,7 +2012,17 @@ $checkFiles = @($manifest.files) + @($previousRelByKey.Values | ForEach-Object {
 foreach ($deleteTarget in $forceDeleteTargets) { $checkFiles += [pscustomobject]@{path=(Normalize-Rel $deleteTarget.FullName.Substring($instanceRoot.Length).TrimStart('\','/'))} }
 $optionConfig = Get-PropertyValue $manifest 'playerOptions' $null
 if ($optionConfig) { foreach ($rel in @(Get-PropertyValue $optionConfig 'targets' @('options.txt'))) { $checkFiles += [pscustomobject]@{path=$rel} } }
-Assert-UpdateFilesAvailable -Root $instanceRoot -Files $checkFiles
+while ($true) {
+    try { Assert-UpdateFilesAvailable -Root $instanceRoot -Files $checkFiles; break }
+    catch {
+        # LOCK_WAIT_V1: a player who forgot to close the game can retry in place.
+        $lockMessage = [string]$_.Exception.Message
+        if (-not $lockMessage.StartsWith('[文件占用]') -or -not (Test-InteractiveSession)) { throw }
+        Write-Host $lockMessage -ForegroundColor Yellow
+        Write-Host '[等待] 完全退出 Minecraft（以及占用该文件的程序）后，按回车重新检查；直接关闭本窗口即可取消。'
+        if ($null -eq [Console]::ReadLine()) { throw }
+    }
+}
 if ([bool](Get-PropertyValue -Object $cleanup -Name 'removeConnectorCache' -Default $true)) { Remove-ConnectorRuntimeCache -Root $instanceRoot }
 if ([bool](Get-PropertyValue -Object $cleanup -Name 'disableLauncherRepairIndex' -Default $true)) { Disable-LauncherRepairIndex -Roots @($PSScriptRoot, $instanceRoot) }
 
@@ -2058,7 +2149,16 @@ if ($downloadJobs.Count) {
     Save-SyncJournal
     $workers = [Math]::Max(1, [Math]::Min(8, [int](Get-PropertyValue -Object $manifest -Name 'downloadWorkers' -Default 4)))
     $workers = [Math]::Min($workers, $downloadJobs.Count)
-    Write-Host ("[同步] 需要更新 {0} 个文件（并行 {1}）。" -f $downloadJobs.Count, $workers)
+    $totalBytes = [long]0
+    foreach ($job in $downloadJobs) { try { $totalBytes += [long]$job.File.size } catch { } }
+    Write-Host ("[同步] 需要更新 {0} 个文件，共 {1:N1} MB（并行 {2}）。逐个文件的明细写在 .portable-sync-logs\latest.log。" -f $downloadJobs.Count, ($totalBytes / 1MB), $workers)
+    if ($downloadJobs.Count -ge 100) {
+        Write-Host '[提示] 本机没有可用的 Python，正在使用较慢的 PowerShell 更新器。安装 Python 3（https://www.python.org/downloads/ ，安装时勾选 Add python.exe to PATH）后，下次更新会快很多。' -ForegroundColor Cyan
+    }
+    $doneFiles = 0
+    $doneBytes = [long]0
+    $progressClock = [Diagnostics.Stopwatch]::StartNew()
+    $lastProgress = 0.0
     # Native runspaces also work in Windows PowerShell 5.1; no Python install needed.
     $ast = [Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
     $defs = $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]}, $false)
@@ -2114,13 +2214,28 @@ try {
                     [void]$updatedPaths.Add($job.Rel)
                     if ($job.Force) { [void]$forcedAppliedPaths.Add($job.Rel) }
                     $label = if ($result.Source -eq 'official') { '[官方源]' } elseif ($result.Source -eq 'staged') { '[缓存]' } else { '[更新]' }
-                    Write-Host "$label $($job.Rel)"
+                    Write-SyncDetail "$label $($job.Rel)"
                 } catch {
                     if (Test-OptionalHelperFile -Rel $task.Job.Rel) {
                         Write-SyncWarning "辅助脚本未更新：$($task.Job.Rel)"
                         $preserved++
                     } elseif (-not $hardError) { $hardError = Format-UpdateError -ErrorRecord $_ -Path $task.Job.Rel }
-                } finally { $task.Shell.Dispose(); [void]$pending.Remove($task) }
+                } finally {
+                    $task.Shell.Dispose(); [void]$pending.Remove($task)
+                    # PROGRESS_V1: one summary line every few seconds and at the end.
+                    $doneFiles++
+                    try { $doneBytes += [long]$task.Job.File.size } catch { }
+                    $now = $progressClock.Elapsed.TotalSeconds
+                    if ($doneFiles -eq $downloadJobs.Count -or $now - $lastProgress -ge 3) {
+                        $lastProgress = $now
+                        $line = '[进度] {0}/{1} 个文件，{2:N1}/{3:N1} MB' -f $doneFiles, $downloadJobs.Count, ($doneBytes / 1MB), ($totalBytes / 1MB)
+                        $rate = $doneBytes / [Math]::Max($now, 0.001)
+                        if ($doneFiles -lt $downloadJobs.Count -and $rate -gt 0) {
+                            $line += '，{0:N1} MB/s，预计还需 {1}' -f ($rate / 1MB), (Format-Duration (($totalBytes - $doneBytes) / $rate))
+                        }
+                        Write-Host ($line + '。')
+                    }
+                }
             }
             [System.Threading.Monitor]::Enter($script:OfficialBreaker.SyncRoot)
             try { $breakerKeys = @($script:OfficialBreaker.Keys) } finally { [System.Threading.Monitor]::Exit($script:OfficialBreaker.SyncRoot) }
@@ -2231,6 +2346,8 @@ try {
     $clearedStage = Clear-StageCache -Root $instanceRoot
     if ($clearedStage -gt 0) { Write-Host "[清理] 已清理预下载缓存 $clearedStage 个文件。" }
 } catch { Write-Host '[清理] 预下载缓存未能清理，不影响本次更新。' }
+$staleDiagnostic = Join-Path $instanceRoot $script:DiagnosticName
+if ([IO.File]::Exists($staleDiagnostic)) { try { [IO.File]::Delete($staleDiagnostic) } catch { } }
 $configApplied = @(@($updatedPaths) + @($adoptedPaths) | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })
 $forcedAppliedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($rel in $forcedAppliedPaths) { [void]$forcedAppliedSet.Add($rel) }
@@ -2259,7 +2376,13 @@ if (-not $NoPause) {
 }
 
 } catch {
-    Write-Host (Format-UpdateError -ErrorRecord $_) -ForegroundColor Red
+    $failure = Format-UpdateError -ErrorRecord $_
+    Write-Host $failure -ForegroundColor Red
+    $failureCode = Get-UpdateErrorCode $failure
+    Write-Host "[错误编号] $failureCode"
+    if ($failureCode -ne 'E-BUSY' -and $instanceRoot -and (Write-DiagnosticPackage -Root $instanceRoot -Code $failureCode -Message $failure)) {
+        Write-Host "[诊断] 已生成「$($script:DiagnosticName)」（在实例目录里），请把这个文件发给管理员，不需要截图。"
+    }
     Write-Host '[同步] 更新未完成，请处理上述问题后重新运行；成功前不要启动游戏。' -ForegroundColor Yellow
     if (-not $NoPause) { Write-Host '按回车关闭。'; [void][Console]::ReadLine() }
     exit 1

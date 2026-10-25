@@ -18,7 +18,8 @@ function Test-Client([string]$Path) {
     return ((Test-Path -LiteralPath (Join-Path $Path '_updater\Windows-sync.bat') -PathType Leaf) -and
         (Test-Path -LiteralPath (Join-Path $Path '_updater\player-update-generic.ps1') -PathType Leaf) -and
         ((Test-Path -LiteralPath (Join-Path $Path 'UPDATE-URL.txt') -PathType Leaf) -or
-         (Test-Path -LiteralPath (Join-Path $Path 'PORTABLE-UPDATE-URL.txt') -PathType Leaf)))
+         (Test-Path -LiteralPath (Join-Path $Path 'PORTABLE-UPDATE-URL.txt') -PathType Leaf) -or
+         (Test-Path -LiteralPath (Join-Path $Path '_updater\UPDATE-URL.txt') -PathType Leaf)))
 }
 $base = Split-Path -Parent $env:PORTABLE_ENTRY_FILE
 $candidates = New-Object 'System.Collections.Generic.List[string]'
@@ -53,7 +54,7 @@ if ($env:PORTABLE_INSTANCE_DIR) {
     }
 }
 if ($candidates.Count -eq 0) {
-    throw 'No update-enabled client found. Put this BAT beside the launcher or inside the instance. Keep _updater and UPDATE-URL.txt inside that instance. For a custom layout, set PORTABLE_INSTANCE_DIR.'
+    throw 'No update-enabled client found. Put this BAT beside the launcher or inside the instance. Keep _updater and its UPDATE-URL.txt inside that instance. For a custom layout, set PORTABLE_INSTANCE_DIR.'
 }
 if ($env:PORTABLE_ENTRY_DETECT_ONLY -eq '1') {
     ConvertTo-Json -InputObject @($candidates.ToArray()) -Compress

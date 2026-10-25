@@ -42,11 +42,14 @@ def hold_read_lock(path):
         close(handle)
 
 
+DIAGNOSTIC_NAME = '更新诊断包.zip'
+
+
 def snapshot(root):
     return {p.relative_to(root).as_posix(): p.read_bytes()
             for p in root.rglob('*') if p.is_file()
             and p.relative_to(root).parts[0] not in
-            ('.portable-sync.lock', '.portable-sync-logs')}
+            ('.portable-sync.lock', '.portable-sync-logs', DIAGNOSTIC_NAME)}
 
 
 @unittest.skipUnless(PS and os.name == 'nt', 'Requires Windows PowerShell')
@@ -116,6 +119,8 @@ class PowerShellFilePreflightTests(unittest.TestCase):
                         self.assertTrue(requests)
                         self.assertEqual(set(requests), {'/server-manifest.json'})
                         self.assertFalse((client / '.portable-sync-backups').exists())
+                        self.assertIn('E-LOCK', output)
+                        self.assertTrue((client / DIAGNOSTIC_NAME).is_file())
                     requests.clear()
                 try:
                     code, output = self.run_updater(client, port)
@@ -125,6 +130,7 @@ class PowerShellFilePreflightTests(unittest.TestCase):
                     state = json.loads((client / '.portable-sync-state.json').read_text('utf-8-sig'))
                     self.assertEqual(state['version'], '2.0')
                     self.assertFalse((client / cache).exists())
+                    self.assertFalse((client / DIAGNOSTIC_NAME).exists())
                     self.assertTrue(any(path != '/server-manifest.json' for path in requests))
                     if delete_old:
                         self.assertFalse(locked_path.exists())

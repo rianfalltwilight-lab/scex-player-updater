@@ -54,6 +54,7 @@ _OFFICIAL_FAILURES = {}
 _OFFICIAL_TRIPPED = set()
 # Directories already proven link-free during this run (see join_safe).
 _LINK_SAFE_DIRS = set()
+_CANONICAL_BASES = {}
 
 
 def fetch_bytes(url: str, timeout: float = 20) -> bytes:
@@ -131,19 +132,51 @@ def _is_link_or_reparse(path: pathlib.Path) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
+_NAME_SURROGATE_TAGS = (0xA000000C, 0xA0000003)  # IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT
+
+
+def _is_name_surrogate(path: pathlib.Path) -> bool:
+    """A symlink or junction; cloud placeholders and other data reparse points are not."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) in _NAME_SURROGATE_TAGS
+
+
+def _canonical_base(base: pathlib.Path):
+    """SHORT_PATH_V1: the resolved form of base, or None if a link is on the way.
+    A resolved path can also differ because of 8.3 short names (C:\\Users\\RUNNER~1)
+    or letter case; those are the same directory, not a link."""
+    resolved = base.resolve()
+    if os.path.normcase(str(resolved)) == os.path.normcase(str(base)):
+        return base
+    probe = base
+    while True:
+        if _is_name_surrogate(probe):
+            return None
+        if probe.parent == probe:
+            return resolved
+        probe = probe.parent
+
+
 def join_safe(root: pathlib.Path, rel: str) -> pathlib.Path:
     base = root.absolute()
-    target = base.joinpath(*safe_rel(rel).split("/"))
     # Do not follow a junction/symlink in any parent, even when the final file
     # itself has ordinary attributes. Root has already been resolved by main.
     # PATH_CACHE_V1: a manifest has thousands of files but few directories, so
     # each existing directory is resolved once per run instead of once per file.
     base_key = os.path.normcase(str(base))
-    if base_key not in _LINK_SAFE_DIRS:
-        if os.path.normcase(str(base.resolve())) != base_key:
+    canonical = _CANONICAL_BASES.get(base_key)
+    if canonical is None:
+        canonical = _canonical_base(base)
+        if canonical is None:
             raise LocalFileUpdateError(f"[路径错误] 更新目录经过链接，已停止写入：{root}")
         if base.is_dir():
-            _LINK_SAFE_DIRS.add(base_key)
+            _CANONICAL_BASES[base_key] = canonical
+            _LINK_SAFE_DIRS.add(os.path.normcase(str(canonical)))
+    base = canonical
+    target = base.joinpath(*safe_rel(rel).split("/"))
     parent = target.parent
     parent_key = os.path.normcase(str(parent))
     if parent_key not in _LINK_SAFE_DIRS:
@@ -292,6 +325,7 @@ def reset_download_policy():
         _OFFICIAL_FAILURES.clear()
         _OFFICIAL_TRIPPED.clear()
     _LINK_SAFE_DIRS.clear()
+    _CANONICAL_BASES.clear()
 
 
 def normalize_proxy_url(raw: str) -> str:
@@ -475,6 +509,13 @@ def current_file_state(path: pathlib.Path, expected: str, manifest_size, previou
 def looks_like_current_file(path: pathlib.Path, expected: str, manifest_size, previous_hash: str, verified=None) -> bool:
     """Skip SHA1 when last completed sync already proved this exact file."""
     return current_file_state(path, expected, manifest_size, previous_hash, verified)[0]
+
+
+def entry_size(item) -> int:
+    try:
+        return max(0, int((item or {}).get("size") or 0))
+    except (TypeError, ValueError, AttributeError):
+        return 0
 
 
 def home_timeout_sec(size=0) -> int:
@@ -1764,7 +1805,20 @@ def sync_instance(root, args) -> int:
     planned_cleanup = cleanup_candidates(root, force_delete_globs)
     extra_targets = [{"path": p.relative_to(root).as_posix()} for p in planned_cleanup]
     extra_targets.extend({"path": str(rel)} for rel in ((manifest.get("playerOptions") or {}).get("targets") or ["options.txt"]))
-    preflight_managed_files(root, list(files) + previous_files + extra_targets)
+    while True:
+        try:
+            preflight_managed_files(root, list(files) + previous_files + extra_targets)
+            break
+        except LocalFileUpdateError as exc:
+            # LOCK_WAIT_V1: a player who forgot to close the game can retry in place.
+            if not str(exc).startswith("[文件占用]") or not interactive_session():
+                raise
+            print(str(exc))
+            print("[等待] 完全退出 Minecraft（以及占用该文件的程序）后，按回车重新检查；直接关闭本窗口即可取消。")
+            try:
+                input()
+            except EOFError:
+                raise exc from None
 
     if cleanup.get("removeConnectorCache", True):
         remove_connector_cache(root)
@@ -1889,7 +1943,8 @@ def sync_instance(root, args) -> int:
             else:
                 source = download_manifest_entry(item, base_url, target, expected, rel)
             ensure_executable_if_needed(target, rel)
-            sync_print(f"[预下载缓存] {rel}" if source == "cache" else (f"[官方源] {rel}" if source == "official" else f"[更新] {rel}"))
+            detail_print(f"[预下载缓存] {rel}" if source == "cache" else (f"[官方源] {rel}" if source == "official" else f"[更新] {rel}"))
+            progress.file_done(entry_size(item))
             return key, rel, force_sync, file_verify_record(target, expected), None
         except Exception as exc:
             if is_optional_helper(rel):
@@ -1908,7 +1963,9 @@ def sync_instance(root, args) -> int:
         except OSError as exc:
             raise local_file_error(exc, _ACTIVE_JOURNAL.path, "保存恢复记录") from None
         workers = max(1, min(8, int(manifest.get("downloadWorkers", _DOWNLOAD_WORKERS)), len(download_jobs)))
-        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {workers}）。")
+        progress = DownloadProgress([entry_size(job[0]) for job in download_jobs])
+        print(f"[同步] 需要更新 {len(download_jobs)} 个文件，共 {megabytes(progress.total_bytes)} MB（并行 {workers}）。"
+              "逐个文件的明细写在 .portable-sync-logs/latest.log。")
         if workers == 1:
             results = [run_download_job(job) for job in download_jobs]
         else:
@@ -2156,18 +2213,35 @@ def instance_lock(root):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def mask_urls(text) -> str:
+    """Logs and diagnostics keep endpoint hosts only, never access-token paths or queries."""
+    def hide(match):
+        try:
+            parsed = urllib.parse.urlsplit(match.group(0))
+            return parsed.scheme + "://" + (parsed.hostname or "更新源") + "/***"
+        except ValueError:
+            return "[更新地址已隐藏]"
+    return re.sub(r"https?://[^\s；，。\"']+", hide, str(text))
+
+
+# Set by sync_log: writes a line to the log file only (per-file download details).
+_LOG_ONLY = None
+
+
+def detail_print(message: str) -> None:
+    """PROGRESS_V1: per-file details go to the log; the console shows progress lines."""
+    sink = _LOG_ONLY
+    if sink is None:
+        sync_print(message)
+    else:
+        sink(message + "\n")
+
+
 class LogTee:
     def __init__(self, stream, log, mutex):
         self.stream, self.log, self.mutex = stream, log, mutex
     def write(self, text):
-        # Logs retain endpoint hosts only, never access-token paths or queries.
-        def hide(match):
-            try:
-                parsed = urllib.parse.urlsplit(match.group(0))
-                return parsed.scheme + "://" + (parsed.hostname or "更新源") + "/***"
-            except ValueError:
-                return "[更新地址已隐藏]"
-        clean = re.sub(r"https?://[^\s；，。]+", hide, str(text))
+        clean = mask_urls(text)
         with self.mutex:
             self.stream.write(text)
             self.log.write(clean)
@@ -2182,12 +2256,26 @@ class LogTee:
 
 @contextlib.contextmanager
 def sync_log(root):
+    global _LOG_ONLY
     path = join_safe(root, ".portable-sync-logs/latest.log")
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous = join_safe(root, ".portable-sync-logs/previous.log")
+    if path.is_file():
+        # Keep the last run's log, so a failed run's log survives one re-run.
+        shutil.copyfile(path, previous)
     with path.open("w", encoding="utf-8", newline="\n") as log:
         lock = threading.Lock()
-        with contextlib.redirect_stdout(LogTee(sys.stdout, log, lock)), contextlib.redirect_stderr(LogTee(sys.stderr, log, lock)):
-            yield
+
+        def log_only(text):
+            with lock:
+                log.write(mask_urls(text))
+                log.flush()
+        _LOG_ONLY = log_only
+        try:
+            with contextlib.redirect_stdout(LogTee(sys.stdout, log, lock)), contextlib.redirect_stderr(LogTee(sys.stderr, log, lock)):
+                yield
+        finally:
+            _LOG_ONLY = None
 
 
 class RecoveryJournal:
@@ -2359,7 +2447,122 @@ def clear_stage_cache(root: pathlib.Path) -> int:
     return removed
 
 
+DIAGNOSTIC_NAME = "更新诊断包.zip"
+# DIAGNOSTIC_V1: short codes the player can quote; the first matching tag wins.
+_ERROR_CODES = (("[文件占用]", "E-LOCK"), ("[权限不足]", "E-PERM"), ("[空间不足]", "E-DISK"),
+                ("[替换失败]", "E-REPLACE"), ("[路径错误]", "E-PATH"), ("[校验失败]", "E-HASH"),
+                ("[下载失败]", "E-NET"), ("[清单获取失败]", "E-FETCH"), ("[清单无效]", "E-MANIFEST"),
+                ("[状态损坏]", "E-STATE"), ("[恢复记录损坏]", "E-STATE"), ("[更新器已运行]", "E-BUSY"),
+                ("[预检失败]", "E-PRECHECK"))
+
+
+def error_code(message: str) -> str:
+    text = str(message)
+    for tag, code in _ERROR_CODES:
+        if tag in text:
+            return code
+    return "E-OTHER"
+
+
+def write_diagnostic_package(root: pathlib.Path, code: str, message: str):
+    """Zip the masked logs and a short summary into the instance root for the
+    player to send to the admin. Never raises; returns the path or None."""
+    try:
+        import platform
+        target = join_safe(root, DIAGNOSTIC_NAME)
+        temporary = target.with_name(target.name + ".tmp")
+        summary = {"errorCode": code, "message": mask_urls(message), "engine": "python",
+                   "python": sys.version.split()[0], "platform": platform.platform(),
+                   "createdAt": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+        try:
+            state = read_state_file(join_safe(root, ".portable-sync-state.json"))
+            summary.update(packId=state.get("packId"), syncedVersion=state.get("version"),
+                           syncedAt=state.get("syncedAt"), managedFiles=len(state.get("files") or []))
+        except Exception:
+            summary["syncedVersion"] = None
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("summary.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+            for rel in (".portable-sync-logs/latest.log", ".portable-sync-logs/previous.log", ".portable-staging/daemon.log"):
+                path = root.joinpath(*rel.split("/"))
+                if path.is_file():
+                    archive.writestr(rel, mask_urls(path.read_text(encoding="utf-8", errors="replace")[-2_000_000:]))
+        os.replace(temporary, target)
+        return target
+    except Exception:
+        return None
+
+
+def interactive_session() -> bool:
+    """Only the player entry points opt in; tests and scripted runs never wait."""
+    try:
+        if os.environ.get("PORTABLE_SYNC_INTERACTIVE") != "1" or sys.stdin is None or not sys.stdin.isatty():
+            return False
+        if os.name != "nt":
+            return True
+        # Windows reports the NUL device as a tty; only a real console can answer.
+        import ctypes
+        import msvcrt
+        mode = ctypes.c_uint32()
+        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        return bool(ctypes.windll.kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)))
+    except (AttributeError, ValueError, OSError, ImportError):
+        return False
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds + 0.5))
+    if seconds < 60:
+        return f"{max(1, seconds)} 秒"
+    minutes = (seconds + 59) // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    return f"{minutes // 60} 小时 {minutes % 60} 分钟"
+
+
+def megabytes(value: float) -> str:
+    return f"{value / 1048576:.1f}"
+
+
+class DownloadProgress:
+    """PROGRESS_V1: one summary line every few seconds instead of one line per file."""
+
+    def __init__(self, sizes, interval: float = 3.0):
+        self.total_files = len(sizes)
+        self.total_bytes = sum(sizes)
+        self.done_files = 0
+        self.done_bytes = 0
+        self.interval = interval
+        self.started = time.monotonic()
+        self.last = self.started
+        self.lock = threading.Lock()
+
+    def file_done(self, size: int) -> None:
+        with self.lock:
+            self.done_files += 1
+            self.done_bytes += size
+            now = time.monotonic()
+            if self.done_files < self.total_files and now - self.last < self.interval:
+                return
+            self.last = now
+            line = self.render(now)
+        sync_print(line)
+
+    def render(self, now: float) -> str:
+        text = f"[进度] {self.done_files}/{self.total_files} 个文件，{megabytes(self.done_bytes)}/{megabytes(self.total_bytes)} MB"
+        elapsed = max(now - self.started, 0.001)
+        rate = self.done_bytes / elapsed
+        if self.done_files < self.total_files and rate > 0:
+            text += f"，{megabytes(rate)} MB/s，预计还需 {format_duration((self.total_bytes - self.done_bytes) / rate)}"
+        return text + "。"
+
+
 def tidy_after_sync(root: pathlib.Path, backup_root: pathlib.Path) -> None:
+    try:
+        stale = join_safe(root, DIAGNOSTIC_NAME)
+        if stale.is_file():
+            stale.unlink()  # an old failure package would only confuse the player now
+    except (OSError, UpdateError):
+        pass
     try:
         pruned = prune_old_backups(root, backup_root)
         if pruned:
@@ -2417,8 +2620,9 @@ def main() -> int:
             try:
                 return sync_instance(root, args)
             except SystemExit as exc:
-                if exc.code:
+                if exc.code and not isinstance(exc.code, int):
                     print(str(exc), file=sys.stderr)
+                    report_failure(root, str(exc))
                 raise
             except Exception as exc:
                 if isinstance(exc, UpdateError):
@@ -2428,10 +2632,19 @@ def main() -> int:
                 else:
                     message = f"[更新失败] 更新未完成，请联系管理员（{type(exc).__name__}）。"
                 print(message, file=sys.stderr)
-                print("[日志] 错误已保存到 .portable-sync-logs/latest.log。", file=sys.stderr)
+                report_failure(root, message)
                 raise UpdateError(message) from None
             finally:
                 _ACTIVE_JOURNAL = None
+
+
+def report_failure(root, message):
+    code = error_code(message)
+    print(f"[错误编号] {code}", file=sys.stderr)
+    package = write_diagnostic_package(root, code, message)
+    if package is not None:
+        print(f"[诊断] 已生成「{DIAGNOSTIC_NAME}」（在实例目录里），请把这个文件发给管理员，不需要截图。", file=sys.stderr)
+    print("[日志] 错误已保存到 .portable-sync-logs/latest.log。", file=sys.stderr)
 
 
 if __name__ == "__main__":
