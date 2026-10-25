@@ -164,6 +164,9 @@ class Release:
             server.append(rel)
             public.update(PUBLIC + p for p in mapping.get(rel, []))
         public.update(PUBLIC + p for p in ("server-manifest.json", "update-log.txt", "使用说明.txt"))
+        # e2e runs the previous root entries and helpers, so back up every published copy
+        # even when this release leaves it unchanged.
+        public.update(PUBLIC + p for paths in mapping.values() for p in paths)
         public.update(PUBLIC + p for p in self.spec.get("removeRows", []))
         removed = set(self.spec.get("removeFiles", []))
         return sorted((set(server) | {"tools/portable-pack.json"} | {r for r in removed if not r.startswith(PUBLIC)})), sorted(public | {r for r in removed if r.startswith(PUBLIC)})
