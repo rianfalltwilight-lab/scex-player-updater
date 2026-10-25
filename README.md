@@ -8,20 +8,22 @@
 
 ## 功能
 
-- 按清单 SHA-1 校验并增量下载；旧文件覆盖或移除时保留本地备份。
+- 按清单 SHA-1 校验并增量下载；先校验临时文件，再在同一文件系统原子替换，旧文件覆盖或移除时保留本地备份。
+- Windows PowerShell / Python 默认并行下载 4 个文件，清单可设置 1–8；官方源先直连，受阻后尝试已有代理，再回退更新服务，单个文件失败不会停用其他官方源。
 - Python 同步器与 Windows PowerShell 同步器，Windows / Linux / macOS 启动入口。
 - 通用服主入口自动识别 Windows/Linux、可用 Python、指定环境变量和常见客户端布局，缺项/多实例明确提示。
 - 玩家更新 BAT 可单独复制到启动器旁，自动查找已有更新器的实例；多实例由玩家选择。
 - 游戏期间可后台预下载到 `.portable-staging`，下一次启动前应用并重新核对。
-- 更新器自刷新、Windows 入口修复、客户端自助检查及按需修复。
+- 更新器自刷新、Windows 入口修复、客户端自助检查及按需修复；NeoForge 实例可补齐已安装的 client-extra 资源库引用，保留自定义启动参数并备份原版本配置。
 - 可配置保留玩家额外文件、本地配置改动与主动删除；也可显式指定强制同步、强制删除。
-- 发布器生成清单和更新摘要，复用相同内容的文件；可查询 Modrinth 官方下载源，并回退到自建源。
-- 下载服务只接受 GET / HEAD，通过随机 URL 路径限制访问，可配置 TLS；默认监听本机。
+- 发布器生成清单和更新摘要，复用相同内容的文件；按文件 SHA-1 查询并缓存 Modrinth 官方源，可选接入 CurseForge 元数据。
+- S3 支持增量上传、公开回读校验，以及分开执行预上传、只读核对和最终版本切换；候选内容或玩家保护策略发生变化时拒绝激活旧候选。
+- 下载服务只接受 GET / HEAD，通过随机 URL 路径限制访问，可配置 TLS；限制大文件并发缓冲并支持 PID 记录，默认监听本机。
 
 ## 管理员快速开始
 
 对象存储分发：支持 S3 内容寻址增量上传、公开回读校验和清单最后切换，
-同时保留现有玩家文件保护。配置与旧玩家迁移见 [云端发布](docs/CLOUD-PUBLISH.md)。
+可先上传候选并校验，确认后再切换玩家版本。配置与旧玩家迁移见 [云端发布](docs/CLOUD-PUBLISH.md)。
 
 **Windows/Linux 通用入口（推荐新部署）**：只需 Python 3.10+，支持检测、初始化、发布和启动下载服务。Linux 无须 PowerShell。完整环境变量、目录识别、可移动 BAT 和回滚说明见 [通用部署指南](docs/PORTABLE-SETUP.md)。
 
@@ -88,6 +90,16 @@ python3 _updater/player-update-generic.py --instance-dir .
 - 常规同步会按上次清单管理的文件处理旧版本；额外模组不因“未出现在新清单”被全目录删除。`additiveDirs` 还可保留资源包、光影等目录的内容。
 - SHA-1 用于文件一致性检查，清单未做数字签名；请只向玩家提供自己可信的更新源。
 - macOS 启动器交互、实际游戏运行期间的后台预下载及公网 TLS/代理环境尚未在本次独立提取中实机验收。详见 [验证记录](docs/VALIDATION.md)。
+
+## 下载源与并发配置
+
+在 `tools/portable-pack.json` 设置 `downloadWorkers`（默认 `4`，有效范围 `1–8`），两种发布器都会写入玩家清单。`updaterRevision` 用于标记更新器脚本版本。
+
+PowerShell 发布器有可用 Python 时调用 `official-source-index.py`，按精确 SHA-1 查询 Modrinth，并缓存已匹配来源；无 Python 时沿用原 Modrinth 查询。可在 `update.pythonExe` 指定解释器，设置 `officialSources.enabled=false` 则不做元数据查询。通用 Python 发布器仍只使用自建源。
+
+可选的 CurseForge 元数据查询从发布进程的 `CURSEFORGE_API_KEY` 或 `officialSources.curseforgeKeyFile` 读取密钥。指纹只用于找候选，SHA-1 一致才会接受；客户端清单不含密钥。元数据匹配不保证 CDN 对玩家开放，下载仍须校验并回退，实际 CDN 鉴权需按自己的服务配置验证。
+
+地址文件可写多行公共清单 URL；自刷新可在公共入口失败后尝试明确配置的 LAN 地址。云端镜像由 `mirrorManifestUrls` 配置，详见 [云端发布](docs/CLOUD-PUBLISH.md)。客户端不会修改系统代理、路由或防火墙；开启 TUN 时，应用直连不等于流量绕过 TUN。
 
 ## 来源与许可
 

@@ -18,10 +18,20 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } c
 
 function Normalize-Rel([string]$Rel) { return ([string]$Rel).Replace('\', '/').TrimStart('/') }
 function Normalize-RelKey([string]$Rel) { return (Normalize-Rel $Rel).ToLowerInvariant() }
-function Get-Sha1([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash.ToLowerInvariant()
+function Get-Sha1 {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
+    $hash = [System.Security.Cryptography.SHA1]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        return ([System.BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $hash.Dispose()
+    }
 }
+
 function Test-RelativePathSafe([string]$Rel) {
     $n = Normalize-Rel $Rel
     if ([string]::IsNullOrWhiteSpace($n)) { return $false }
@@ -226,26 +236,36 @@ $checked = 0
 $errors = New-Object System.Collections.Generic.List[string]
 $warnings = New-Object System.Collections.Generic.List[string]
 $fixed = New-Object System.Collections.Generic.List[string]
-$manifestUrl = $ManifestUrl
+$manifestUrl = ''
+$manifestUrls = New-Object 'System.Collections.Generic.List[string]'
 $packVersion = ''
 $serverReachable = $false
 
-# UPDATE-URL
-if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
+# UPDATE-URL：支持多行候选地址，按顺序尝试；局域网用户可在公网地址失败后回落到 LAN。
+$rawUrlValues = New-Object 'System.Collections.Generic.List[string]'
+if (-not [string]::IsNullOrWhiteSpace($ManifestUrl)) { [void]$rawUrlValues.Add($ManifestUrl) }
+else {
     foreach ($rel in @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', '_updater\UPDATE-URL.txt')) {
-        $p = Join-Path $instanceRoot $rel
-        if (Test-Path -LiteralPath $p -PathType Leaf) {
-            $v = (Get-Content -LiteralPath $p -Raw -Encoding UTF8).Trim()
-            if ($v) { $manifestUrl = $v; break }
+        $urlPath = Join-Path $instanceRoot $rel
+        if (Test-Path -LiteralPath $urlPath -PathType Leaf) {
+            try { [void]$rawUrlValues.Add((Get-Content -LiteralPath $urlPath -Raw -Encoding UTF8)) } catch { }
         }
     }
 }
-if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
-    # 本地清单兜底
+$seenManifestUrls = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($rawUrls in $rawUrlValues) {
+    foreach ($line in ([string]$rawUrls -split "`r?`n")) {
+        $candidate = ([string]$line).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $candidate.StartsWith('#') -and $seenManifestUrls.Add($candidate)) { [void]$manifestUrls.Add($candidate) }
+    }
+}
+
+# 本地清单兜底
+if ($manifestUrls.Count -eq 0) {
     $localMan = Join-Path $instanceRoot 'server-manifest.json'
     if (Test-Path $localMan) {
         $warnings.Add('未找到 UPDATE-URL.txt，改用本地 server-manifest.json（可能不是最新）') | Out-Null
-        $manifestUrl = 'file:///' + ($localMan -replace '\\', '/')
+        [void]$manifestUrls.Add('file:///' + ($localMan -replace '\\', '/'))
     } else {
         $errors.Add('找不到 UPDATE-URL.txt 与本地清单。请确认玩家包完整，或用 -ManifestUrl 指定。') | Out-Null
     }
@@ -253,20 +273,28 @@ if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
 
 $manifest = $null
 $fileBaseUrl = ''
-if ($manifestUrl -and $errors.Count -eq 0) {
+$manifestErrors = New-Object 'System.Collections.Generic.List[string]'
+foreach ($candidateUrl in @($manifestUrls)) {
+    if ($manifest -or $errors.Count -gt 0) { break }
     try {
-        if ($manifestUrl -like 'file:///*') {
-            $path = $manifestUrl -replace '^file:///', '' -replace '/', [IO.Path]::DirectorySeparatorChar
+        if ($candidateUrl -like 'file:///*') {
+            $path = $candidateUrl -replace '^file:///', '' -replace '/', [IO.Path]::DirectorySeparatorChar
             $raw = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
-            $fileBaseUrl = ''
+            $candidateBaseUrl = ''
+            $candidateReachable = $false
         } else {
-            $raw = Read-UrlText $manifestUrl
-            $slash = $manifestUrl.LastIndexOf('/')
-            $fileBaseUrl = if ($slash -gt 0) { $manifestUrl.Substring(0, $slash + 1) } else { '' }
-            $serverReachable = $true
+            $raw = Read-UrlText $candidateUrl
+            $slash = $candidateUrl.LastIndexOf('/')
+            $candidateBaseUrl = if ($slash -gt 0) { $candidateUrl.Substring(0, $slash + 1) } else { '' }
+            $candidateReachable = $true
         }
         $raw = Strip-JsonComments $raw
-        $manifest = $raw | ConvertFrom-Json
+        $candidateManifest = $raw | ConvertFrom-Json
+        if ($null -eq $candidateManifest -or $null -eq $candidateManifest.files) { throw 'manifest 缺少 files。' }
+        $manifest = $candidateManifest
+        $manifestUrl = $candidateUrl
+        $fileBaseUrl = $candidateBaseUrl
+        $serverReachable = $candidateReachable
         if ($manifest.version) { $packVersion = [string]$manifest.version }
         if ($manifest.PSObject.Properties['updateUrl'] -and $manifest.updateUrl -and -not $fileBaseUrl) {
             $u = [string]$manifest.updateUrl
@@ -274,8 +302,12 @@ if ($manifestUrl -and $errors.Count -eq 0) {
             if ($slash -gt 0) { $fileBaseUrl = $u.Substring(0, $slash + 1) }
         }
     } catch {
-        $errors.Add('拉取/解析清单失败: ' + $_.Exception.Message) | Out-Null
+        [void]$manifestErrors.Add(($candidateUrl + ' -> ' + $_.Exception.Message))
     }
+}
+if (-not $manifest -and $errors.Count -eq 0) {
+    $errors.Add('拉取/解析清单失败：已尝试 ' + $manifestUrls.Count + ' 个更新地址。' + (($manifestErrors -join '；'))) | Out-Null
+    if ($manifestUrls.Count -gt 0) { $manifestUrl = [string]$manifestUrls[0] }
 }
 
 # Java：需求随清单里的 Minecraft 版本变化，不把某个私服版本写死在公版逻辑里。

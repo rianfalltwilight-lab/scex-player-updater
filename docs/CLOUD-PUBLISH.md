@@ -47,6 +47,29 @@ python tools/cloud_publish.py --source /path/to/prepared/portable --config tools
 失败不输出 SDK 原始异常，以免签名 URL 或凭据出现在日志中。
 若在最后一步回读失败，清单可能已经生效，应先查远端真实状态再重试。
 
+## 先上传候选，再切换版本
+
+把大文件上传与版本切换分开执行，可在发布窗口前完成上传和完整回读。下面三个命令使用同一份已准备目录、配置和候选回执：
+
+```sh
+# 上传不可变文件和清单快照；稳定清单、自刷新入口和旧更新源不变。
+python tools/cloud_publish.py --source /path/to/prepared/portable --config tools/cloud.local.json --apply --stage-only --receipt /path/to/private/staged.json
+
+# 只读核对候选、存储目标、对象身份及当前在线清单。
+python tools/cloud_publish.py --source /path/to/prepared/portable --config tools/cloud.local.json --check-staged /path/to/private/staged.json
+
+# 核对通过后更新自刷新文件，最后有条件地切换稳定清单。
+python tools/cloud_publish.py --source /path/to/prepared/portable --config tools/cloud.local.json --apply --activate-staged /path/to/private/staged.json --receipt /path/to/private/activated.json
+```
+
+候选回执绑定文件内容、版本、下载目录与玩家保护策略。文件对象被改动或删除、在线清单被其他发布者切换、候选策略变化，都会中止激活。生成时间和单文件下载提示可刷新；最终清单仍重新保存并回读。普通 `--apply` 继续一次完成上传与激活。
+
+已有离线发布计划时，可给 `--stage-only` 或 `--check-staged` 增加 `--release-plan /path/to/plan`。目录须含 `release-plan.json` 和 `manifest.proposed.json`：前者记录基线根目录/清单 SHA-256、目标版本、移除文件及 SHA-256、候选路径/来源/SHA-256/大小；后者列出替换后的完整清单。工具核对基线与每个差异，在内存中覆盖候选，不复制整包也不写基线。最终激活必须使用已准备完成的实际目录，不能直接激活离线计划。此仓库不提供生产运维计划生成器。
+
+Windows 包装脚本对应参数为 `-StageOnly -ReceiptPath ...`、`-CheckStaged ...`、`-ActivateStaged ...`，离线计划用 `-ReleasePlanDirectory ...`。候选回执应保存在私有位置，并保留到完成切换或决定放弃候选。
+
+`cloud.local.json` 可额外设置 `mirrorManifestUrls` 数组，最多写入三个不同的 HTTP(S) 清单地址。生成的地址文件先写主入口，再写镜像；镜像应提供同一版本、内容和玩家保护策略。整合包身份、版本或文件清单不一致的镜像不会用来拼接一次更新；玩家保护策略始终取主清单。
+
 ## 迁移旧玩家
 
 云端清单含新下载字段，旧引擎不能直接处理。必须先通过原更新源的
@@ -82,6 +105,6 @@ Cache-Control、稳定入口覆盖、首次同步与第二次增量同步。
 python -m unittest discover -s tests -v
 ```
 
-`test_cloud_publish.py` 使用内存对象存储模拟故障与竞争，并以真实本地 HTTP
+`test_cloud_publish.py` 和 `test_cloud_staging.py` 使用内存对象存储模拟故障、竞争、分阶段激活与候选变化，并以真实本地 HTTP
 测试 Windows/Python 玩家同步、中文路径、资源包和个人文件保护。
 本地通过不代表七彩云实测通过。

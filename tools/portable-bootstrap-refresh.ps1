@@ -172,6 +172,8 @@ $candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($urls) }
 if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in $candidates) { & $addUrl $u }
 if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
+# Explicit LAN addresses remain fallback candidates when public access fails.
+foreach ($u in @($urls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
 $urls = @($ordered)
 $selected = ''
 $selectedIndex = -1

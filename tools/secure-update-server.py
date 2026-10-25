@@ -1,18 +1,48 @@
 #!/usr/bin/env python3
 import argparse
+import atexit
 import functools
 import os
 import posixpath
 import socket
 import ssl
 import sys
+import threading
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 
+def install_pid_file(path):
+    """Record the serving process and remove the record on normal exit."""
+    if not path:
+        return
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pid = str(os.getpid())
+    with open(path, "w", encoding="ascii", newline="\n") as handle:
+        handle.write(pid + "\n")
+
+    def cleanup():
+        try:
+            with open(path, "r", encoding="ascii") as handle:
+                if handle.read().strip() != pid:
+                    return
+            os.remove(path)
+        except (FileNotFoundError, OSError):
+            pass
+
+    atexit.register(cleanup)
+
+
 class SecureUpdateHandler(SimpleHTTPRequestHandler):
     server_version = "SCEXPlayerUpdateServer/1.0"
+    _buffer_gate = threading.BoundedSemaphore(1)
+    _SOCKET_TIMEOUT = 30
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(self._SOCKET_TIMEOUT)
 
     def __init__(self, *args, token="", **kwargs):
         self.token = token.strip("/")
@@ -77,11 +107,14 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
                 size = os.fstat(f.fileno()).st_size
             except (OSError, AttributeError, ValueError):
                 size = None
-            if size is not None and size <= self._BUFFER_CAP:
-                data = f.read()
-                f.close()
-                f = None
-                self.wfile.write(data)
+            if size is not None and size <= self._BUFFER_CAP and self._buffer_gate.acquire(blocking=False):
+                try:
+                    data = f.read()
+                    f.close()
+                    f = None
+                    self.wfile.write(data)
+                finally:
+                    self._buffer_gate.release()
             else:
                 self.copyfile(f, self.wfile)
         finally:
@@ -97,6 +130,9 @@ class SecureUpdateHandler(SimpleHTTPRequestHandler):
         return
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 32
+
     def handle_error(self, request, client_address):
         exc_type = sys.exc_info()[0]
         if exc_type in (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
@@ -121,6 +157,7 @@ def main():
     parser.add_argument("--token", required=True)
     parser.add_argument("--certfile", default="", help="PEM cert chain; enables HTTPS when set")
     parser.add_argument("--keyfile", default="", help="PEM private key; defaults to certfile if omitted")
+    parser.add_argument("--pid-file", default="", help="write the serving process PID here")
     args = parser.parse_args()
 
     handler = functools.partial(SecureUpdateHandler, directory=args.directory, token=args.token)
@@ -131,6 +168,8 @@ def main():
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(args.certfile, args.keyfile or None)
             httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        # Record only a successfully bound and configured listener.
+        install_pid_file(args.pid_file)
         httpd.serve_forever()
 
 

@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import pathlib
+import random
 import re
 import shutil
 import socket
@@ -16,13 +17,14 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 
 # 家宽更新源是 DDNS 直连地址，绝不该走系统代理。macOS 上 urllib 会自动读取系统代理
 # （如 Clash 的“设为系统代理”），而代理节点到不了 18088 端口就会对每个请求整齐回 503。
-# 官方 CDN（cdn.modrinth.com）相反：国内直连经常能通但很慢，有系统代理就该走代理。
+# 官方 CDN 优先直连；仅在当前请求失败或持续低速后尝试现有代理。
 # 默认 opener 仍强制直连，避免清单/家宽误入代理；官方源单独选 opener。
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 urllib.request.install_opener(_DIRECT_OPENER)
@@ -36,11 +38,8 @@ _PRIVATE_PROBE_TIMEOUT_SEC = 1.2
 _PUBLIC_PROBE_TIMEOUT_SEC = 8
 _DOWNLOAD_WORKERS = 4
 _PRINT_LOCK = threading.Lock()
-_OFFICIAL_LOCK = threading.Lock()
 _PROXY_URL = None
 _PROXY_OPENER = None
-_OFFICIAL_SKIP = False
-_OFFICIAL_SKIP_NOTIFIED = False
 
 
 def fetch_bytes(url: str, timeout: float = 20) -> bytes:
@@ -237,12 +236,10 @@ def is_official_https_url(url: str) -> bool:
 
 
 def reset_download_policy():
-    """测试和每次 main() 开头清空缓存，避免上次运行的跳过/代理结果串台。"""
-    global _PROXY_URL, _PROXY_OPENER, _OFFICIAL_SKIP, _OFFICIAL_SKIP_NOTIFIED
+    """Reset cached proxy detection for tests and each main() invocation."""
+    global _PROXY_URL, _PROXY_OPENER
     _PROXY_URL = None
     _PROXY_OPENER = None
-    _OFFICIAL_SKIP = False
-    _OFFICIAL_SKIP_NOTIFIED = False
 
 
 def normalize_proxy_url(raw: str) -> str:
@@ -344,7 +341,7 @@ def probe_timeout_for_url(url: str) -> float:
 
 
 def order_manifest_urls(urls, last_good: str = "") -> list:
-    """Public addresses only. Never auto-insert a LAN IP for WAN players."""
+    """Prefer public addresses, then explicit LAN fallbacks; never invent a LAN URL."""
     seen = set()
     out = []
 
@@ -367,6 +364,9 @@ def order_manifest_urls(urls, last_good: str = "") -> list:
         add(url)
     if last_good and not is_private_update_url(last_good):
         add(last_good)
+    for url in (urls or []):
+        if is_private_update_url(url):
+            add(url)
     return out
 
 
@@ -464,12 +464,12 @@ def opener_for_official_url(url: str):
 def official_urls(item) -> list:
     raw = []
     if isinstance(item, dict):
-        url = item.get("url")
-        if url:
-            raw.append(str(url).strip())
         for extra in item.get("downloads") or []:
             if extra:
                 raw.append(str(extra).strip())
+        url = item.get("url")
+        if url:
+            raw.append(str(url).strip())
     seen = set()
     out = []
     for url in raw:
@@ -520,16 +520,60 @@ def copy_response(resp, out, timeout: int, min_bytes_after_timeout: int = 0, min
         next_check = elapsed + max(1.0, float(timeout))
 
 
-def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None, timeout=60, retries=1, min_bytes_after_timeout=0, min_rate_bps=0):
+def install_verified_file(temporary, destination):
+    # Same-volume atomic replacement; never unlink the previous file first.
+    if destination.is_symlink():
+        raise OSError('Refusing to replace a symlink')
+    old_mode = destination.stat().st_mode if destination.is_file() else None
+    try:
+        if os.name == 'nt' and old_mode is not None:
+            destination.chmod(old_mode | 0o200)
+        os.replace(temporary, destination)
+    except OSError:
+        if old_mode is not None and destination.is_file():
+            destination.chmod(old_mode)
+        raise
+
+
+_BUSY_STATUSES = (429, 500, 502, 503, 504)
+_BUSY_MAX_RETRIES = 5
+_BUSY_MAX_DELAY_SEC = 30.0
+
+
+def busy_status(exc):
+    code = getattr(exc, "code", None)
+    return f"HTTP {code}" if code else type(exc).__name__
+
+
+def busy_retry_delay(exc, busy_attempt):
+    """Seconds to wait before retrying a busy/overloaded source, or None."""
+    code = getattr(exc, "code", None)
+    if not isinstance(exc, urllib.error.HTTPError) or code not in _BUSY_STATUSES:
+        return None
+    if busy_attempt >= _BUSY_MAX_RETRIES:
+        return None
+    delay = min(_BUSY_MAX_DELAY_SEC, 1.5 * (2 ** busy_attempt))
+    try:
+        retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        if retry_after and str(retry_after).strip().isdigit():
+            delay = min(_BUSY_MAX_DELAY_SEC, max(delay, float(retry_after)))
+    except Exception:
+        pass
+    return delay + random.uniform(0, delay * 0.25)
+
+
+def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None, timeout=60, retries=1, min_bytes_after_timeout=0, min_rate_bps=0, backoff=True):
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="portable-sync-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(prefix=".portable-sync-", suffix=".tmp", dir=dest.parent)
     os.close(fd)
     tmp = pathlib.Path(tmp_name)
     opener = opener or _DIRECT_OPENER
     req = urllib.request.Request(url, headers={"User-Agent": _SYNC_UA})
     try:
         last_exc = None
-        for attempt in range(retries + 1):
+        attempt = 0
+        busy_attempt = 0
+        while True:
             try:
                 with opener.open(req, timeout=timeout) as resp, tmp.open("wb") as out:
                     copy_response(resp, out, timeout, min_bytes_after_timeout, min_rate_bps)
@@ -537,7 +581,17 @@ def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None,
                 break
             except Exception as exc:
                 last_exc = exc
+                # BUSY_BACKOFF_V1: 429/5xx means "busy", not "broken"; wait and retry.
+                delay = busy_retry_delay(exc, busy_attempt) if backoff else None
+                if isinstance(exc, urllib.error.HTTPError):
+                    exc.close()
+                if delay is not None:
+                    busy_attempt += 1
+                    sync_print(f"[同步] 更新服务繁忙（{busy_status(exc)}），{delay:.1f} 秒后重试：{mask_url(url)}")
+                    time.sleep(delay)
+                    continue
                 if attempt < retries:
+                    attempt += 1
                     time.sleep(2)
                     continue
                 raise
@@ -546,45 +600,117 @@ def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None,
         actual = sha1(tmp)
         if actual != expected_sha1.lower():
             raise RuntimeError(f"SHA1 mismatch for {mask_url(url)}. expected={expected_sha1} actual={actual}")
-        shutil.move(str(tmp), dest)
+        install_verified_file(tmp, dest)
     finally:
         if tmp.exists():
             tmp.unlink()
 
 
-def mark_official_skip():
-    global _OFFICIAL_SKIP, _OFFICIAL_SKIP_NOTIFIED
-    with _OFFICIAL_LOCK:
-        _OFFICIAL_SKIP = True
-        notify = not _OFFICIAL_SKIP_NOTIFIED
-        _OFFICIAL_SKIP_NOTIFIED = True
-    if notify:
-        sync_print("[同步] 官方源本轮不再尝试，其余文件直接走更新服务。")
+# HYBRID_DOWNLOAD_V1: mirrors supply bytes only, never policy or a different release.
+_HYBRID = None
+_HYBRID_LOCK = threading.Lock()
+
+def configure_hybrid(manifest, manifest_url):
+    global _HYBRID
+    urls = manifest.get('mirrorManifestUrls') or []
+    _HYBRID = {'manifest': manifest, 'url': manifest_url, 'urls': urls[:3],
+               'sources': None, 'failed': set()} if urls else None
+
+def mirror_identity(manifest):
+    rows = {}
+    for row in manifest.get('files', []):
+        rel = safe_rel(row['path'])
+        if rel.casefold() in rows or not re.fullmatch('[0-9a-fA-F]{40}', str(row.get('sha1', ''))):
+            raise ValueError('Invalid mirror file inventory')
+        rows[rel.casefold()] = (int(row['size']), row['sha1'].lower())
+    return str(manifest.get('packId', '')), str(manifest.get('version', '')), rows
+
+def hybrid_url(source, rel):
+    row = source['rows'][rel]
+    remote = row.get('downloadPath', rel)
+    if remote != rel and not re.fullmatch(r'blobs/[0-9a-f]{64}', str(remote)):
+        raise ValueError('Invalid mirror downloadPath')
+    return url_for(source['base'], remote)
+
+def prepare_hybrid():
+    h = _HYBRID
+    if h is None:
+        return []
+    with _HYBRID_LOCK:
+        if h['sources'] is not None:
+            return h['sources']
+        identity = mirror_identity(h['manifest'])
+        sources = []
+        seen = set()
+        for url in [h['url']] + list(h['urls']):
+            parsed = urllib.parse.urlsplit(str(url))
+            if url in seen or parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+                continue
+            seen.add(url)
+            try:
+                m = h['manifest'] if url == h['url'] else json.loads(fetch_bytes(url, timeout=4).decode('utf-8-sig'))
+                if mirror_identity(m) != identity:
+                    sync_print('[混合源] 已忽略版本或文件清单不一致的备用源。')
+                    continue
+                source = {'base': url.rsplit('/', 1)[0]+'/', 'rows': {r['path']: r for r in m['files']}, 'score': 0.0}
+                sample = max(m['files'], key=lambda r: int(r.get('size', 0)))
+                started = time.monotonic()
+                try:
+                    request = urllib.request.Request(hybrid_url(source, sample['path']), headers={'User-Agent': _SYNC_UA, 'Range': 'bytes=0-131071'})
+                    with _DIRECT_OPENER.open(request, timeout=3) as response:
+                        data = response.read(131072)
+                    source['score'] = len(data) / max(time.monotonic()-started, 0.001)
+                except Exception as exc:
+                    if isinstance(exc, urllib.error.HTTPError):
+                        exc.close()
+                    pass  # keep an unmeasured source as last-resort fallback
+                sources.append(source)
+            except Exception:
+                sync_print('[混合源] 一个备用源暂不可用，继续使用其余来源。')
+        sources.sort(key=lambda s: s['score'], reverse=True)
+        h['sources'] = sources
+        if sources:
+            host = urllib.parse.urlsplit(sources[0]['base']).hostname
+            sync_print(f'[混合源] 本机采样优先选择 {host}；失败或持续低速会自动换源。')
+        return sources
+
+def download_hybrid_entry(item, dest, expected, rel):
+    sources = prepare_hybrid()
+    error = None
+    for source in sources:
+        if source['base'] in _HYBRID['failed']:
+            continue
+        try:
+            download_file(hybrid_url(source, rel), dest, expected,
+                          opener=_DIRECT_OPENER, timeout=home_timeout_sec(item.get("size", 0)), retries=0,
+                          min_rate_bps=65536 if len(sources)>1 else 0)
+            return 'home'
+        except Exception as exc:
+            error = exc
+            sync_print('[混合源] 下载失败、低速或校验不符，正在切换备用源。')
+    if error:
+        raise error
+    raise RuntimeError('本轮所有更新源均不可用，请稍后重试。')
 
 
 def download_manifest_entry(item, base_url: str, dest: pathlib.Path, expected_sha1: str, rel: str) -> str:
-    # 官方源：有系统代理就走代理（国内直连 Modrinth 经常能通但很慢）。
-    # 按持续速率判断，太慢立刻回落家宽；本轮后面的文件不再试官方，避免 90 次白等。
-    # 家宽始终直连，绝不进 Clash。
-    urls = [] if _OFFICIAL_SKIP else official_urls(item if isinstance(item, dict) else {})
-    for url in urls:
-        started = time.time()
-        try:
-            download_file(
-                url, dest, expected_sha1,
-                opener=opener_for_official_url(url),
-                timeout=_OFFICIAL_TIMEOUT_SEC,
-                retries=0,
-                min_bytes_after_timeout=_OFFICIAL_MIN_BYTES,
-                min_rate_bps=_OFFICIAL_MIN_RATE,
-            )
-            return "official"
-        except Exception as exc:
-            sync_print(
-                f"[同步] 官方源不可用（{time.time() - started:.1f}s，{download_fail_reason(exc)}），改走更新服务：{rel}"
-            )
-            mark_official_skip()
-            break
+    # Prefer official exact-hash URLs, then the pack server/mirrors.
+    for url in official_urls(item if isinstance(item, dict) else {}):
+        openers = [_DIRECT_OPENER]
+        proxy = opener_for_official_url(url)
+        if proxy is not _DIRECT_OPENER:
+            openers.append(proxy)
+        for opener in openers:
+            try:
+                download_file(url, dest, expected_sha1, opener=opener,
+                              timeout=_OFFICIAL_TIMEOUT_SEC, retries=0,
+                              min_bytes_after_timeout=_OFFICIAL_MIN_BYTES,
+                              min_rate_bps=_OFFICIAL_MIN_RATE, backoff=False)
+                return "official"
+            except Exception as exc:
+                sync_print(f"[同步] {urllib.parse.urlsplit(url).hostname} 不可用（{download_fail_reason(exc)}），继续尝试下一下载源：{rel}")
+    if _HYBRID is not None:
+        return download_hybrid_entry(item, dest, expected_sha1, rel)
     size = 0
     if isinstance(item, dict):
         size = item.get("size") or 0
@@ -858,6 +984,129 @@ def minecraft_home_for_instance(root: pathlib.Path):
     if grandparent and parent.name.lower() == "versions" and grandparent.name.lower() == ".minecraft":
         return grandparent.parent
     return None
+
+
+def ensure_neoforge_client_extra(root: pathlib.Path, manifest: dict, backup_root: pathlib.Path) -> bool:
+    """把已安装的纯资源 client-extra 加入当前实例 classpath，供 CSL 读取版本元数据。"""
+    if str((manifest.get("loader") or {}).get("type") or "").strip().lower() != "neoforge":
+        return False
+
+    def unfinished(reason):
+        print(f"[启动修复未完成] {reason}；当前实例版本 JSON 未改。")
+        return False
+
+    home = minecraft_home_for_instance(root)
+    if home is None:
+        return unfinished("当前目录不是 .minecraft/versions/<实例>，无法定位客户端库")
+    mc = str(manifest.get("minecraftVersion") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", mc):
+        return unfinished("清单缺少有效 Minecraft 版本")
+    try:
+        preferred = root / (root.name + ".json")
+        paths = [preferred] if preferred.is_file() else sorted(root.glob("*.json"))
+        candidates = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and isinstance(data.get("id"), str) and data["id"] and (data.get("mainClass") or data.get("inheritsFrom")):
+                candidates.append((path, data))
+        if len(candidates) != 1:
+            return unfinished("找不到唯一的当前实例版本 JSON")
+        path, data = candidates[0]
+        libraries = data.get("libraries", [])
+        if not isinstance(libraries, list):
+            return unfinished("当前实例 libraries 格式不适用")
+        game_args = (data.get("arguments") or {}).get("game") or []
+        if not isinstance(game_args, list):
+            return unfinished("当前实例游戏参数格式不适用")
+
+        def argument(name):
+            for index, value in enumerate(game_args):
+                if value == name and index + 1 < len(game_args) and isinstance(game_args[index + 1], str):
+                    return game_args[index + 1]
+            return ""
+
+        names = [str(item.get("name") or "") for item in libraries if isinstance(item, dict)]
+        if not argument("--fml.neoForgeVersion") and not any(name.startswith("net.neoforged:neoforge:") for name in names):
+            return unfinished("当前实例版本 JSON 没有 NeoForge 标记，已跳过")
+        declared_mc = argument("--fml.mcVersion")
+        parent_version = str(data.get("inheritsFrom") or "")
+        if (declared_mc and declared_mc != mc) or (re.fullmatch(r"\d+\.\d+(?:\.\d+)?", parent_version) and parent_version != mc):
+            return unfinished("当前实例 Minecraft 版本与更新清单不一致")
+        neoform = argument("--fml.neoFormVersion") or argument("--fml.mcpVersion")
+        if neoform and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", neoform):
+            return unfinished("当前实例 NeoForm 版本格式不适用")
+        minecraft_dir = home / ".minecraft"
+        client_dir = minecraft_dir / "libraries" / "net" / "minecraft" / "client"
+        if neoform:
+            coordinate_version = mc + "-" + neoform
+            jars = [client_dir / coordinate_version / ("client-" + coordinate_version + "-extra.jar")]
+        else:
+            jars = sorted(client_dir.glob(mc + "-*/client-*-extra.jar")) if client_dir.is_dir() else []
+        valid = []
+        invalid = []
+        for jar in jars:
+            if not jar.is_file():
+                continue
+            # 只读取 FML 已安装库目录里的标准 extra 工件；不扫描别的实例，不下载依赖。
+            if jar.name != "client-" + jar.parent.name + "-extra.jar":
+                continue
+            try:
+                with zipfile.ZipFile(jar) as archive:
+                    entries = archive.namelist()
+                    if any(name.lower().endswith(".class") for name in entries):
+                        invalid.append("client-extra 包含 class，拒绝加入普通 classpath")
+                        continue
+                    if entries.count("version.json") != 1:
+                        invalid.append("client-extra 缺少唯一 version.json")
+                        continue
+                    metadata = json.loads(archive.read("version.json").decode("utf-8-sig"))
+                    if metadata.get("id") != mc:
+                        invalid.append("client-extra 内 Minecraft 版本与更新清单不一致")
+                        continue
+                valid.append(jar)
+            except (OSError, ValueError, zipfile.BadZipFile):
+                invalid.append("client-extra 无法读取")
+        if len(valid) != 1:
+            if len(valid) > 1:
+                return unfinished("同一 Minecraft 版本存在多个 client-extra，且实例未指定 NeoForm 版本")
+            return unfinished(invalid[0] if invalid else "缺少当前实例已安装的 client-extra.jar，请先用启动器补全游戏库后重新更新")
+        jar = valid[0]
+        name = "net.minecraft:client:" + jar.parent.name + ":extra"
+        relative = jar.relative_to(minecraft_dir / "libraries").as_posix()
+        for item in libraries:
+            if not isinstance(item, dict):
+                continue
+            existing = str(item.get("name") or "")
+            if existing == name:
+                downloads = item.get("downloads")
+                artifact = downloads.get("artifact") if isinstance(downloads, dict) else None
+                ordinary = downloads is None or (isinstance(artifact, dict) and artifact.get("path", relative) == relative)
+                if ordinary and not item.get("rules") and not item.get("natives") and not item.get("extract"):
+                    print("[启动修复] 当前实例已包含 client-extra 普通库，无需修改。")
+                    return False
+                return unfinished("client-extra 已有特殊规则或分类器配置，请检查启动器版本配置")
+            if existing.startswith("net.minecraft:client:") and existing.endswith(":extra"):
+                return unfinished("当前实例已声明其他 client-extra 版本，未覆盖玩家配置")
+        libraries.append({"name": name, "downloads": {"artifact": {"path": relative, "sha1": sha1(jar), "size": jar.stat().st_size}}})
+        data["libraries"] = libraries
+        encoded = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        backup_file(path, root, path.name, backup_root)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+                temporary = pathlib.Path(stream.name)
+                stream.write(encoded)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+        print("[启动修复] 已补齐当前实例 client-extra 资源库。请完全退出游戏并重新打开启动器，再启动游戏。")
+        return True
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return unfinished("无法修复 client-extra 启动配置：" + str(exc))
 
 
 def stable_path_cache(path: pathlib.Path) -> int:
@@ -1140,12 +1389,9 @@ def main() -> int:
     print("[同步] 清单候选：" + "；".join(mask_url(url) for url in manifest_urls))
     proxy = get_proxy_url()
     if proxy:
-        print(f"[同步] 已检测到系统代理 {describe_proxy(proxy)}，官方源走代理；家宽更新服务始终直连。")
+        print(f"[同步] 已检测到系统代理 {describe_proxy(proxy)}，官方源先直连，受阻后可使用现有代理；更新服务直连。")
     else:
         print("[同步] 未检测到系统代理，官方源直连（太慢会在约 8 秒内回落更新服务）。")
-        if state.get("skipOfficial"):
-            mark_official_skip()
-            print("[同步] 上次官方源偏慢，本轮直接走更新服务。检测到代理后会再试官方源。")
     manifest = None
     selected_manifest_url = ""
     last_exc = None
@@ -1197,6 +1443,7 @@ def main() -> int:
     if not files:
         raise SystemExit("清单没有 files 文件列表。")
     base_url = manifest_url.rsplit("/", 1)[0] + "/"
+    configure_hybrid(manifest, manifest_url)
     initial_sync = not bool(state.get("files"))
     previous_version = str(state.get("version") or "")
     current_version = str(manifest.get("version") or "")
@@ -1346,8 +1593,8 @@ def main() -> int:
             return key, rel, force_sync, None, exc
 
     if download_jobs:
-        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {_DOWNLOAD_WORKERS}）。")
-        workers = max(1, min(_DOWNLOAD_WORKERS, len(download_jobs)))
+        workers = max(1, min(8, int(manifest.get("downloadWorkers", _DOWNLOAD_WORKERS)), len(download_jobs)))
+        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {workers}）。")
         if workers == 1:
             results = [run_download_job(job) for job in download_jobs]
         else:
@@ -1443,6 +1690,7 @@ def main() -> int:
         )
     apply_server_list(root, manifest, backup_root, preserved_deletions, initial_sync)
     apply_launcher_profile(root, manifest, backup_root)
+    ensure_neoforge_client_extra(root, manifest, backup_root)
     show_launcher_hints(root)
     if cleanup.get("removeConnectorCache", True):
         remove_connector_cache(root)
@@ -1476,7 +1724,7 @@ def main() -> int:
         "version": manifest.get("version") or "",
         "manifestUrl": manifest_url,
         "lastManifestUrl": manifest_url,
-        "skipOfficial": bool(_OFFICIAL_SKIP) and not get_proxy_url(),
+        "skipOfficial": False,
         "syncedAt": dt.datetime.now().isoformat(timespec="seconds"),
         "files": files,
         "verified": verified,

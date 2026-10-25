@@ -32,7 +32,7 @@ Windows，在 PowerShell 中：
 
 `doctor` 只检查并显示有效路径、操作系统、Python、识别出的客户端版本和配置覆盖来源。`init` 只创建新配置，已有配置不会被覆盖。默认地址和监听都是 `127.0.0.1`，检测结果会提示它们只能供本机使用。公网域名、端口映射和反向代理不能从网卡可靠推断，需要明确配置；脚本不修改防火墙或 NAT。
 
-`serve` 在前台运行，Ctrl+C 正常结束；可由自己的 systemd、Docker 或面板进程管理器托管。此通用版本没有面板专属 API 或 Docker 专用变量。示例域名必须换成真实地址。
+`serve` 在前台运行，Ctrl+C 正常结束；可由自己的 systemd、Docker、macOS launchd 或面板进程管理器托管，并由它们设置退出重启策略。此通用版本没有面板专属 API 或 Docker 专用变量。示例域名必须换成真实地址。
 
 ## 自动检测与环境变量
 
@@ -75,6 +75,6 @@ Windows，在 PowerShell 中：
 
 会拒绝：源目录与发布目录重叠、仓库外发布目录、覆盖工具源码目录、不明非空目录、不同 packId、路径穿越、软链接/junction、Windows 不支持的路径、大小写冲突、无效端口和把监听通配地址当玩家下载地址。目录锁防止两个通用发布器同时运行；异常断电留下锁时，先核查 `.portable-publish-lock/owner.json` 的主机/PID，再人工处理，脚本不会杀进程或盲目解锁。
 
-保留已有玩家自定义配置、主动删除、资源包追加等清单策略；发行内容仍由 `includeRoots/includeFiles/excludeGlobs` 决定。通用发布器使用自建源，不做 Modrinth 查询，也不捆绑启动器；`launchers.include=true` 会明确报错。原 PowerShell 发布器保留官方源查询和启动器打包能力，两种发布器**不要同时对同一目录运行**。通用发布器可接收旧格式 2 清单并保留原目录备份。
+保留已有玩家自定义配置、主动删除、资源包追加等清单策略；发行内容仍由 `includeRoots/includeFiles/excludeGlobs` 决定。通用发布器使用自建源，不做 Modrinth 查询，也不捆绑启动器；`launchers.include=true` 会明确报错。`downloadWorkers` 配置会写入清单，默认 4、限制为 1–8；`updaterRevision` 可标记脚本版本。原 PowerShell 发布器保留官方源查询和启动器打包能力，两种发布器**不要同时对同一目录运行**。通用发布器可接收旧格式 2 清单并保留原目录备份。
 
 直接 HTTPS 在配置中填写 `update.certFile/keyFile`。已有反向代理终止 TLS 时设置 `update.reverseProxyTls=true`、`scheme=https`，并让反代保持 URL 路径；这里的 `port` 同时用于本机服务和公开 URL，端口不同的反代部署须先对齐端口设计。随机路径令牌保存在私有文件中，不打印在检测报告或服务命令行里；Linux 新建令牌文件权限为 `0600`。

@@ -120,6 +120,7 @@ def resolve_config(root, config, require_source=True):
             raise ValueError(f'{key} must be a JSON array of strings.')
     if 'allowEmptyClient' in c and type(c['allowEmptyClient']) is not bool:
         raise ValueError('allowEmptyClient must be true or false, not a string.')
+    c['downloadWorkers'] = max(1, min(8, int(c.get('downloadWorkers', 4))))
     raw = c.get('sourceClient', 'auto')
     if (not raw or raw == 'auto') and not require_source:
         source = root / 'main-client'
@@ -389,7 +390,8 @@ def publish(root, config):
                     rows.append({'path': path.relative_to(stage).as_posix(), 'size': path.stat().st_size, 'sha1': file_sha1(path)})
             manifest = {k: c[k] for k in ('packId', 'packName', 'version', 'minecraftVersion', 'loader',
                 'preserveLocalChangeGlobs', 'preserveLocalDeletionGlobs', 'additiveDirs', 'adoptExistingFiles',
-                'forceSyncGlobs', 'forceDeleteGlobs', 'cleanup', 'playerOptions', 'serverList', 'platformExcludeGlobs') if k in c}
+                'forceSyncGlobs', 'forceDeleteGlobs', 'cleanup', 'playerOptions', 'serverList', 'platformExcludeGlobs',
+                'downloadWorkers', 'updaterRevision') if k in c}
             manifest.update(format=2, pack=c['packId'], name=c['packId'],
                 generatedAt=datetime.now(timezone.utc).isoformat(), updateUrl=url,
                 preservePlayerCustomizations=True, files=rows,

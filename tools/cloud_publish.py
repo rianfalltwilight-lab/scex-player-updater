@@ -68,13 +68,14 @@ def hash_file(path):
     return sha1.hexdigest(), sha256.hexdigest(), size
 
 
-def prepare(source, public_base, updater_dir=None):
+def prepare(source, public_base, updater_dir=None, mirror_urls=None,
+            manifest_bytes=None, file_overrides=None):
     """Validate all inputs before any write. Never modify the prepared pack."""
     source = Path(source).absolute()
     no_links(source)
     manifest_path = source / 'server-manifest.json'
     no_links(manifest_path)
-    original_manifest = manifest_path.read_bytes()
+    original_manifest = manifest_path.read_bytes() if manifest_bytes is None else manifest_bytes
     manifest = json.loads(original_manifest.decode('utf-8-sig'))
     if not manifest.get('files') or not manifest.get('version') or not manifest.get('packId'):
         raise ValueError('Expected a prepared portable manifest with packId/version/files')
@@ -84,6 +85,16 @@ def prepare(source, public_base, updater_dir=None):
         raise ValueError('Signed input requires a compatible re-signing workflow')
     manifest['updateUrl'] = base + '/server-manifest.json'
     manifest['cloudFormat'] = 1
+    if mirror_urls is not None:
+        from urllib.parse import urlsplit
+        mirrors = []
+        for url in mirror_urls:
+            u = urlsplit(url)
+            if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password or u.query or u.fragment:
+                raise ValueError('Invalid mirror manifest URL')
+            if url not in mirrors and url != manifest['updateUrl']:
+                mirrors.append(url)
+        manifest['mirrorManifestUrls'] = mirrors[:3]
     inputs, blobs, seen = {}, {}, set()
     rows = manifest['files']
     for row in rows:
@@ -91,7 +102,7 @@ def prepare(source, public_base, updater_dir=None):
         if rel.casefold() in seen or rel == 'server-manifest.json':
             raise ValueError('Duplicate or recursive manifest path')
         seen.add(rel.casefold())
-        path = source / rel
+        path = Path((file_overrides or {}).get(rel, source / rel))
         actual_sha1, _, actual_size = hash_file(path)
         if actual_sha1 != row['sha1'].lower() or actual_size != row['size']:
             raise ValueError('Source differs from prepared manifest: ' + rel)
@@ -114,7 +125,7 @@ def prepare(source, public_base, updater_dir=None):
         rel = row['path']
         item = inputs[rel]
         if rel in URL_FILES:
-            item = (manifest['updateUrl'] + '\n').encode('utf-8')
+            item = ('\n'.join([manifest['updateUrl']] + manifest.get('mirrorManifestUrls', [])) + '\n').encode('utf-8')
         if isinstance(item, bytes):
             sha1, sha256, size = hashlib.sha1(item).hexdigest(), hashlib.sha256(item).hexdigest(), len(item)
         else:
@@ -129,6 +140,56 @@ def prepare(source, public_base, updater_dir=None):
             bootstrap[rel] = row['downloadPath']
     return {'manifest': manifest, 'blobs': blobs, 'bootstrap': bootstrap,
             'inputManifestSha256': hashlib.sha256(original_manifest).hexdigest()}
+
+
+def prepare_release_plan(directory, source, public_base, updater_dir=None, mirror_urls=None):
+    """Overlay a verified release plan in memory; neither live source is written."""
+    directory, source = Path(directory), Path(source).absolute()
+    for name in ('release-plan.json', 'manifest.proposed.json'):
+        no_links(directory / name)
+    release = json.loads((directory / 'release-plan.json').read_text(encoding='utf-8-sig'))
+    if Path(release['baseline_root']).resolve() != source.resolve():
+        raise ValueError('Release plan baseline root differs from source')
+    baseline_path = source / 'server-manifest.json'
+    if hash_file(baseline_path)[1] != release['baseline_manifest_sha256'].lower():
+        raise ValueError('Release plan baseline changed; regenerate before staging')
+    baseline = json.loads(baseline_path.read_text(encoding='utf-8-sig'))
+    expected = {r['path']: (r['sha1'].lower(), r['size']) for r in baseline['files']}
+    for row in release['remove_paths']:
+        rel = relative(row['path'])
+        if hash_file(source / rel)[1] != row['sha256'].lower():
+            raise ValueError('Release predecessor changed')
+        del expected[rel]
+    overrides = {}
+    for row in release['files']:
+        rel = relative(row['path'])
+        digest1, digest256, size = hash_file(Path(row['source']))
+        if digest256 != row['sha256'].lower() or size != row['size']:
+            raise ValueError('Release candidate changed')
+        overrides[rel] = Path(row['source'])
+        expected[rel] = (digest1, size)
+    raw = (directory / 'manifest.proposed.json').read_bytes()
+    proposed = json.loads(raw.decode('utf-8-sig'))
+    actual = {r['path']: (r['sha1'].lower(), r['size']) for r in proposed['files']}
+    if (actual != expected or len(actual) != len(proposed['files'])
+            or proposed['version'] != release['version']
+            or proposed['packId'] != baseline['packId']):
+        raise ValueError('Proposed manifest differs from release plan')
+    return prepare(source, public_base, updater_dir, mirror_urls, raw, overrides)
+
+
+def contract_digest(plan):
+    """Bind content and player policy; timestamps and per-file route hints may vary."""
+    contract = copy.deepcopy(plan['manifest'])
+    contract.pop('generatedAt', None)
+    for row in contract['files']:
+        for field in ('url', 'urls', 'downloads', 'downloadUrl', 'downloadUrls', 'officialUrls'):
+            row.pop(field, None)
+    contract['files'].sort(key=lambda row: row['path'])
+    for key in ('forceDeleteGlobs', 'forceSyncGlobs'):
+        if key in contract:
+            contract[key] = sorted(set(contract[key]))
+    return hashlib.sha256(encode(contract)).hexdigest()
 
 
 def bridge_source(plan, target, backup_root):
@@ -200,12 +261,13 @@ def bridge_source(plan, target, backup_root):
             'manifestSha256': hash_file(manifest_path)[1]}
 
 
-def publish(plan, store, progress=None):
-    """Store adapter supports head/put/verify. A failure never switches the manifest."""
+def stage(plan, store, progress=None):
+    """Upload and fully read back immutable objects, without changing live endpoints."""
     manifest = plan['manifest']
     previous = store.head('server-manifest.json')
     previous_etag = previous.get('ETag') if previous else None
     uploaded = reused = 0
+    verified = {}
     for key, blob in plan['blobs'].items():
         old = store.head(key)
         if old:
@@ -217,8 +279,12 @@ def publish(plan, store, progress=None):
         else:
             store.put(key, blob['source'], IMMUTABLE, blob['sha256'])
             uploaded += 1
+        identity = store.head(key)
+        if not identity or not identity.get('ETag'):
+            raise ValueError('Provider must return an object identity for staged activation')
         # Public readback validates actual bytes, including pre-existing objects.
         store.verify(key, blob['sha256'], blob['size'])
+        verified[key] = {'etag': identity['ETag'], 'size': blob['size'], 'sha256': blob['sha256']}
         if progress:
             progress(uploaded + reused, len(plan['blobs']))
     raw = encode(manifest)
@@ -226,20 +292,76 @@ def publish(plan, store, progress=None):
     snapshot = 'manifests/' + digest + '.json'
     store.put(snapshot, raw, IMMUTABLE, digest)
     store.verify(snapshot, digest, len(raw))
+    latest = store.head('server-manifest.json')
+    if (latest.get('ETag') if latest else None) != previous_etag:
+        raise ValueError('Live manifest changed while staging; regenerate before maintenance')
+    return {'status': 'STAGED_NOT_ACTIVATED', 'schema': 1,
+            'storeId': getattr(store, 'identity', None),
+            'version': manifest['version'], 'packId': manifest['packId'],
+            'contractSha256': contract_digest(plan), 'previousETag': previous_etag,
+            'manifestSha256': digest, 'manifestSize': len(raw), 'snapshot': snapshot,
+            'uploaded': uploaded, 'reused': reused, 'verifiedBlobs': verified,
+            'files': len(manifest['files']), 'remoteDeleted': 0}
+
+
+def check_staged(plan, store, receipt):
+    """Recheck fresh remote identities against full readback evidence, without writes."""
+    if (receipt.get('status') != 'STAGED_NOT_ACTIVATED' or receipt.get('schema') != 1
+            or receipt.get('storeId') != getattr(store, 'identity', None)
+            or receipt.get('contractSha256') != contract_digest(plan)):
+        raise ValueError('Staged receipt does not match this candidate/store/policy')
+    previous = store.head('server-manifest.json')
+    if (previous.get('ETag') if previous else None) != receipt['previousETag']:
+        raise ValueError('Live manifest changed since staging; activation cancelled')
+    recorded = receipt['verifiedBlobs']
+    if set(recorded) != set(plan['blobs']):
+        raise ValueError('Staged blob inventory differs')
+    if hasattr(store, 'refresh_inventory'):
+        store.refresh_inventory()
+    for key, blob in plan['blobs'].items():
+        old = recorded[key]
+        current = store.head(key)
+        if (not current or not old.get('etag') or current.get('ETag') != old['etag']
+                or current.get('ContentLength') != blob['size'] or old['size'] != blob['size']
+                or old['sha256'] != blob['sha256']):
+            raise ValueError('Staged cloud object changed or disappeared: ' + key)
+    if receipt['snapshot'] != 'manifests/' + receipt['manifestSha256'] + '.json':
+        raise ValueError('Invalid staged snapshot identity')
+    store.verify(receipt['snapshot'], receipt['manifestSha256'], receipt['manifestSize'])
+    return {'status': 'STAGED_CHECK_PASS', 'version': plan['manifest']['version'],
+            'files': len(plan['manifest']['files'])}
+
+
+def activate_staged(plan, store, receipt):
+    """Only activate a frozen, fully verified candidate; do not reread every blob."""
+    check_staged(plan, store, receipt)
+    manifest = plan['manifest']
+    raw = encode(manifest)
+    digest = hashlib.sha256(raw).hexdigest()
+    snapshot = 'manifests/' + digest + '.json'
+    if snapshot != receipt['snapshot']:
+        store.put(snapshot, raw, IMMUTABLE, digest)
+        store.verify(snapshot, digest, len(raw))
     # Bootstrap refresh runs before manifest parsing in existing players.
     for rel, blob_key in plan['bootstrap'].items():
         blob = plan['blobs'][blob_key]
         store.put(rel, blob['source'], LIVE, blob['sha256'])
         store.verify(rel, blob['sha256'], blob['size'])
     latest = store.head('server-manifest.json')
-    if (latest.get('ETag') if latest else None) != previous_etag:
+    if (latest.get('ETag') if latest else None) != receipt['previousETag']:
         raise ValueError('Another publisher changed the cloud manifest; switch cancelled')
-    store.activate(raw, digest, previous_etag)
+    store.activate(raw, digest, receipt['previousETag'])
     # If this fails, the manifest may already be live: inspect before retrying.
     store.verify('server-manifest.json', digest, len(raw))
     return {'status': 'PUBLISHED_AND_READ_BACK', 'version': manifest['version'],
-            'manifestSha256': digest, 'snapshot': snapshot, 'uploaded': uploaded,
-            'reused': reused, 'files': len(manifest['files']), 'remoteDeleted': 0}
+            'manifestSha256': digest, 'snapshot': snapshot, 'uploaded': receipt['uploaded'],
+            'reused': receipt['reused'], 'files': len(manifest['files']), 'remoteDeleted': 0,
+            'activationMode': 'PREVERIFIED_STAGED_OBJECTS'}
+
+
+def publish(plan, store, progress=None):
+    """Compatibility path: stage and activate in one invocation."""
+    return activate_staged(plan, store, stage(plan, store, progress))
 
 
 class S3Store:
@@ -251,6 +373,8 @@ class S3Store:
         self.bucket = cfg['bucket']
         self.base = checked_url(cfg['publicBaseUrl'])
         endpoint = checked_url(cfg['endpointUrl'])
+        self.identity = hashlib.sha256(encode({key: cfg[key] for key in
+            ('bucket', 'prefix', 'publicBaseUrl', 'endpointUrl', 'region')})).hexdigest()
         key = os.environ[cfg.get('accessKeyEnv', 'SCEX_CLOUD_ACCESS_KEY')]
         secret = os.environ[cfg.get('secretKeyEnv', 'SCEX_CLOUD_SECRET_KEY')]
         self.api = boto3.client('s3', endpoint_url=endpoint,
@@ -261,6 +385,9 @@ class S3Store:
                                              retries={'max_attempts': 3, 'mode': 'standard'}))
         # Reuse direct HTTPS connections for serial full-byte readback.
         self.http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', maxsize=1)
+        self.blob_inventory = None
+
+    def refresh_inventory(self):
         self.blob_inventory = None
 
     def head(self, key):
@@ -295,10 +422,14 @@ class S3Store:
         if not isinstance(source, bytes) and source.stat().st_size <= 256 * 1024:
             source = source.read_bytes()
         if isinstance(source, bytes):
-            self.api.put_object(Body=source, **args)
+            response = self.api.put_object(Body=source, **args)
+            size = len(source)
         else:
             with source.open('rb') as stream:
-                self.api.put_object(Body=stream, **args)
+                response = self.api.put_object(Body=stream, **args)
+            size = source.stat().st_size
+        if key.startswith('blobs/') and self.blob_inventory is not None:
+            self.blob_inventory[key] = {'ContentLength': size, 'ETag': response.get('ETag')}
 
     def activate(self, raw, digest, previous_etag):
         # Conditional writes must be supported by the provider. Never silently
@@ -347,15 +478,39 @@ def main():
     parser.add_argument('--bridge-source', type=Path, help='Update this old direct-layout source after cloud readback')
     parser.add_argument('--backup-root', type=Path, help='Required for --bridge-source')
     parser.add_argument('--lock-root', type=Path, help='Native publisher root to serialize with local releases')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--stage-only', action='store_true', help='Upload/read back immutable files; leave players on current release')
+    mode.add_argument('--activate-staged', type=Path, help='Activate using a matching stage receipt')
+    mode.add_argument('--check-staged', type=Path, help='Read-only candidate and cloud identity preflight')
+    parser.add_argument('--release-plan', type=Path, help='Offline plan directory; overlay candidate without copying the live pack')
     args = parser.parse_args()
     cfg = json.loads(args.config.read_text(encoding='utf-8-sig'))
     relative(cfg['prefix'])
     checked_url(cfg['endpointUrl'])
     if args.bridge_source and (not args.apply or not args.backup_root):
         parser.error('--bridge-source requires --apply and --backup-root')
+    if args.stage_only and (not args.apply or not args.receipt or args.bridge_source):
+        parser.error('--stage-only requires --apply and --receipt, and forbids --bridge-source')
+    if args.activate_staged and (not args.apply or args.release_plan):
+        parser.error('--activate-staged requires --apply and the final prepared source')
+    if args.check_staged and args.bridge_source:
+        parser.error('--check-staged forbids --bridge-source')
+    if args.release_plan and not (args.stage_only or args.check_staged or not args.apply):
+        parser.error('--release-plan cannot directly activate a live release')
     with publish_lock(args.lock_root or Path(__file__).resolve().parents[1]):
-        plan = prepare(args.source, cfg['publicBaseUrl'], Path(__file__).parent)
-        if not args.apply:
+        if args.release_plan:
+            plan = prepare_release_plan(args.release_plan, args.source, cfg['publicBaseUrl'],
+                                        Path(__file__).parent, cfg.get('mirrorManifestUrls'))
+        else:
+            plan = prepare(args.source, cfg['publicBaseUrl'], Path(__file__).parent, cfg.get('mirrorManifestUrls'))
+        receipt_path = args.activate_staged or args.check_staged
+        staged = None
+        if receipt_path:
+            no_links(receipt_path)
+            staged = json.loads(receipt_path.read_text(encoding='utf-8-sig'))
+        if args.check_staged:
+            result = check_staged(plan, S3Store(cfg), staged)
+        elif not args.apply:
             result = {'status': 'LOCAL_PLAN_ONLY', 'files': len(plan['manifest']['files']),
                       'uniqueBlobs': len(plan['blobs']),
                       'uniqueBytes': sum(b['size'] for b in plan['blobs'].values()),
@@ -364,14 +519,20 @@ def main():
             def report_progress(done, total):
                 if done == 1 or done % 25 == 0 or done == total:
                     print(json.dumps({'verifiedBlobs': done, 'totalBlobs': total}), flush=True)
-            result = publish(plan, S3Store(cfg), report_progress)
+            store = S3Store(cfg)
+            if args.stage_only:
+                result = stage(plan, store, report_progress)
+            elif args.activate_staged:
+                result = activate_staged(plan, store, staged)
+            else:
+                result = publish(plan, store, report_progress)
             if args.bridge_source:
                 result['bridge'] = bridge_source(plan, args.bridge_source, args.backup_root)
         if args.receipt:
             no_links(args.receipt)
             args.receipt.parent.mkdir(parents=True, exist_ok=True)
             args.receipt.write_bytes(encode(result) + b'\n')
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps({k: v for k, v in result.items() if k != 'verifiedBlobs'}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

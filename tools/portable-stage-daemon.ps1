@@ -12,7 +12,7 @@
       3) 只在 manifest 文本变化时才做文件 diff；idle 轮询近乎零开销（一次 GET + 字符串比较）。
       4) 生命周期自管：游戏由 PCL/HMCL 独立进程启动，本 daemon 靠"检测 java 进程 + 最大时长 + 单例锁"自退，
          不残留后台进程。
-      5) 编码/换行按仓库铁律：UTF-8 无 BOM 保存；本文件是 PowerShell，CRLF 或 LF 均可，但保存时勿加 BOM。
+      5) Windows PowerShell 5.1 使用 UTF-8 BOM 识别中文；CRLF 或 LF 均可。
 #>
 param(
     [string]$InstanceDir = ".",
@@ -487,15 +487,42 @@ function Get-ManifestIfChanged {
     } finally { $resp.Close() }
 }
 
+function Install-VerifiedFile {
+    param([string]$Temporary,[string]$Destination)
+    # Temp is on the destination volume. Never delete the old file to make room.
+    if ([IO.Directory]::Exists($Destination)) { throw '更新目标是目录，请检查客户端文件路径。' }
+    $oldAttributes = $null
+    if ([IO.File]::Exists($Destination)) {
+        $oldAttributes = [IO.File]::GetAttributes($Destination)
+        if ($oldAttributes -band [IO.FileAttributes]::ReparsePoint) { throw '拒绝替换链接目标。' }
+    }
+    try {
+        if ($null -ne $oldAttributes -and ($oldAttributes -band [IO.FileAttributes]::ReadOnly)) {
+            [IO.File]::SetAttributes($Destination, ($oldAttributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+        }
+        for ($attempt=0; $attempt -lt 3; $attempt++) {
+            try {
+                if ([IO.File]::Exists($Destination)) { [IO.File]::Replace($Temporary,$Destination,[NullString]::Value) }
+                else { [IO.File]::Move($Temporary,$Destination) }
+                return
+            } catch { if ($attempt -eq 2) { throw }; Start-Sleep -Milliseconds 250 }
+        }
+    } catch {
+        if ($null -ne $oldAttributes -and [IO.File]::Exists($Destination)) { [IO.File]::SetAttributes($Destination,$oldAttributes) }
+        throw ('文件替换失败，旧文件已保留。请完全退出 Minecraft、关闭占用该资源包的程序后重试。' + $_.Exception.Message)
+    }
+}
+
+
 function Save-StagedFile {
     param([string]$Url, [string]$Destination, [string]$ExpectedSha1, [switch]$AllowProxy, [int]$TimeoutSec = 120, [int]$MinBytesAfterTimeout = 0)
     New-Item -ItemType Directory -Force (Split-Path -Parent $Destination) | Out-Null
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("portable-stage-" + [System.Guid]::NewGuid().ToString('N') + ".tmp")
+    $tmp = Join-Path (Split-Path -Parent $Destination) (".portable-stage-" + [System.Guid]::NewGuid().ToString('N') + ".tmp")
     try {
         Save-UrlToFile -Url $Url -Path $tmp -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy -MinBytesAfterTimeout $MinBytesAfterTimeout
         $actual = Get-Sha1 -Path $tmp
         if ($actual -ne $ExpectedSha1.ToLowerInvariant()) { throw "SHA1 mismatch expected=$ExpectedSha1 actual=$actual" }
-        Move-Item -LiteralPath $tmp -Destination $Destination -Force
+        Install-VerifiedFile -Temporary $tmp -Destination $Destination
     } finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }

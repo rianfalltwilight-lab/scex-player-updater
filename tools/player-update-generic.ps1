@@ -139,8 +139,6 @@ function Backup-FileIfExists {
 
 $script:ProxyUrl = $null
 $script:ProxyResolved = $false
-$script:OfficialSkip = $false
-$script:OfficialSkipNotified = $false
 $script:OfficialMinBytes = 1MB
 $script:OfficialMinRateBps = 128KB
 $script:PrivateProbeTimeoutSec = 2
@@ -288,6 +286,7 @@ function Get-OrderedManifestUrls {
     if ($candidates -contains $LastGood -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
     foreach ($u in $candidates) { & $add $u }
     if (-not [string]::IsNullOrWhiteSpace($LastGood) -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
+    foreach ($u in @($Urls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $add $u }
     return @($out)
 }
 
@@ -365,6 +364,8 @@ function New-DirectHttpRequest {
     } else {
         $request.Proxy = $null
     }
+    # PowerShell 5.1 同源默认仅 2 条连接；连接上限须覆盖最多 8 个下载 worker，避免排队耗尽请求超时。
+    $request.ServicePoint.ConnectionLimit = [Math]::Max(8, $request.ServicePoint.ConnectionLimit)
     $request.Timeout = [Math]::Max(1000, $TimeoutSec * 1000)
     $request.ReadWriteTimeout = [Math]::Max(1000, $TimeoutSec * 1000)
     $request.KeepAlive = $false
@@ -400,21 +401,16 @@ function Test-OfficialHttpsUrl {
 
 function Get-OfficialFileUrls {
     param($File)
-    $out = New-Object System.Collections.Generic.List[string]
+    $urls = New-Object 'System.Collections.Generic.List[string]'
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $candidates = New-Object System.Collections.Generic.List[string]
-    if ($File -and $File.PSObject.Properties['url'] -and -not [string]::IsNullOrWhiteSpace([string]$File.url)) {
-        [void]$candidates.Add(([string]$File.url).Trim())
+    $raw = @()
+    if ($File -and $File.PSObject.Properties['downloads']) { $raw += @($File.downloads) }
+    if ($File -and $File.PSObject.Properties['url']) { $raw += [string]$File.url }
+    foreach ($value in $raw) {
+        $url = ([string]$value).Trim()
+        if ((Test-OfficialHttpsUrl $url) -and $seen.Add($url)) { [void]$urls.Add($url) }
     }
-    if ($File -and $File.PSObject.Properties['downloads']) {
-        foreach ($u in @($File.downloads)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$u)) { [void]$candidates.Add(([string]$u).Trim()) }
-        }
-    }
-    foreach ($u in $candidates) {
-        if ((Test-OfficialHttpsUrl $u) -and $seen.Add($u)) { [void]$out.Add($u) }
-    }
-    return @($out)
+    return @($urls.ToArray())
 }
 
 function Read-UrlUtf8Text {
@@ -523,6 +519,56 @@ function Save-UrlToFile {
         if ($response) { $response.Dispose() }
     }
 }
+function Install-VerifiedFile {
+    param([string]$Temporary,[string]$Destination)
+    # Temp is on the destination volume. Never delete the old file to make room.
+    if ([IO.Directory]::Exists($Destination)) { throw '更新目标是目录，请检查客户端文件路径。' }
+    $oldAttributes = $null
+    if ([IO.File]::Exists($Destination)) {
+        $oldAttributes = [IO.File]::GetAttributes($Destination)
+        if ($oldAttributes -band [IO.FileAttributes]::ReparsePoint) { throw '拒绝替换链接目标。' }
+    }
+    try {
+        if ($null -ne $oldAttributes -and ($oldAttributes -band [IO.FileAttributes]::ReadOnly)) {
+            [IO.File]::SetAttributes($Destination, ($oldAttributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+        }
+        for ($attempt=0; $attempt -lt 3; $attempt++) {
+            try {
+                if ([IO.File]::Exists($Destination)) { [IO.File]::Replace($Temporary,$Destination,[System.Management.Automation.Language.NullString]::Value) }
+                else { [IO.File]::Move($Temporary,$Destination) }
+                return
+            } catch { if ($attempt -eq 2) { throw }; Start-Sleep -Milliseconds 250 }
+        }
+    } catch {
+        if ($null -ne $oldAttributes -and [IO.File]::Exists($Destination)) { [IO.File]::SetAttributes($Destination,$oldAttributes) }
+        throw ('文件替换失败，旧文件已保留。请完全退出 Minecraft、关闭占用该资源包的程序后重试。' + $_.Exception.Message)
+    }
+}
+
+
+function Get-BusyRetryDelay {
+    # Returns @{Status; Seconds} for HTTP 429/500/502/503/504, otherwise $null.
+    param($ErrorRecord, [int]$Attempt)
+    if ($Attempt -ge 5) { return $null }
+    $ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    $response = $null
+    while ($null -ne $ex) {
+        if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) { $response = $ex.Response; break }
+        $ex = $ex.InnerException
+    }
+    if ($null -eq $response) { return $null }
+    $status = 0
+    try { $status = [int]$response.StatusCode } catch { return $null }
+    if ($status -notin @(429, 500, 502, 503, 504)) { return $null }
+    $seconds = [Math]::Min(30.0, 1.5 * [Math]::Pow(2, $Attempt))
+    try {
+        $retryAfter = [string]$response.Headers['Retry-After']
+        if ($retryAfter -match '^\s*\d+\s*$') { $seconds = [Math]::Min(30.0, [Math]::Max($seconds, [double]$retryAfter)) }
+    } catch {}
+    $seconds += (Get-Random -Minimum 0.0 -Maximum ($seconds * 0.25))
+    return [pscustomobject]@{ Status = $status; Seconds = $seconds }
+}
+
 function Download-ManifestFile {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -532,17 +578,27 @@ function Download-ManifestFile {
         [int]$TimeoutSec = 60,
         [int]$Retries = 1,
         [int]$MinBytesAfterTimeout = 0,
-        [int]$MinRateBps = 0
+        [int]$MinRateBps = 0,
+        [switch]$NoBackoff
     )
     New-Item -ItemType Directory -Force (Split-Path -Parent $Destination) | Out-Null
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("portable-sync-" + [System.Guid]::NewGuid().ToString('N') + ".tmp")
+    $tmp = Join-Path (Split-Path -Parent $Destination) (".portable-sync-" + [System.Guid]::NewGuid().ToString('N') + ".tmp")
     try {
         $attempt = 0
+        $busyAttempt = 0
         while ($true) {
             try {
                 Save-UrlToFile -Url $Url -Path $tmp -TimeoutSec $TimeoutSec -AllowProxy:$AllowProxy -MinBytesAfterTimeout $MinBytesAfterTimeout -MinRateBps $MinRateBps
                 break
             } catch {
+                # BUSY_BACKOFF_V1: 429/5xx means "busy", not "broken"; wait and retry.
+                $busyDelay = if ($NoBackoff) { $null } else { Get-BusyRetryDelay -ErrorRecord $_ -Attempt $busyAttempt }
+                if ($null -ne $busyDelay) {
+                    $busyAttempt++
+                    Write-Host ("[同步] 更新服务繁忙（HTTP {0}），{1:N1} 秒后重试：{2}" -f $busyDelay.Status, $busyDelay.Seconds, (Get-MaskedUrl $Url))
+                    Start-Sleep -Milliseconds ([int]($busyDelay.Seconds * 1000))
+                    continue
+                }
                 $attempt++
                 if ($attempt -gt $Retries) { throw }
                 Start-Sleep -Seconds 2
@@ -550,38 +606,91 @@ function Download-ManifestFile {
         }
         $actual = Get-Sha1 -Path $tmp
         if ($actual -ne $ExpectedSha1.ToLowerInvariant()) { throw "SHA1 mismatch for $(Get-MaskedUrl $Url). expected=$ExpectedSha1 actual=$actual" }
-        Move-Item -LiteralPath $tmp -Destination $Destination -Force
+        Install-VerifiedFile -Temporary $tmp -Destination $Destination
     } finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force }
     }
 }
 
-function Set-OfficialSkip {
-    $script:OfficialSkip = $true
-    if (-not $script:OfficialSkipNotified) {
-        $script:OfficialSkipNotified = $true
-        Write-Host '[同步] 官方源本轮不再尝试，其余文件直接走更新服务。'
+# HYBRID_DOWNLOAD_V1: alternate manifests are byte sources, never policy overrides.
+function Initialize-HybridSources {
+    if ($null -ne $script:HybridSources) { return }
+    $script:HybridSources = @()
+    $reference = @{}
+    foreach ($r in $script:HybridManifest.files) { $reference[[string]$r.path] = ([string]$r.sha1).ToLowerInvariant() + ':' + [string]$r.size }
+    $seen = @{}
+    foreach ($url in (@($script:HybridManifestUrl) + @($script:HybridManifest.mirrorManifestUrls | Select-Object -First 3))) {
+        if ($seen.ContainsKey([string]$url)) { continue }; $seen[[string]$url] = $true
+        try {
+            $uri = [Uri]$url
+            if ($uri.Scheme -notin @('http','https') -or -not $uri.Host -or $uri.UserInfo -or $uri.Fragment) { continue }
+            $m = if ($url -eq $script:HybridManifestUrl) { $script:HybridManifest } else { (Read-UrlUtf8Text -Url $url -TimeoutSec 4 -Retries 0) | ConvertFrom-Json }
+            if ([string]$m.packId -cne [string]$script:HybridManifest.packId -or [string]$m.version -cne [string]$script:HybridManifest.version -or @($m.files).Count -ne $reference.Count) { throw 'Different mirror release' }
+            $rows = @{}
+            foreach ($r in $m.files) {
+                $rel = [string]$r.path
+                if ($rows.ContainsKey($rel) -or -not $reference.ContainsKey($rel) -or $reference[$rel] -cne (([string]$r.sha1).ToLowerInvariant() + ':' + [string]$r.size)) { throw 'Different mirror inventory' }
+                $rows[$rel] = $r
+            }
+            $source = [pscustomobject]@{ Base = $url.Substring(0,$url.LastIndexOf('/')+1); Rows = $rows; Score = 0.0; Failed = $false }
+            $sample = $m.files | Sort-Object { [int64]$_.size } -Descending | Select-Object -First 1
+            $request = $null; $response = $null; $stream = $null
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $request = New-DirectHttpRequest -Url (Get-HybridFileUrl $source ([string]$sample.path)) -TimeoutSec 3
+                $request.AddRange(0,131071)
+                $response = $request.GetResponse(); $stream = $response.GetResponseStream()
+                $buf = New-Object byte[] 131072; $got = 0
+                while ($got -lt $buf.Length) { $n=$stream.Read($buf,$got,$buf.Length-$got); if ($n -le 0) { break }; $got += $n; if ($sw.Elapsed.TotalSeconds -ge 3) { break } }
+                $source.Score = $got / [Math]::Max($sw.Elapsed.TotalSeconds,0.001)
+            } catch {} finally { if ($stream) { $stream.Dispose() }; if ($response) { $response.Dispose() }; if ($request) { $request.Abort() } }
+            $script:HybridSources += $source
+        } catch { Write-Host '[混合源] 已忽略不可用或文件清单不一致的备用源。' }
     }
+    $script:HybridSources = @($script:HybridSources | Sort-Object Score -Descending)
+    if ($script:HybridSources.Count) { Write-Host ('[混合源] 本机采样优先选择 ' + ([Uri]$script:HybridSources[0].Base).Host + '；失败或持续低速会自动换源。') }
 }
+function Get-HybridFileUrl {
+    param($Source,[string]$Rel)
+    $row = $Source.Rows[$Rel]; $remote = $Rel
+    if ($row.PSObject.Properties['downloadPath']) { $remote = [string]$row.downloadPath }
+    if ($remote -cne $Rel -and $remote -cnotmatch '^blobs/[0-9a-f]{64}$') { throw 'Invalid mirror downloadPath' }
+    return Join-UrlPath -BaseUrl $Source.Base -Rel $remote
+}
+function Download-HybridEntry {
+    param($File,[string]$Destination,[string]$ExpectedSha1,[string]$Rel)
+    Initialize-HybridSources
+    $last = $null
+    foreach ($source in $script:HybridSources) {
+        if ($source.Failed) { continue }
+        try {
+            $rate = if ($script:HybridSources.Count -gt 1) { 65536 } else { 0 }
+            Download-ManifestFile -Url (Get-HybridFileUrl $source $Rel) -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 180 -Retries 0 -MinRateBps $rate
+            return 'home'
+        } catch { $last = $_; Write-Host '[混合源] 下载失败、低速或校验不符，正在切换备用源。' }
+    }
+    if ($last) { throw $last }
+    throw '本轮所有更新源均不可用，请稍后重试。'
+}
+
 
 function Download-ManifestEntry {
     param($File, [Parameter(Mandatory = $true)][string]$BaseUrl, [Parameter(Mandatory = $true)][string]$Destination, [Parameter(Mandatory = $true)][string]$ExpectedSha1, [Parameter(Mandatory = $true)][string]$Rel)
-    # 官方源：有系统代理就走代理；8 秒内字节太少或失败立刻回落家宽。
-    # 家宽始终直连。本轮官方失败一次后不再试，避免每个文件白等 8 秒。
-    $urls = @()
-    if (-not $script:OfficialSkip) { $urls = @(Get-OfficialFileUrls $File) }
-    foreach ($url in $urls) {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $useProxy = Test-ShouldUseProxyForOfficial $url
-        try {
-            Download-ManifestFile -Url $url -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 8 -Retries 0 -AllowProxy:$useProxy -MinBytesAfterTimeout $script:OfficialMinBytes -MinRateBps $script:OfficialMinRateBps
-            return 'official'
-        } catch {
-            Write-Host ("[同步] 官方源不可用（{0:N1}s，{1}），改走更新服务：{2}" -f $sw.Elapsed.TotalSeconds, (Get-DownloadFailReason $_.Exception), $Rel)
-            Set-OfficialSkip
-            break
+    # Downloads are hash-matched at publication and verified again before install.
+    # Failure of one URL must not disable CurseForge or Modrinth for other files.
+    foreach ($url in @(Get-OfficialFileUrls $File)) {
+        $attempts = @($false)
+        if (Test-ShouldUseProxyForOfficial $url) { $attempts += $true }
+        foreach ($useProxy in $attempts) {
+            try {
+                Download-ManifestFile -Url $url -Destination $Destination -ExpectedSha1 $ExpectedSha1 -TimeoutSec 8 -Retries 0 -AllowProxy:$useProxy -NoBackoff -MinBytesAfterTimeout $script:OfficialMinBytes -MinRateBps $script:OfficialMinRateBps
+                return 'official'
+            } catch {
+                Write-Host ("[同步] {0} 不可用（{1}），继续尝试下一下载源：{2}" -f ([Uri]$url).Host, (Get-DownloadFailReason $_.Exception), $Rel)
+            }
         }
     }
+    if ($script:HybridManifest) { return Download-HybridEntry -File $File -Destination $Destination -ExpectedSha1 $ExpectedSha1 -Rel $Rel }
     $homeTimeout = 180
     try {
         if ($File -and $File.PSObject.Properties['size'] -and [int64]$File.size -gt 0) {
@@ -879,6 +988,129 @@ function Get-MinecraftHomeForInstance {
     return $null
 }
 
+function Ensure-NeoForgeClientExtra {
+    param([string]$Root, $Manifest, [string]$BackupRoot)
+    # 仅把当前实例已经安装的纯资源 client-extra 加到 classpath，供 CSL 读取 version.json。
+    $loader = Get-PropertyValue -Object $Manifest -Name 'loader' -Default $null
+    if (([string](Get-PropertyValue -Object $loader -Name 'type' -Default '')).Trim() -ine 'neoforge') { return $false }
+    try {
+        $launcherHome = Get-MinecraftHomeForInstance -Root $Root
+        if (-not $launcherHome) { throw '当前目录不是 .minecraft/versions/<实例>，无法定位客户端库' }
+        $mc = ([string](Get-PropertyValue -Object $Manifest -Name 'minecraftVersion' -Default '')).Trim()
+        if ($mc -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw '清单缺少有效 Minecraft 版本' }
+        $preferred = Join-Path $Root ((Split-Path -Leaf $Root) + '.json')
+        $paths = if (Test-Path -LiteralPath $preferred -PathType Leaf) { @((Get-Item -LiteralPath $preferred)) } else { @(Get-ChildItem -LiteralPath $Root -File -Filter '*.json' | Sort-Object Name) }
+        $candidates = @()
+        foreach ($file in $paths) {
+            try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+            $id = Get-PropertyValue -Object $data -Name 'id' -Default $null
+            if ($id -is [string] -and $id -and ((Get-PropertyValue -Object $data -Name 'mainClass' -Default '') -or (Get-PropertyValue -Object $data -Name 'inheritsFrom' -Default ''))) {
+                $candidates += @{ Path = $file.FullName; Name = $file.Name; Data = $data }
+            }
+        }
+        if ($candidates.Count -ne 1) { throw '找不到唯一的当前实例版本 JSON' }
+        $selected = $candidates[0]
+        $data = $selected.Data
+        $libraries = @()
+        if ($data.PSObject.Properties['libraries']) { $libraries = $data.libraries }
+        if ($null -eq $libraries -or $libraries -isnot [System.Array]) { throw '当前实例 libraries 格式不适用' }
+        $arguments = Get-PropertyValue -Object $data -Name 'arguments' -Default $null
+        $gameArgs = @()
+        if ($arguments -and $arguments.PSObject.Properties['game']) { $gameArgs = $arguments.game }
+        if ($null -eq $gameArgs -or $gameArgs -isnot [System.Array]) { throw '当前实例游戏参数格式不适用' }
+        $values = @{}
+        for ($i = 0; $i -lt ($gameArgs.Count - 1); $i++) {
+            if ($gameArgs[$i] -is [string] -and $gameArgs[$i + 1] -is [string] -and $gameArgs[$i] -in @('--fml.neoForgeVersion', '--fml.mcVersion', '--fml.neoFormVersion', '--fml.mcpVersion')) {
+                if (-not $values.ContainsKey($gameArgs[$i])) { $values[$gameArgs[$i]] = $gameArgs[$i + 1] }
+            }
+        }
+        $hasNeoForge = -not [string]::IsNullOrWhiteSpace([string]$values['--fml.neoForgeVersion'])
+        foreach ($library in $libraries) {
+            if ([string](Get-PropertyValue -Object $library -Name 'name' -Default '') -clike 'net.neoforged:neoforge:*') { $hasNeoForge = $true }
+        }
+        if (-not $hasNeoForge) { throw '当前实例版本 JSON 没有 NeoForge 标记，已跳过' }
+        $declaredMc = [string]$values['--fml.mcVersion']
+        $parentVersion = [string](Get-PropertyValue -Object $data -Name 'inheritsFrom' -Default '')
+        if (($declaredMc -and $declaredMc -cne $mc) -or ($parentVersion -match '^\d+\.\d+(?:\.\d+)?$' -and $parentVersion -cne $mc)) { throw '当前实例 Minecraft 版本与更新清单不一致' }
+        $neoform = [string]$values['--fml.neoFormVersion']
+        if (-not $neoform) { $neoform = [string]$values['--fml.mcpVersion'] }
+        if ($neoform -and $neoform -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw '当前实例 NeoForm 版本格式不适用' }
+        $minecraftDir = Join-Path $launcherHome '.minecraft'
+        $clientDir = Join-Path $minecraftDir 'libraries\net\minecraft\client'
+        $jars = @()
+        if ($neoform) {
+            $coordinateVersion = "$mc-$neoform"
+            $jarPath = Join-Path (Join-Path $clientDir $coordinateVersion) ("client-$coordinateVersion-extra.jar")
+            if (Test-Path -LiteralPath $jarPath -PathType Leaf) { $jars = @((Get-Item -LiteralPath $jarPath)) }
+        } elseif (Test-Path -LiteralPath $clientDir -PathType Container) {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $clientDir -Directory | Where-Object { $_.Name.StartsWith("$mc-", [StringComparison]::Ordinal) })) {
+                $jarPath = Join-Path $dir.FullName ("client-" + $dir.Name + '-extra.jar')
+                if (Test-Path -LiteralPath $jarPath -PathType Leaf) { $jars += Get-Item -LiteralPath $jarPath }
+            }
+        }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $valid = @()
+        $invalid = @()
+        foreach ($jar in $jars) {
+            $archive = $null
+            $reader = $null
+            try {
+                $archive = [IO.Compression.ZipFile]::OpenRead($jar.FullName)
+                if (@($archive.Entries | Where-Object { $_.FullName.EndsWith('.class', [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { $invalid += 'client-extra 包含 class，拒绝加入普通 classpath'; continue }
+                $entries = @($archive.Entries | Where-Object { $_.FullName -ceq 'version.json' })
+                if ($entries.Count -ne 1) { $invalid += 'client-extra 缺少唯一 version.json'; continue }
+                $reader = New-Object IO.StreamReader($entries[0].Open())
+                $metadata = $reader.ReadToEnd() | ConvertFrom-Json
+                if ([string](Get-PropertyValue -Object $metadata -Name 'id' -Default '') -cne $mc) { $invalid += 'client-extra 内 Minecraft 版本与更新清单不一致'; continue }
+                $valid += $jar
+            } catch { $invalid += 'client-extra 无法读取' } finally {
+                if ($reader) { $reader.Dispose() }
+                if ($archive) { $archive.Dispose() }
+            }
+        }
+        if ($valid.Count -ne 1) {
+            if ($valid.Count -gt 1) { throw '同一 Minecraft 版本存在多个 client-extra，且实例未指定 NeoForm 版本' }
+            if ($invalid.Count -gt 0) { throw $invalid[0] }
+            throw '缺少当前实例已安装的 client-extra.jar，请先用启动器补全游戏库后重新更新'
+        }
+        $jar = $valid[0]
+        $coordinateVersion = $jar.Directory.Name
+        $name = "net.minecraft:client:${coordinateVersion}:extra"
+        $relative = "net/minecraft/client/$coordinateVersion/client-$coordinateVersion-extra.jar"
+        foreach ($library in $libraries) {
+            $existing = [string](Get-PropertyValue -Object $library -Name 'name' -Default '')
+            if ($existing -ceq $name) {
+                $downloads = Get-PropertyValue -Object $library -Name 'downloads' -Default $null
+                $artifact = Get-PropertyValue -Object $downloads -Name 'artifact' -Default $null
+                $ordinary = ($null -eq $downloads) -or ($null -ne $artifact -and ([string](Get-PropertyValue -Object $artifact -Name 'path' -Default $relative) -ceq $relative))
+                if ($ordinary -and -not (Get-PropertyValue -Object $library -Name 'rules' -Default $null) -and -not (Get-PropertyValue -Object $library -Name 'natives' -Default $null) -and -not (Get-PropertyValue -Object $library -Name 'extract' -Default $null)) {
+                    Write-Host '[启动修复] 当前实例已包含 client-extra 普通库，无需修改。'
+                    return $false
+                }
+                throw 'client-extra 已有特殊规则或分类器配置，请检查启动器版本配置'
+            }
+            if ($existing -clike 'net.minecraft:client:*:extra') { throw '当前实例已声明其他 client-extra 版本，未覆盖玩家配置' }
+        }
+        $entry = [ordered]@{ name = $name; downloads = [ordered]@{ artifact = [ordered]@{ path = $relative; sha1 = (Get-Sha1 -Path $jar.FullName); size = $jar.Length } } }
+        $data | Add-Member -NotePropertyName 'libraries' -NotePropertyValue (@($libraries) + @($entry)) -Force
+        $encoded = ($data | ConvertTo-Json -Depth 100) + "`r`n"
+        Backup-FileIfExists -Path $selected.Path -Rel $selected.Name -BackupRoot $BackupRoot
+        $temporary = $selected.Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        try {
+            Write-Utf8NoBom -Path $temporary -Value $encoded
+            [IO.File]::Replace($temporary, $selected.Path, [System.Management.Automation.Language.NullString]::Value)
+        } finally {
+            if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+        }
+        Write-Host '[启动修复] 已补齐当前实例 client-extra 资源库。请完全退出游戏并重新打开启动器，再启动游戏。'
+        return $true
+    } catch {
+        Write-Host ("[启动修复未完成] {0}；当前实例版本 JSON 未改。" -f $_.Exception.Message) -ForegroundColor Yellow
+        return $false
+    }
+}
+
+
 function Write-PclGlobalConfig {
     param([string]$PclHome, [string]$MinecraftDirValue, [string]$InstanceName, [string]$BackupRoot)
     # 温和写入：PCL.ini 缺失才创建；Setup.ini 只维护 LaunchFolderSelect 一行，
@@ -1162,13 +1394,9 @@ if ([string]::IsNullOrWhiteSpace($ManifestUrl)) {
 Write-Host ("[同步] 清单候选：" + (($manifestUrls | ForEach-Object { Get-MaskedUrl $_ }) -join '；'))
 $detectedProxy = Get-SystemProxyUrl
 if ($detectedProxy) {
-    Write-Host ("[同步] 已检测到系统代理 {0}，官方源走代理；家宽更新服务始终直连。" -f (Get-ProxyDescription $detectedProxy))
+    Write-Host ("[同步] 已检测到系统代理 {0}，官方源先直连，受阻后可使用现有代理；更新服务直连。" -f (Get-ProxyDescription $detectedProxy))
 } else {
     Write-Host '[同步] 未检测到系统代理，官方源直连（太慢会在约 8 秒内回落更新服务）。'
-    if ($state -and [bool](Get-PropertyValue -Object $state -Name 'skipOfficial' -Default $false)) {
-        Set-OfficialSkip
-        Write-Host '[同步] 上次官方源偏慢，本轮直接走更新服务。检测到代理后会再试官方源。'
-    }
 }
 $manifest = $null
 $manifestText = $null
@@ -1219,6 +1447,9 @@ if (-not $manifest.files) { throw 'manifest 缺少 files。' }
 $slash = $manifestUrl.LastIndexOf('/')
 if ($slash -lt 0) { throw "manifest URL 格式异常：$manifestUrl" }
 $baseUrl = $manifestUrl.Substring(0, $slash + 1)
+$script:HybridManifest = $null
+$script:HybridSources = $null
+if ($manifest.PSObject.Properties['mirrorManifestUrls'] -and @($manifest.mirrorManifestUrls).Count) { $script:HybridManifest = $manifest; $script:HybridManifestUrl = $manifestUrl }
 $script:InitialSync = -not $state -or -not (Get-PropertyValue -Object $state -Name 'files' -Default $null)
 $previousVersion = [string](Get-PropertyValue -Object $state -Name 'version' -Default '')
 $currentVersion = [string](Get-PropertyValue -Object $manifest -Name 'version' -Default '')
@@ -1281,6 +1512,7 @@ $script:PreservedDeletionKeys = New-Object 'System.Collections.Generic.HashSet[s
 # 保留了玩家修改、但服务端同一文件本次其实也有更新的清单：结尾集中提醒一次。
 $script:PreservedConflicts = New-Object 'System.Collections.Generic.List[string]'
 
+$downloadJobs = New-Object 'System.Collections.Generic.List[object]'
 foreach ($file in @($manifest.files)) {
     $rel = Normalize-Rel ([string]$file.path)
     $relKey = Normalize-RelKey $rel
@@ -1351,21 +1583,75 @@ foreach ($file in @($manifest.files)) {
         }
     }
     if ($exists) { Backup-FileIfExists -Path $target -Rel $rel -BackupRoot $backupRoot }
+    [void]$downloadJobs.Add([pscustomobject]@{ File=$file; Target=$target; Expected=$expected; Rel=$rel; Key=$relKey; Force=$forceSync })
+}
+
+if ($downloadJobs.Count) {
+    $workers = [Math]::Max(1, [Math]::Min(8, [int](Get-PropertyValue -Object $manifest -Name 'downloadWorkers' -Default 4)))
+    $workers = [Math]::Min($workers, $downloadJobs.Count)
+    Write-Host ("[同步] 需要更新 {0} 个文件（并行 {1}）。" -f $downloadJobs.Count, $workers)
+    # Native runspaces also work in Windows PowerShell 5.1; no Python install needed.
+    $ast = [Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+    $defs = $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]}, $false)
+    $workerCode = ($defs | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $workerCode += @'
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$script:ProxyResolved = $false
+$script:ProxyUrl = $null
+$script:OfficialMinBytes = 1MB
+$script:OfficialMinRateBps = 128KB
+$script:HybridManifest = $null
+$script:HybridSources = $null
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
+try {
+    $script:HybridManifest = $args[2]
+    $script:HybridManifestUrl = $args[3]
+    $job = $args[0]
+    $source = Download-ManifestEntry -File $job.File -BaseUrl $args[1] -Destination $job.Target -ExpectedSha1 $job.Expected -Rel $job.Rel
+    [pscustomobject]@{ Job=$job; Source=$source; Record=(Get-FileVerifyRecord -Path $job.Target -Sha1 $job.Expected); Error=$null }
+} catch { [pscustomobject]@{ Job=$args[0]; Source=$null; Record=$null; Error=$_.Exception.Message } }
+'@
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, $workers)
+    $pool.Open()
+    $pending = New-Object 'System.Collections.Generic.List[object]'
+    $next = 0
+    $hardError = $null
     try {
-        $source = Download-ManifestEntry -File $file -BaseUrl $baseUrl -Destination $target -ExpectedSha1 $expected -Rel $rel
-        $verified[$relKey] = Get-FileVerifyRecord -Path $target -Sha1 $expected
-        if ($source -eq 'official') { Write-Host "[官方源] $rel" } else { Write-Host "[更新] $rel" }
-        $downloaded++
-        [void]$updatedPaths.Add($rel)
-        if ($forceSync) { [void]$forcedAppliedPaths.Add($rel) }
-    } catch {
-        if (Test-OptionalHelperFile -Rel $rel) {
-            Write-SyncWarning "辅助脚本未更新：$rel；$($_.Exception.Message)"
-            $preserved++
-            continue
+        while ($next -lt $downloadJobs.Count -or $pending.Count) {
+            while ($next -lt $downloadJobs.Count -and $pending.Count -lt $workers) {
+                $ps = [PowerShell]::Create()
+                $ps.RunspacePool = $pool
+                [void]$ps.AddScript($workerCode).AddArgument($downloadJobs[$next]).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl)
+                [void]$pending.Add([pscustomobject]@{ Shell=$ps; Handle=$ps.BeginInvoke(); Job=$downloadJobs[$next] })
+                $next++
+            }
+            foreach ($task in @($pending.ToArray())) {
+                if (-not $task.Handle.IsCompleted) { continue }
+                try {
+                    $results = @($task.Shell.EndInvoke($task.Handle))
+                    $result = $results | Where-Object { $_.PSObject.Properties['Record'] } | Select-Object -Last 1
+                    if (-not $result) { throw '下载任务未返回结果。' }
+                    $job = $task.Job
+                    if ($result.Error) { throw $result.Error }
+                    $verified[$job.Key] = $result.Record
+                    $downloaded++
+                    [void]$updatedPaths.Add($job.Rel)
+                    if ($job.Force) { [void]$forcedAppliedPaths.Add($job.Rel) }
+                    $label = if ($result.Source -eq 'official') { '[官方源]' } else { '[更新]' }
+                    Write-Host "$label $($job.Rel)"
+                } catch {
+                    if (Test-OptionalHelperFile -Rel $task.Job.Rel) {
+                        Write-SyncWarning "辅助脚本未更新：$($task.Job.Rel)"
+                        $preserved++
+                    } elseif (-not $hardError) { $hardError = "文件下载失败：$($task.Job.Rel)；$($_.Exception.Message)" }
+                } finally { $task.Shell.Dispose(); [void]$pending.Remove($task) }
+            }
+            if ($pending.Count) { Start-Sleep -Milliseconds 100 }
         }
-        throw
-    }
+    } finally { foreach ($task in $pending) { $task.Shell.Dispose() }; $pool.Dispose() }
+    if ($hardError) { throw $hardError }
 }
 
 foreach ($oldKey in @($previousMap.Keys)) {
@@ -1428,6 +1714,7 @@ if ($requiredPackChanges -gt 0) {
 }
 Apply-ServerList -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
 Apply-LauncherProfile -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
+[void](Ensure-NeoForgeClientExtra -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot)
 Show-LauncherHints -Root $instanceRoot
 if ([bool](Get-PropertyValue -Object $cleanup -Name 'removeConnectorCache' -Default $true)) { Remove-ConnectorRuntimeCache -Root $instanceRoot }
 if ([bool](Get-PropertyValue -Object $cleanup -Name 'disableDuplicateMods' -Default $true)) {
@@ -1462,7 +1749,7 @@ $stateOut = [ordered]@{
     version = Get-PropertyValue -Object $manifest -Name 'version' -Default ''
     manifestUrl = $manifestUrl
     lastManifestUrl = $manifestUrl
-    skipOfficial = [bool]($script:OfficialSkip -and -not $detectedProxy)
+    skipOfficial = $false
     syncedAt = (Get-Date).ToString('s')
     files = $manifest.files
     verified = $verifiedOut

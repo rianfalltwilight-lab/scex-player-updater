@@ -337,9 +337,24 @@ def copy_response(resp, out, timeout: int, min_bytes_after_timeout: int = 0, min
         next_check = elapsed + max(1.0, float(timeout))
 
 
+def install_verified_file(temporary, destination):
+    # Same-volume atomic replacement; never unlink the previous file first.
+    if destination.is_symlink():
+        raise OSError('Refusing to replace a symlink')
+    old_mode = destination.stat().st_mode if destination.is_file() else None
+    try:
+        if os.name == 'nt' and old_mode is not None:
+            destination.chmod(old_mode | 0o200)
+        os.replace(temporary, destination)
+    except OSError:
+        if old_mode is not None and destination.is_file():
+            destination.chmod(old_mode)
+        raise
+
+
 def download_verify(url: str, dest: pathlib.Path, expected: str, opener=None, timeout=120, min_bytes_after_timeout=0, min_rate_bps=0):
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="portable-stage-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(prefix=".portable-stage-", suffix=".tmp", dir=dest.parent)
     os.close(fd)
     tmp = pathlib.Path(tmp_name)
     opener = opener or _DIRECT_OPENER
@@ -350,7 +365,7 @@ def download_verify(url: str, dest: pathlib.Path, expected: str, opener=None, ti
         actual = sha1(tmp)
         if actual != expected.lower():
             raise RuntimeError(f"SHA1 mismatch expected={expected} actual={actual}")
-        shutil.move(str(tmp), dest)
+        install_verified_file(tmp, dest)
     finally:
         if tmp.exists():
             tmp.unlink()

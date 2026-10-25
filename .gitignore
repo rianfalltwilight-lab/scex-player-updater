@@ -1,5 +1,7 @@
 /tools/portable-pack.json
 /tools/cloud.local.json
+/tools/cache/
+/tools/curseforge-api-key.txt
 /.update-server-token
 *.pem
 *.key
