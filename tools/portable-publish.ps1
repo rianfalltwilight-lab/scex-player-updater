@@ -47,6 +47,37 @@ function Get-PlayerGuideText {
     return ($lines -join "`r`n") + "`r`n"
 }
 
+function New-ManifestSignature {
+    # MANIFEST_SIGNATURE_V1: detached signature file for server-manifest.json. The result is
+    # checked with the updater's own verifier, so a key the players do not trust never ships.
+    param([byte[]]$Data, [string]$KeyXml)
+    $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $rsa.PersistKeyInCsp = $false
+        $rsa.FromXmlString($KeyXml)
+        if ($rsa.PublicOnly) { throw '[发布] 签名私钥文件里只有公钥。' }
+        $keyId = ([BitConverter]::ToString($sha.ComputeHash($rsa.ExportParameters($false).Modulus))).Replace('-', '').ToLowerInvariant().Substring(0, 16)
+        $manifestSha = ([BitConverter]::ToString($sha.ComputeHash($Data))).Replace('-', '').ToLowerInvariant()
+        $signature = $rsa.SignData($Data, 'SHA256')
+    } finally { $rsa.Dispose(); $sha.Dispose() }
+    $text = ([ordered]@{ format = 'scex-manifest-signature/1'; algorithm = 'RSA-PKCS1-v1_5-SHA256'; keyId = $keyId
+        manifestSha256 = $manifestSha; signature = [Convert]::ToBase64String($signature) } | ConvertTo-Json) + "`n"
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($text)
+    if (-not $script:TrustVerifierLoaded) {
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'player-update-generic.ps1'), [ref]$null, [ref]$null)
+        $keys = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:TrustedManifestKeys' }, $false)
+        $verifier = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-ManifestSignature' }, $false)
+        if (-not $keys -or -not $verifier) { throw '[发布] tools\player-update-generic.ps1 缺少清单签名校验代码（MANIFEST_SIGNATURE_V1）。' }
+        Invoke-Expression $keys.Extent.Text
+        Invoke-Expression ($verifier.Extent.Text -replace '^function\s+', 'function script:')
+        $script:TrustVerifierLoaded = $true
+    }
+    try { [void](Test-ManifestSignature -Data $Data -SignatureFile $bytes) }
+    catch { throw "[发布] 签名私钥与更新器内置的公钥不匹配（密钥 $keyId）：$($_.Exception.Message)" }
+    return ,$bytes
+}
+
 function Resolve-InRoot {
     param([Parameter(Mandatory = $true)][string]$Path)
     $full = Resolve-AnyPath -Path $Path
@@ -580,6 +611,16 @@ if ($Preview) {
     exit 0
 }
 
+# MANIFEST_SIGNATURE_V1: every manifest is signed. Player updaters that have verified a signed
+# manifest refuse unsigned ones, so publishing stops here, before any change, without the key.
+$signingKeyFile = [string](Get-ConfigValue -Object $config.update -Name 'signingKeyFile' -Default '.update-signing-key.xml')
+$signingKeyPath = Resolve-AnyPath -Path $signingKeyFile
+if (-not (Test-Path -LiteralPath $signingKeyPath -PathType Leaf)) {
+    throw "[发布] 找不到清单签名私钥：$signingKeyFile。已升级的玩家只接受签名清单，没有私钥发布会让他们无法更新；已停止发布，发布目录没有改动。"
+}
+$signingKeyXml = [IO.File]::ReadAllText($signingKeyPath)
+[void](New-ManifestSignature -Data ([Text.Encoding]::UTF8.GetBytes('signing-key-check')) -KeyXml $signingKeyXml)
+
 New-Item -ItemType Directory -Force $publishDir | Out-Null
 $script:CopiedFiles = 0
 foreach ($rootName in $includeRoots) {
@@ -658,7 +699,7 @@ $serverAddress = [string](Get-ConfigValue -Object $config.server -Name 'address'
 $base = $publishDir.TrimEnd('\', '/')
 
 # 每次发布都重新生成的元文件也算"本次应有"，其余未登记的文件即上一版遗留，统一清理。
-foreach ($meta in @('_updater/UPDATE-URL.txt', '_updater/PORTABLE-UPDATE-URL.txt', '使用说明.txt', 'server-manifest.json', 'update-log.txt')) {
+foreach ($meta in @('_updater/UPDATE-URL.txt', '_updater/PORTABLE-UPDATE-URL.txt', '使用说明.txt', 'server-manifest.json', 'server-manifest.json.sig', 'update-log.txt')) {
     Register-PublishedRel -Rel $meta
 }
 if ($lanManifestUrl) { Register-PublishedRel -Rel '_updater/UPDATE-URL-LAN.txt' }
@@ -688,7 +729,7 @@ Get-ChildItem -LiteralPath $publishDir -Recurse -File -Force | Sort-Object FullN
     if (-not $script:DesiredRelKeys.Contains($rel)) { return }
     # server-manifest.json / update-log.txt 在清单生成之后才写入，不能进清单，
     # 否则增量发布时旧内容的哈希会跟着进清单、随后又被覆盖，玩家端校验必失败。
-    if ($rel -in @('server-manifest.json', 'update-log.txt')) { return }
+    if ($rel -in @('server-manifest.json', 'server-manifest.json.sig', 'update-log.txt')) { return }
     # 清单必须以发布目录当前字节为准，不能复用复制阶段的源文件缓存哈希；
     # 否则发布后被其它流程改写的文件可能带着旧缓存进入清单。
     $hash = Get-FileSha1 -Path $_.FullName
@@ -768,6 +809,9 @@ $manifest = [ordered]@{
 }
 $manifestPath = Join-Path $publishDir 'server-manifest.json'
 $manifestNextPath = Join-Path $publishDir '.server-manifest.json.next'
+$signaturePath = Join-Path $publishDir 'server-manifest.json.sig'
+$signatureNextPath = Join-Path $publishDir '.server-manifest.json.sig.next'
+$oldSignatureBytes = if (Test-Path -LiteralPath $signaturePath -PathType Leaf) { [IO.File]::ReadAllBytes($signaturePath) } else { $null }
 $manifestText = (($manifest | ConvertTo-Json -Depth 10) + "`r`n")
 try {
     Write-Utf8NoBom -Path $manifestNextPath -Value $manifestText
@@ -782,17 +826,26 @@ try {
         $officialMatched = [int]$manifest.downloadSourceStatus.official_unique
     }
     Assert-PublishedManifestIntegrity -Manifest $manifest -PublishRoot $publishDir
+    # Sign the exact bytes players will download. Manifest first, then its signature: a reader
+    # that catches the moment in between sees a mismatch and fetches both again.
+    [IO.File]::WriteAllBytes($signatureNextPath, (New-ManifestSignature -Data ([IO.File]::ReadAllBytes($manifestNextPath)) -KeyXml $signingKeyXml))
     Copy-FileWithRetry -Source $manifestNextPath -Dest $manifestPath
     $writtenManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-PublishedManifestIntegrity -Manifest $writtenManifest -PublishRoot $publishDir
+    Copy-FileWithRetry -Source $signatureNextPath -Dest $signaturePath
+    $signedKeyId = Test-ManifestSignature -Data ([IO.File]::ReadAllBytes($manifestPath)) -SignatureFile ([IO.File]::ReadAllBytes($signaturePath))
 } catch {
     if ($oldManifestText -ne $null) {
         try { Write-Utf8NoBom -Path $manifestPath -Value $oldManifestText } catch { Write-Host "[便携] 警告：新清单失败且旧清单恢复失败：$($_.Exception.Message)" -ForegroundColor Red }
+        if ($null -ne $oldSignatureBytes) { try { [IO.File]::WriteAllBytes($signaturePath, $oldSignatureBytes) } catch { } }
     }
     throw
 } finally {
-    if (Test-Path -LiteralPath $manifestNextPath -PathType Leaf) { Remove-Item -LiteralPath $manifestNextPath -Force -ErrorAction SilentlyContinue }
+    foreach ($next in @($manifestNextPath, $signatureNextPath)) {
+        if (Test-Path -LiteralPath $next -PathType Leaf) { Remove-Item -LiteralPath $next -Force -ErrorAction SilentlyContinue }
+    }
 }
+Write-Host "[便携] 清单已签名（密钥 $signedKeyId）。复制发布结果到其他服务器时，server-manifest.json.sig 必须和清单一起复制。"
 Write-Host ("[便携] 官方源：命中 {0} / {1}。未命中的汉化/私有文件仍走自建更新服务。" -f $officialMatched, $officialEligible)
 Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n文件数量：$($files.Count)`r`n官方源命中：$officialMatched / $officialEligible`r`n"
 Write-Host "[便携] 已发布 $packName $Version"
@@ -820,6 +873,7 @@ if ($oldFiles.Count -gt 0) {
         '_updater/PORTABLE-UPDATE-URL.txt' = $true
         '_updater/UPDATE-URL-LAN.txt' = $true
         '使用说明.txt' = $true
+        'server-manifest.json.sig' = $true
     }
     $newFileMap = @{}
     foreach ($f in $files) {

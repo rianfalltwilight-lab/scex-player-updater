@@ -70,7 +70,7 @@ class PythonUpdaterTests(unittest.TestCase):
         opener.open.side_effect = fetch
         with mock.patch.object(sys, 'argv', ['updater', '--instance-dir', str(self.root),
                      '--manifest-url', 'http://127.0.0.1/secret/server-manifest.json']), \
-             mock.patch.object(self.u, 'fetch_bytes', return_value=json.dumps(manifest).encode()), \
+             mock.patch.object(self.u, 'fetch_trusted_manifest', return_value=(json.dumps(manifest).encode(), None)), \
              mock.patch.object(self.u, '_DIRECT_OPENER', opener), \
              mock.patch.object(self.u.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()), \
              contextlib.redirect_stderr(io.StringIO()):
@@ -252,7 +252,8 @@ class MacSelfRefreshTests(unittest.TestCase):
                 requested = [path for path, _ in web.requests]
             output = (result.stdout + result.stderr).decode('utf-8', errors='replace')
             self.assertEqual(result.returncode, 0, output)
-            self.assertEqual(requested, ['/m.json'], output)
+            # MANIFEST_SIGNATURE_V1: the manifest and its (absent) signature; no helper download.
+            self.assertEqual(requested, ['/m.json', '/m.json.sig'], output)
             self.assertIn('已是最新 player-update-generic.py', output)
 
 
@@ -367,7 +368,7 @@ Write-Output 'PS-OK'
             requested = [path for path, _ in web.requests]
         output = result.stdout.decode('utf-8-sig', errors='replace')
         self.assertEqual(result.returncode, 0, output)
-        self.assertEqual(requested, ['/m.json'], output)
+        self.assertEqual(requested, ['/m.json', '/m.json.sig'], output)
         self.assertIn('已是最新 player-update-generic.py', output)
 
 

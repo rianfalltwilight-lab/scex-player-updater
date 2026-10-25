@@ -30,6 +30,48 @@ def json_write(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
 
 
+FIXTURES = ROOT / 'tests' / 'fixtures'
+TEST_SIGNING_KEY = FIXTURES / 'test-signing-key.xml'
+
+
+def signing_key_strings():
+    """(production key id, production modulus, test key id, test modulus) as base64 text."""
+    import base64
+    import re
+    text = TEST_SIGNING_KEY.read_text(encoding='utf-8-sig')
+    test_modulus = re.search(r'<Modulus>([^<]+)</Modulus>', text).group(1)
+    test_id = hashlib.sha256(base64.b64decode(test_modulus)).hexdigest()[:16]
+    trusted = json.loads((FIXTURES / 'manifest-signing-keys.json').read_text(encoding='utf-8'))['trusted']
+    (prod_id, prod_modulus), = trusted.items()
+    return prod_id, prod_modulus, test_id, test_modulus
+
+
+def trust_test_key(tools):
+    """Make the copied readers in a tools folder trust the test key instead of the real one."""
+    prod_id, prod_modulus, test_id, test_modulus = signing_key_strings()
+    for path in Path(tools).iterdir():
+        if path.is_file() and path.suffix in ('.py', '.ps1', '.bat', '.command'):
+            data = path.read_bytes()
+            if prod_modulus.encode() in data:
+                path.write_bytes(data.replace(prod_modulus.encode(), test_modulus.encode())
+                                 .replace(prod_id.encode(), test_id.encode()))
+
+
+def install_publish_key(root):
+    """Give a copied publisher (root/tools) the test signing key and matching readers."""
+    shutil.copyfile(TEST_SIGNING_KEY, Path(root) / '.update-signing-key.xml')
+    trust_test_key(Path(root) / 'tools')
+
+
+def sign_manifest(path):
+    """Write path + '.sig' with the test key (MANIFEST_SIGNATURE_V1)."""
+    spec = importlib.util.spec_from_file_location('manifest_signing_for_tests', ROOT / 'tools/manifest_signing.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = Path(path)
+    Path(str(path) + '.sig').write_bytes(module.sign(path.read_bytes(), TEST_SIGNING_KEY.read_text(encoding='utf-8-sig')))
+
+
 class SilentHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -188,6 +230,7 @@ class PublishTests(unittest.TestCase):
             root = Path(tmp)
             shutil.copytree(ROOT / 'tools', root / 'tools')
             shutil.copytree(ROOT / '一键脚本', root / '一键脚本')
+            install_publish_key(root)
             config = json.loads((root / 'tools/portable-pack.example.json').read_text(encoding='utf-8'))
             config['includeRoots'] = ['config']  # no remote Modrinth lookup in tests
             config['update']['tokenFile'] = '.test-token'

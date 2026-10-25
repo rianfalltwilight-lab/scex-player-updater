@@ -65,7 +65,9 @@ class Tests(unittest.TestCase):
   requests=[]
   class Handler(http.server.BaseHTTPRequestHandler):
    def do_GET(self):
-    requests.append(self.path);body=json.dumps(manifest).encode() if self.path.endswith('manifest.json') else b'new';self.send_response(200);self.end_headers();self.wfile.write(body)
+    requests.append(self.path)
+    if self.path.endswith('.sig'):self.send_response(404);self.end_headers();return
+    body=json.dumps(manifest).encode() if self.path.endswith('manifest.json') else b'new';self.send_response(200);self.end_headers();self.wfile.write(body)
    def log_message(self,*args):pass
   server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start();h=hold(self.dest)
   try:
@@ -74,5 +76,5 @@ class Tests(unittest.TestCase):
   out=p.stdout+p.stderr
   self.assertEqual(p.returncode,1,out);self.assertIn('[文件占用]',out);self.assertIn('尚未开始替换',out);self.assertNotIn('Traceback',out);self.assertNotIn('private-test',out)
   self.assertEqual(first.read_bytes(),b'first-old');self.assertEqual(self.dest.read_bytes(),b'old')
-  self.assertEqual(requests,['/private-test/manifest.json']);self.assertFalse((self.root/'.portable-sync-state.json').exists());self.assertFalse((self.root/'.portable-sync-backups').exists())
+  self.assertEqual(requests,['/private-test/manifest.json','/private-test/manifest.json.sig']);self.assertFalse((self.root/'.portable-sync-state.json').exists());self.assertFalse((self.root/'.portable-sync-backups').exists())
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -74,7 +74,7 @@ def fetch_bytes(url, timeout=12):
         try:
             conn = http.client.HTTPConnection(ip, port, timeout=timeout)
             try:
-                conn.request("GET", path, headers={"Host": host, "User-Agent": "portable-server-kit-bootstrap/1.0"})
+                conn.request("GET", path, headers={"Host": host, "User-Agent": _ENTRY_UA})
                 resp = conn.getresponse()
                 if resp.status != 200:
                     raise OSError(f"HTTP {resp.status} from {ip}")
@@ -87,6 +87,183 @@ def fetch_bytes(url, timeout=12):
         raise last
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return response.read()
+
+# MANIFEST_TRUST_BEGIN: identical in player-update-generic.py, portable-stage-daemon.py and
+# the macOS entry heredoc; tests/test_manifest_trust.py compares the copies.
+# MANIFEST_SIGNATURE_V1: the publisher signs server-manifest.json into server-manifest.json.sig
+# (RSA-3072, PKCS#1 v1.5, SHA-256). Once a sync has verified a signed manifest, the state says
+# "manifestSignature": "required" and unsigned or wrongly signed manifests are refused.
+# MANIFEST_CACHE_V1: the last verified manifest and signature are kept with their ETags, so an
+# unchanged manifest costs two small 304 responses; the server may send it gzip-compressed.
+import base64, gzip, hmac, http.client, socket, stat as _trust_stat, urllib.error  # noqa: E401
+
+UPDATER_VERSION = "2.27.24"
+TRUSTED_MANIFEST_KEYS = {"d95f8fce25c000bb": "36G6hVExT3FYPdPFSYf/TTxIqZ0Q8ybtxLqtR8KXgZ8yc2CNEJA+kW27ZO8vzQB7wrjKG7H58r0bkyHQpFRlcU0JygsWTypUzdCeNioTe5PP9vixwORTM37E4O4Dr+/IaLfxUQK+VsWhVMV30Wn2RWBrjLsVg5d9WeK0HC/Sm/VR2NJfCH8d9PLMFRptpp3z3mAaATBdyIMFh6+wlv241rayh/hLTSj6ZGtTcedlMrbY4lNR/b9VV0C/abhvQxU32qKOgLJEHmSxHh2YdzreW9lMBvzQOPztftnZjr1uCqm1+3H0B53iqHmqwvNf5MpQiajBK5bbm/tkXM/AVwuIe5z9kNDAWgDYr7FxiwlX5Glg5C3i4KQJK5eQn8X8m4GW22e/lfYEggvfPiNNYIn9k2C7itxI3W8jxe8GBuiNKiTuDkzOjw0RoOYfOYW3IGvVqy+MRt51bEp3XoVgw/DyeTi+RDQHR56n4Pkr78ISuVWOQKqHO4R7j4jSIM9maEM5"}
+MANIFEST_CACHE_DIR = ".portable-manifest-cache"
+_DIGEST_INFO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+class ManifestTrustError(Exception):
+    """The manifest signature is missing, invalid or made with an untrusted key."""
+
+
+def verify_manifest_signature(data, signature_file):
+    """Return the id of the trusted key that signed data, or raise ManifestTrustError."""
+    try:
+        info = json.loads(signature_file.decode("utf-8-sig"))
+        key_id = str(info["keyId"])
+        signature = base64.b64decode(str(info["signature"]), validate=True)
+        algorithm = info.get("algorithm")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise ManifestTrustError("签名文件格式错误") from None
+    if algorithm != "RSA-PKCS1-v1_5-SHA256":
+        raise ManifestTrustError("签名算法不受支持")
+    modulus = TRUSTED_MANIFEST_KEYS.get(key_id)
+    if not modulus:
+        raise ManifestTrustError("签名密钥不受信任")
+    n = int.from_bytes(base64.b64decode(modulus), "big")
+    size = (n.bit_length() + 7) // 8
+    value = int.from_bytes(signature, "big")
+    if len(signature) != size or value >= n:
+        raise ManifestTrustError("签名与清单不符")
+    digest = _DIGEST_INFO_SHA256 + hashlib.sha256(data).digest()
+    expected = b"\x00\x01" + b"\xff" * (size - len(digest) - 3) + b"\x00" + digest
+    if not hmac.compare_digest(pow(value, 65537, n).to_bytes(size, "big"), expected):
+        raise ManifestTrustError("签名与清单不符")
+    return key_id
+
+
+def manifest_signature_required(root):
+    try:
+        state = json.loads((pathlib.Path(root) / ".portable-sync-state.json").read_text(encoding="utf-8-sig"))
+        return isinstance(state, dict) and state.get("manifestSignature") == "required"
+    except (OSError, ValueError):
+        return False
+
+
+def _trust_get(url, headers, timeout):
+    """One GET without any proxy (IPv4 first for plain HTTP). Returns (status, headers, body)."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "http" and parsed.hostname:
+        path = (parsed.path or "/") + ("?" + parsed.query if parsed.query else "")
+        port = parsed.port or 80
+        last = None
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                address = socket.getaddrinfo(parsed.hostname, port, family, socket.SOCK_STREAM)[0][4][0]
+            except (OSError, IndexError) as exc:
+                last = exc
+                continue
+            connection = http.client.HTTPConnection(address, port, timeout=timeout)
+            try:
+                connection.request("GET", path, headers=dict(headers, Host=parsed.netloc.rsplit("@", 1)[-1]))
+                response = connection.getresponse()
+                return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+            except (OSError, http.client.HTTPException) as exc:
+                last = exc
+            finally:
+                connection.close()
+        raise last if isinstance(last, OSError) else OSError(str(last or "无法连接更新源"))
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout) as response:
+            return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, {k.lower(): v for k, v in (exc.headers or {}).items()}, b""
+
+
+def _trust_fetch(url, etag, cached, timeout, user_agent, optional=False):
+    headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip", "Cache-Control": "no-cache"}
+    if etag and cached is not None:
+        headers["If-None-Match"] = etag
+    status, response_headers, body = _trust_get(url, headers, timeout)
+    if status == 304 and cached is not None:
+        return cached, etag
+    if status == 404 and optional:
+        return None, ""
+    if status != 200:
+        raise urllib.error.HTTPError(url, status, f"HTTP {status}", None, None)
+    if "gzip" in str(response_headers.get("content-encoding", "")).lower():
+        body = gzip.decompress(body)
+    return body, str(response_headers.get("etag", ""))
+
+
+def _trust_cache_folder(root):
+    folder = pathlib.Path(root) / MANIFEST_CACHE_DIR
+    try:
+        info = os.lstat(folder)
+    except OSError:
+        return folder
+    if _trust_stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+        return None  # never follow a link planted in place of the cache folder
+    return folder
+
+
+def _trust_cache_read(root):
+    folder = _trust_cache_folder(root)
+    try:
+        meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        manifest = (folder / "server-manifest.json").read_bytes()
+        signature = (folder / "server-manifest.json.sig").read_bytes()
+        if (hashlib.sha256(manifest).hexdigest() != meta["manifestSha256"] or
+                hashlib.sha256(signature).hexdigest() != meta["signatureSha256"]):
+            return None
+        return {"manifest": manifest, "manifestEtag": str(meta.get("manifestEtag") or ""),
+                "signature": signature, "signatureEtag": str(meta.get("signatureEtag") or "")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _trust_cache_write(root, manifest, manifest_etag, signature, signature_etag):
+    folder = _trust_cache_folder(root)
+    if folder is None:
+        return
+    meta = {"manifestEtag": manifest_etag, "manifestSha256": hashlib.sha256(manifest).hexdigest(),
+            "signatureEtag": signature_etag, "signatureSha256": hashlib.sha256(signature).hexdigest()}
+    try:
+        folder.mkdir(exist_ok=True)
+        for name, data in (("server-manifest.json", manifest), ("server-manifest.json.sig", signature),
+                           ("meta.json", json.dumps(meta).encode("utf-8"))):
+            temporary = folder / f"{name}.{os.getpid()}.tmp"
+            temporary.write_bytes(data)
+            os.replace(temporary, folder / name)
+    except OSError:
+        pass  # the cache only saves bandwidth
+
+
+def fetch_trusted_manifest(url, root=None, timeout=20, user_agent="SCEX-updater", use_cache=True, required=None):
+    """Return (manifest bytes, signing key id or None). ManifestTrustError means the
+    signature is missing or wrong; OSError/ValueError mean the source is unreachable."""
+    if required is None:
+        required = bool(root) and manifest_signature_required(root)
+    cache = _trust_cache_read(root) if (root and use_cache) else None
+    for attempt in (1, 2):
+        manifest, manifest_etag = _trust_fetch(url, cache and cache["manifestEtag"], cache and cache["manifest"], timeout, user_agent)
+        signature, signature_etag = _trust_fetch(url + ".sig", cache and cache["signatureEtag"], cache and cache["signature"],
+                                                 timeout, user_agent, optional=True)
+        if signature is None:
+            if required:
+                raise ManifestTrustError("更新清单缺少签名")
+            return manifest, None
+        try:
+            key_id = verify_manifest_signature(manifest, signature)
+        except ManifestTrustError:
+            try:
+                named = json.loads(signature.decode("utf-8-sig")).get("manifestSha256")
+            except (ValueError, AttributeError):
+                named = None
+            if attempt == 1 and named and named != hashlib.sha256(manifest).hexdigest():
+                cache = None  # a publish is replacing the two files: fetch both again
+                time.sleep(1.5)
+                continue
+            raise
+        if root and use_cache and not (cache and manifest is cache["manifest"] and signature is cache["signature"]):
+            _trust_cache_write(root, manifest, manifest_etag, signature, signature_etag)
+        return manifest, key_id
+    raise ManifestTrustError("签名与清单不符")
+# MANIFEST_TRUST_END
+_ENTRY_UA = f"SCEX-updater/{UPDATER_VERSION} (mac-entry {sys.version_info[0]}.{sys.version_info[1]}; {sys.platform})"
+
 
 def watch_matches(pid, root):
     try:
@@ -205,17 +382,25 @@ if not manifest_urls:
     raise SystemExit(0)
 selected_manifest_url = None
 selected_manifest = None
+trust_failed = False
 for candidate in manifest_urls:
     try:
-        parsed = json.loads(fetch_bytes(candidate, timeout=8).decode("utf-8-sig"))
+        raw_manifest, _key_id = fetch_trusted_manifest(candidate, instance_guess, timeout=8, user_agent=_ENTRY_UA)
+        parsed = json.loads(raw_manifest.decode("utf-8-sig"))
         if not isinstance(parsed, dict) or not isinstance(parsed.get("files"), list):
             continue
         selected_manifest_url, selected_manifest = candidate, parsed
         break
+    except ManifestTrustError:
+        trust_failed = True  # MANIFEST_SIGNATURE_V1: never refresh scripts from an unverified manifest
+        continue
     except (OSError, ValueError, http.client.HTTPException):
         continue
 if not selected_manifest_url:
-    print("[更新器] 更新源暂时不可达，已保留本地脚本；主同步器将重试备用地址。")
+    if trust_failed:
+        print("[更新器] 更新清单签名校验没有通过，已保留本地脚本；主同步器会再次校验。")
+    else:
+        print("[更新器] 更新源暂时不可达，已保留本地脚本；主同步器将重试备用地址。")
     raise SystemExit(0)
 if selected_manifest_url != manifest_urls[0]:
     print("[更新器] 已切换到备用更新地址。")

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from test_updater import PS, ROOT, json_write, run, write
+from test_updater import PS, ROOT, install_publish_key, json_write, run, write
 
 
 def load_index():
@@ -98,6 +98,7 @@ class SourceIndexPublisherTests(unittest.TestCase):
             root = Path(tmp)
             shutil.copytree(ROOT / 'tools', root / 'tools')
             shutil.copytree(ROOT / '一键脚本', root / '一键脚本')
+            install_publish_key(root)
             config = json.loads((root / 'tools/portable-pack.example.json').read_text('utf-8'))
             config['includeRoots'] = ['config']
             config['downloadWorkers'] = 6
@@ -158,6 +159,7 @@ class SourceIndexPublisherTests(unittest.TestCase):
             root = Path(tmp)
             shutil.copytree(ROOT / 'tools', root / 'tools')
             shutil.copytree(ROOT / '一键脚本', root / '一键脚本')
+            install_publish_key(root)
             config = json.loads((root / 'tools/portable-pack.example.json').read_text('utf-8'))
             config['includeRoots'] = ['config']
             config['downloadWorkers'] = 99

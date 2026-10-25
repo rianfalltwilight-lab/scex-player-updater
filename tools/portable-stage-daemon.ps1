@@ -158,40 +158,176 @@ function Test-ManifestUrl {
     return ($null -ne (Get-ManifestProbe -Url $Url -TimeoutSec $TimeoutSec))
 }
 
-function Get-ManifestProbe {
-    # Probe once and require a JSON manifest; the first watch round reuses this
-    # download and its Last-Modified instead of fetching the manifest again.
-    param([string]$Url, [int]$TimeoutSec = 8)
-    $request = $null
-    $response = $null
-    $stream = $null
-    $reader = $null
+# MANIFEST_TRUST_BEGIN: identical in player-update-generic.ps1, portable-bootstrap-refresh.ps1,
+# portable-stage-daemon.ps1, player-self-repair.ps1 and portable-windows-repair.ps1;
+# tests/test_manifest_trust.py compares the copies (rules as in player-update-generic.py).
+# MANIFEST_SIGNATURE_V1: server-manifest.json.sig is an RSA PKCS#1 v1.5 SHA-256 signature by a
+# trusted key. After a sync has verified one, the state says manifestSignature = required and
+# unsigned or wrongly signed manifests are refused. MANIFEST_CACHE_V1: the last verified
+# manifest and signature are kept with their ETags, so an unchanged manifest costs two 304s.
+$script:UpdaterVersion = '2.27.24'
+$script:TrustedManifestKeys = @{ 'd95f8fce25c000bb' = '36G6hVExT3FYPdPFSYf/TTxIqZ0Q8ybtxLqtR8KXgZ8yc2CNEJA+kW27ZO8vzQB7wrjKG7H58r0bkyHQpFRlcU0JygsWTypUzdCeNioTe5PP9vixwORTM37E4O4Dr+/IaLfxUQK+VsWhVMV30Wn2RWBrjLsVg5d9WeK0HC/Sm/VR2NJfCH8d9PLMFRptpp3z3mAaATBdyIMFh6+wlv241rayh/hLTSj6ZGtTcedlMrbY4lNR/b9VV0C/abhvQxU32qKOgLJEHmSxHh2YdzreW9lMBvzQOPztftnZjr1uCqm1+3H0B53iqHmqwvNf5MpQiajBK5bbm/tkXM/AVwuIe5z9kNDAWgDYr7FxiwlX5Glg5C3i4KQJK5eQn8X8m4GW22e/lfYEggvfPiNNYIn9k2C7itxI3W8jxe8GBuiNKiTuDkzOjw0RoOYfOYW3IGvVqy+MRt51bEp3XoVgw/DyeTi+RDQHR56n4Pkr78ISuVWOQKqHO4R7j4jSIM9maEM5' }
+$script:ManifestCacheDir = '.portable-manifest-cache'
+
+function Test-ManifestSignature {
+    # Returns the id of the trusted key that signed Data; throws '[签名校验失败] <reason>'.
+    param([byte[]]$Data, [byte[]]$SignatureFile)
     try {
-        $request = [System.Net.HttpWebRequest]::Create($Url)
-        $request.Proxy = $null
-        $request.Method = 'GET'
-        $request.Timeout = [Math]::Max(1000, $TimeoutSec * 1000)
-        $request.ReadWriteTimeout = [Math]::Max(1000, $TimeoutSec * 1000)
-        $request.UserAgent = 'portable-server-kit-stage/1.0'
-        $response = $request.GetResponse()
-        $stream = $response.GetResponseStream()
-        $reader = New-Object -TypeName System.IO.StreamReader -ArgumentList @($stream, (New-Object System.Text.UTF8Encoding($false)), $true)
-        $text = $reader.ReadToEnd().TrimStart([char]0xFEFF)
+        $info = [Text.Encoding]::UTF8.GetString($SignatureFile).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        $keyId = [string]$info.keyId
+        $signature = [Convert]::FromBase64String([string]$info.signature)
+        $algorithm = [string]$info.algorithm
+    } catch { throw '[签名校验失败] 签名文件格式错误' }
+    if ($algorithm -ne 'RSA-PKCS1-v1_5-SHA256') { throw '[签名校验失败] 签名算法不受支持' }
+    if (-not $keyId -or -not $script:TrustedManifestKeys.ContainsKey($keyId)) { throw '[签名校验失败] 签名密钥不受信任' }
+    $parameters = New-Object Security.Cryptography.RSAParameters
+    $parameters.Modulus = [Convert]::FromBase64String([string]$script:TrustedManifestKeys[$keyId])
+    $parameters.Exponent = [byte[]](1, 0, 1)
+    $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider
+    $valid = $false
+    try { $rsa.ImportParameters($parameters); $valid = $rsa.VerifyData($Data, 'SHA256', $signature) } catch { $valid = $false } finally { $rsa.Dispose() }
+    if (-not $valid) { throw '[签名校验失败] 签名与清单不符' }
+    return $keyId
+}
+
+function Test-ManifestSignatureRequired {
+    param([string]$Root)
+    try {
+        $state = [IO.File]::ReadAllText((Join-Path $Root '.portable-sync-state.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+        return ([string]$state.manifestSignature -eq 'required')
+    } catch { return $false }
+}
+
+function Invoke-TrustRequest {
+    # One direct GET, never through a proxy. Returns @{ Status; ETag; Body }.
+    param([string]$Url, [string]$ETag, [int]$TimeoutSec, [string]$UserAgent)
+    $request = [Net.HttpWebRequest]::Create($Url)
+    $request.Proxy = $null
+    $request.Timeout = [Math]::Max(1000, $TimeoutSec * 1000)
+    $request.ReadWriteTimeout = [Math]::Max(1000, $TimeoutSec * 1000)
+    $request.KeepAlive = $false
+    $request.UserAgent = $UserAgent
+    $request.AutomaticDecompression = [Net.DecompressionMethods]::GZip
+    $request.Headers['Cache-Control'] = 'no-cache'
+    if ($ETag) { $request.Headers['If-None-Match'] = $ETag }
+    $response = $null
+    try {
+        try { $response = $request.GetResponse() } catch {
+            $web = $_.Exception
+            while ($web -and -not ($web -is [Net.WebException])) { $web = $web.InnerException }
+            # 304 and 404 are answers; anything else keeps the original WebException for the caller.
+            if ($web -and $web.Response -and ([int]$web.Response.StatusCode) -in @(304, 404)) { $response = $web.Response } else { throw }
+        }
+        $status = [int]$response.StatusCode
+        $body = $null
+        if ($status -eq 200) {
+            $stream = $response.GetResponseStream()
+            $buffer = New-Object IO.MemoryStream
+            try { $stream.CopyTo($buffer); $body = $buffer.ToArray() } finally { $stream.Dispose(); $buffer.Dispose() }
+        }
+        return @{ Status = $status; ETag = [string]$response.Headers['ETag']; Body = $body }
+    } finally { if ($response) { $response.Dispose() } }
+}
+
+function Get-ManifestCacheFolder {
+    param([string]$Root)
+    $folder = Join-Path $Root $script:ManifestCacheDir
+    try {
+        if ([IO.Directory]::Exists($folder) -and ([IO.File]::GetAttributes($folder) -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+    } catch { return $null }
+    return $folder
+}
+
+function Read-ManifestTrustCache {
+    param([string]$Root)
+    $folder = Get-ManifestCacheFolder $Root
+    if (-not $folder) { return $null }
+    try {
+        $meta = [IO.File]::ReadAllText((Join-Path $folder 'meta.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $manifest = [IO.File]::ReadAllBytes((Join-Path $folder 'server-manifest.json'))
+        $signature = [IO.File]::ReadAllBytes((Join-Path $folder 'server-manifest.json.sig'))
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $manifestSha = ([BitConverter]::ToString($sha.ComputeHash($manifest))).Replace('-', '').ToLowerInvariant()
+            $signatureSha = ([BitConverter]::ToString($sha.ComputeHash($signature))).Replace('-', '').ToLowerInvariant()
+        } finally { $sha.Dispose() }
+        if ($manifestSha -ne [string]$meta.manifestSha256 -or $signatureSha -ne [string]$meta.signatureSha256) { return $null }
+        return @{ Manifest = $manifest; ManifestETag = [string]$meta.manifestEtag; Signature = $signature; SignatureETag = [string]$meta.signatureEtag }
+    } catch { return $null }
+}
+
+function Write-ManifestTrustCache {
+    param([string]$Root, [byte[]]$Manifest, [string]$ManifestETag, [byte[]]$Signature, [string]$SignatureETag)
+    $folder = Get-ManifestCacheFolder $Root
+    if (-not $folder) { return }
+    try {
+        [void][IO.Directory]::CreateDirectory($folder)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $meta = [ordered]@{ manifestEtag = $ManifestETag; manifestSha256 = ([BitConverter]::ToString($sha.ComputeHash($Manifest))).Replace('-', '').ToLowerInvariant()
+                signatureEtag = $SignatureETag; signatureSha256 = ([BitConverter]::ToString($sha.ComputeHash($Signature))).Replace('-', '').ToLowerInvariant() }
+        } finally { $sha.Dispose() }
+        $files = @(@('server-manifest.json', $Manifest), @('server-manifest.json.sig', $Signature), @('meta.json', [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Compress))))
+        foreach ($file in $files) {
+            $target = Join-Path $folder $file[0]
+            $temporary = $target + '.' + $PID + '.tmp'
+            [IO.File]::WriteAllBytes($temporary, [byte[]]$file[1])
+            if ([IO.File]::Exists($target)) { [IO.File]::Replace($temporary, $target, [System.Management.Automation.Language.NullString]::Value) } else { [IO.File]::Move($temporary, $target) }
+        }
+    } catch { }  # the cache only saves bandwidth
+}
+
+function Get-TrustedManifest {
+    # Returns [pscustomobject]@{ Raw = [byte[]]; KeyId = id or $null }. Throws '[签名校验失败] ...'
+    # for a missing or wrong signature, and any other exception when the source is unreachable.
+    param([string]$Url, [string]$Root = '', [int]$TimeoutSec = 20, [string]$UserAgent = 'SCEX-updater', [switch]$NoCache)
+    $required = [bool]($Root -and (Test-ManifestSignatureRequired $Root))
+    $cache = if ($Root -and -not $NoCache) { Read-ManifestTrustCache $Root } else { $null }
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $reply = Invoke-TrustRequest -Url $Url -ETag $(if ($cache) { $cache.ManifestETag } else { '' }) -TimeoutSec $TimeoutSec -UserAgent $UserAgent
+        if ($reply.Status -eq 304 -and $cache) { $raw = $cache.Manifest; $rawTag = $cache.ManifestETag }
+        elseif ($reply.Status -eq 200) { $raw = $reply.Body; $rawTag = $reply.ETag }
+        else { throw ('HTTP ' + $reply.Status) }
+        $reply = Invoke-TrustRequest -Url ($Url + '.sig') -ETag $(if ($cache) { $cache.SignatureETag } else { '' }) -TimeoutSec $TimeoutSec -UserAgent $UserAgent
+        if ($reply.Status -eq 304 -and $cache) { $sig = $cache.Signature; $sigTag = $cache.SignatureETag }
+        elseif ($reply.Status -eq 200) { $sig = $reply.Body; $sigTag = $reply.ETag }
+        elseif ($reply.Status -eq 404) { $sig = $null }
+        else { throw ('HTTP ' + $reply.Status) }
+        if ($null -eq $sig) {
+            if ($required) { throw '[签名校验失败] 更新清单缺少签名' }
+            return [pscustomobject]@{ Raw = $raw; KeyId = $null }
+        }
+        try { $keyId = Test-ManifestSignature -Data $raw -SignatureFile $sig }
+        catch {
+            $failure = $_
+            $named = $null
+            try { $named = [string]([Text.Encoding]::UTF8.GetString($sig).TrimStart([char]0xFEFF) | ConvertFrom-Json).manifestSha256 } catch { }
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $actual = ([BitConverter]::ToString($sha.ComputeHash($raw))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+            if ($attempt -eq 1 -and $named -and $named -ne $actual) { $cache = $null; Start-Sleep -Milliseconds 1500; continue }
+            throw $failure
+        }
+        $fromCache = $cache -and [object]::ReferenceEquals($raw, $cache.Manifest) -and [object]::ReferenceEquals($sig, $cache.Signature)
+        if ($Root -and -not $NoCache -and -not $fromCache) { Write-ManifestTrustCache -Root $Root -Manifest $raw -ManifestETag $rawTag -Signature $sig -SignatureETag $sigTag }
+        return [pscustomobject]@{ Raw = $raw; KeyId = $keyId }
+    }
+    throw '[签名校验失败] 签名与清单不符'
+}
+# MANIFEST_TRUST_END
+$script:SyncUserAgent = "SCEX-updater/$($script:UpdaterVersion) (stage-powershell $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor); windows)"
+
+function Get-ManifestProbe {
+    # Probe once and require a JSON manifest; the first watch round reuses this download.
+    # MANIFEST_SIGNATURE_V1: a manifest whose signature fails counts as unreachable.
+    param([string]$Url, [int]$TimeoutSec = 8)
+    try {
+        $trusted = Get-TrustedManifest -Url $Url -Root $script:TrustRoot -TimeoutSec $TimeoutSec -UserAgent $script:SyncUserAgent
+        $text = [Text.Encoding]::UTF8.GetString([byte[]]$trusted.Raw).TrimStart([char]0xFEFF)
         $manifest = $text | ConvertFrom-Json
         if ($null -eq $manifest -or $null -eq $manifest.files) { return $null }
-        $lastModified = $null
-        $lm = $response.Headers['Last-Modified']
-        if (-not [string]::IsNullOrWhiteSpace($lm)) {
-            try { $lastModified = [DateTime]::Parse($lm, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } catch {}
-        }
-        return [pscustomobject]@{ Text = $text; LastModified = $lastModified }
+        return [pscustomobject]@{ Text = $text; LastModified = $null }
     } catch {
         return $null
-    } finally {
-        if ($reader) { $reader.Dispose() }
-        if ($stream) { $stream.Dispose() }
-        if ($response) { $response.Dispose() }
-        if ($request) { try { $request.Abort() } catch {} }
     }
 }
 
@@ -306,7 +442,7 @@ function Save-UrlToFile {
     $request.ReadWriteTimeout = [Math]::Max(1000, $TimeoutSec * 1000)
     $request.KeepAlive = $false
     try { $request.ServicePoint.Expect100Continue = $false } catch {}
-    $request.UserAgent = 'portable-server-kit-stage/1.0'
+    $request.UserAgent = $script:SyncUserAgent
     $response = $null
     $inputStream = $null
     $outputStream = $null
@@ -356,6 +492,7 @@ function Enter-SyncLock {
 
 # --- 解析实例目录与暂存区 -------------------------------------------------
 $instanceRoot = Resolve-FullPath $InstanceDir
+$script:TrustRoot = $instanceRoot
 $stageRoot = Join-Path $instanceRoot '.portable-staging'
 $readyPath = Join-Path $stageRoot 'READY.json'
 $noticePath = Join-Path $instanceRoot '更新已就绪.txt'
@@ -474,37 +611,11 @@ function Get-LocalSha1Cached {
 # 这样才能把轮询降到 30s 也不心疼。更新服基于 SimpleHTTPRequestHandler，支持 If-Modified-Since。
 $script:LastModified = $null
 function Get-ManifestIfChanged {
+    # MANIFEST_CACHE_V1: an unchanged manifest costs two 304s and returns the cached, verified
+    # bytes; the watch loop then skips it because the text equals the last round.
     param([string]$Url)
-    $req = [System.Net.HttpWebRequest]::Create($Url)
-    $req.Proxy = $null
-    $req.Method = 'GET'
-    $req.Timeout = 30000
-    $req.ReadWriteTimeout = 30000
-    try { $req.CachePolicy = New-Object System.Net.Cache.RequestCachePolicy([System.Net.Cache.RequestCacheLevel]::NoCacheNoStore) } catch {}
-    if ($script:LastModified) { $req.IfModifiedSince = $script:LastModified }
-    $resp = $null
-    try {
-        $resp = $req.GetResponse()
-    } catch [System.Net.WebException] {
-        $r = $_.Exception.Response
-        if ($r) {
-            try { $sc = [int]$r.StatusCode } catch { $sc = 0 }
-            $r.Close()
-            if ($sc -eq 304) { return [pscustomobject]@{ Changed = $false; Text = $null } }
-        }
-        throw
-    }
-    try {
-        # 只在服务器真的给了 Last-Modified 时才记录，否则保持 $null 走全量兜底，避免误判为"永远未变"。
-        $lm = $resp.Headers['Last-Modified']
-        if (-not [string]::IsNullOrWhiteSpace($lm)) {
-            try { $script:LastModified = [DateTime]::Parse($lm, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } catch {}
-        }
-        $stream = $resp.GetResponseStream()
-        $sr = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        try { $text = $sr.ReadToEnd() } finally { $sr.Dispose() }
-        return [pscustomobject]@{ Changed = $true; Text = ($text.TrimStart([char]0xFEFF)) }
-    } finally { $resp.Close() }
+    $trusted = Get-TrustedManifest -Url $Url -Root $script:TrustRoot -TimeoutSec 30 -UserAgent $script:SyncUserAgent
+    return [pscustomobject]@{ Changed = $true; Text = [Text.Encoding]::UTF8.GetString([byte[]]$trusted.Raw).TrimStart([char]0xFEFF) }
 }
 
 function Install-VerifiedFile {

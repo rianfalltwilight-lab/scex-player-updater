@@ -117,7 +117,7 @@ class PowerShellFilePreflightTests(unittest.TestCase):
                         self.assert_clean_lock_message(code, output)
                         self.assertEqual(snapshot(client), before)
                         self.assertTrue(requests)
-                        self.assertEqual(set(requests), {'/server-manifest.json'})
+                        self.assertEqual(set(requests), {'/server-manifest.json', '/server-manifest.json.sig'})
                         self.assertFalse((client / '.portable-sync-backups').exists())
                         self.assertIn('E-LOCK', output)
                         self.assertTrue((client / DIAGNOSTIC_NAME).is_file())
