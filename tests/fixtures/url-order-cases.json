@@ -1,5 +1,5 @@
 {
-  "rule": "URL_RULES_V1: drop non-http(s) lines and retired hosts (7caiyun.com); use only the first public URL; then the LAN URLs in listed order; duplicates compare case-insensitively; lastGood never reorders.",
+  "rule": "URL_RULES_V1: drop non-http(s) lines; use only the first public URL; then the LAN URLs in listed order; duplicates compare case-insensitively; lastGood never reorders.",
   "implementations": [
     "tools/player-update-generic.py order_manifest_urls",
     "tools/portable-stage-daemon.py order_update_urls",
@@ -26,18 +26,6 @@
       "urls": ["http://192.168.1.2/m.json", "http://10.0.0.5/m.json"],
       "lastGood": "http://10.0.0.5/m.json",
       "expected": ["http://192.168.1.2/m.json", "http://10.0.0.5/m.json"]
-    },
-    {
-      "name": "retired cloud host is dropped",
-      "urls": ["https://cdn.7caiyun.com/m.json", "https://a.example/m.json", "http://192.168.1.2/m.json"],
-      "lastGood": "https://cdn.7caiyun.com/m.json",
-      "expected": ["https://a.example/m.json", "http://192.168.1.2/m.json"]
-    },
-    {
-      "name": "only retired hosts leave nothing",
-      "urls": ["https://7caiyun.com/m.json"],
-      "lastGood": "",
-      "expected": []
     },
     {
       "name": "IPv6 ULA is private but an fc-prefixed name is public",

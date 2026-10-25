@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @version 17
+# @version 18
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
@@ -103,7 +103,7 @@ def fetch_bytes(url, timeout=12):
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.25"
+UPDATER_VERSION = "2.27.26"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
@@ -277,13 +277,6 @@ def is_private_update_url(url):
     except ValueError:
         return False
 
-def is_retired_cloud_url(url):
-    try:
-        host = (urllib.parse.urlsplit(str(url)).hostname or "").lower().rstrip(".")
-    except ValueError:
-        return False
-    return host == "7caiyun.com" or host.endswith(".7caiyun.com")
-
 def is_usable_update_url(url):
     """Only absolute http(s) URLs with a host take part in ordering."""
     try:
@@ -294,11 +287,11 @@ def is_usable_update_url(url):
 
 
 def order_manifest_urls(urls, last_good=""):
-    """Drop retired hosts; the first public URL, then listed LAN URLs in file order."""
+    """The first public URL, then listed LAN URLs in file order."""
     seen = set()
     out = []
     usable = [str(url or "").strip() for url in (urls or [])]
-    usable = [url for url in usable if is_usable_update_url(url) and not is_retired_cloud_url(url)]
+    usable = [url for url in usable if is_usable_update_url(url)]
     public = [url for url in usable if not is_private_update_url(url)]
     for url in public[:1] + [url for url in usable if is_private_update_url(url)]:
         if url.lower() not in seen:
@@ -488,3 +481,4 @@ exit "$status"
 # v16：曾加入清单签名校验（v17 已去掉）；从根目录启动时改为运行 _updater 里的副本；
 # 同步失败时可直接运行完整检查修复（_updater/macOS-self-repair.command 是同一功能的独立入口）。
 # v17：去掉清单签名校验（只保留 ETag 缓存）。
+# v18：去掉已退役云端的地址过滤（该云端已全面停用）。

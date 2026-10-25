@@ -139,11 +139,6 @@ def is_private_update_url(url: str) -> bool:
     return is_local_or_private_host(host)
 
 
-def is_retired_cloud_url(url: str) -> bool:
-    host = (urllib.parse.urlparse(str(url) or "").hostname or "").lower().rstrip(".")
-    return host == "7caiyun.com" or host.endswith(".7caiyun.com")
-
-
 def is_usable_update_url(url):
     """Only absolute http(s) URLs with a host take part in ordering."""
     try:
@@ -154,12 +149,12 @@ def is_usable_update_url(url):
 
 
 def order_update_urls(urls: list, last_good: str = "") -> list:
-    """URL_RULES_V1: same order as the main updater: drop retired hosts, the
+    """URL_RULES_V1: same order as the main updater: the
     first public URL, then listed LAN URLs. ``last_good`` cannot reorder."""
     seen = set()
     out = []
     usable = [str(url or "").strip() for url in (urls or [])]
-    usable = [url for url in usable if is_usable_update_url(url) and not is_retired_cloud_url(url)]
+    usable = [url for url in usable if is_usable_update_url(url)]
     public = [url for url in usable if not is_private_update_url(url)]
     for url in public[:1] + [url for url in usable if is_private_update_url(url)]:
         if url.lower() not in seen:
@@ -178,7 +173,7 @@ def probe_timeout_for_url(url: str) -> float:
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.25"
+UPDATER_VERSION = "2.27.26"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 

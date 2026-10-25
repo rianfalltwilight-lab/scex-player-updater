@@ -4,7 +4,7 @@
 
 默认分支仅提供更新器：客户端增量同步、后台预下载、更新脚本刷新与修复、管理员发布清单、更新文件下载服务。上游的服务器启停、面板、RCON、QQ/Discord 通知、备份管理、整套工具包自更新均已移除。Git 历史保留上游记录。
 
-`scex` 分支是 SCEX 正式部署使用的版本：在 main 的基础上保留 7caiyun 退役过滤、单一公网地址规则、发布器 `-NoNotify` 与 Discord/QQ/RCON 通知、下载服务 `/kit/` 通道及默认 `0.0.0.0` 监听。正式发布物应从该分支的某个提交构建。
+`scex` 分支是 SCEX 正式部署使用的版本：在 main 的基础上保留单一公网地址规则、发布器 `-NoNotify` 与 Discord/QQ/RCON 通知、下载服务 `/kit/` 通道及默认 `0.0.0.0` 监听。正式发布物应从该分支的某个提交构建。
 
 这是脚本工具，不是 Minecraft 模组，无须放进 `mods` 文件夹，也不需要服务器安装插件。仓库不包含整合包、模组 JAR、玩家存档、生产地址、令牌或私有配置。
 
@@ -97,7 +97,7 @@ PowerShell 发布器有可用 Python 时调用 `official-source-index.py`，按�
 
 可选的 CurseForge 元数据查询从发布进程的 `CURSEFORGE_API_KEY` 或 `officialSources.curseforgeKeyFile` 读取密钥。指纹只用于找候选，SHA-1 一致才会接受；客户端清单不含密钥。元数据匹配不保证 CDN 对玩家开放，下载仍须校验并回退，实际 CDN 鉴权需按自己的服务配置验证。
 
-地址文件可写多行 URL。scex 分支的所有入口（Python/PowerShell 同步器、自刷新、两个后台预下载、macOS 入口）使用同一规则：忽略非 http(s) 行和已退役的 7caiyun 地址，只使用第一个公网地址，失败后按文件顺序尝试明确写入的局域网地址；规则与用例见 `tests/fixtures/url-order-cases.json`。云端镜像由 `mirrorManifestUrls` 配置，详见 [云端发布](docs/CLOUD-PUBLISH.md)。客户端不会修改系统代理、路由或防火墙；开启 TUN 时，应用直连不等于流量绕过 TUN。
+地址文件可写多行 URL。scex 分支的所有入口（Python/PowerShell 同步器、自刷新、两个后台预下载、macOS 入口）使用同一规则：忽略非 http(s) 行，只使用第一个公网地址，失败后按文件顺序尝试明确写入的局域网地址；规则与用例见 `tests/fixtures/url-order-cases.json`。客户端不会修改系统代理、路由或防火墙；开启 TUN 时，应用直连不等于流量绕过 TUN。
 
 ## 来源与许可
 

@@ -81,10 +81,11 @@ class CopyConsistencyTests(unittest.TestCase):
                          re.search(r"^\$script:UpdaterVersion = '([\d.]+)'$", ps, re.M).group(1))
 
     def test_no_signature_or_cloud_code_left(self):
+        # The signing system and every 七彩云 path were removed for good (2.27.25 / 2.27.26).
         for path in TOOLS.iterdir():
             if path.suffix in ('.py', '.ps1', '.bat', '.command') and path.name != 'release-updater.py':
                 text = path.read_text(encoding='utf-8-sig', errors='replace')
-                for needle in ('MANIFEST_SIGNATURE', 'server-manifest.json.sig', 'mirrorManifestUrls', 'downloadPath'):
+                for needle in ('MANIFEST_SIGNATURE', 'server-manifest.json.sig', 'mirrorManifestUrls', 'downloadPath', '7caiyun', '七彩云', 'RetiredCloud'):
                     self.assertNotIn(needle, text, path.name)
 
 

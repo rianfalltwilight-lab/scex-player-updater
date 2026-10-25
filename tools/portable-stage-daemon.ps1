@@ -106,11 +106,6 @@ function Read-UpdateUrl {
     return ""
 }
 
-function Test-RetiredCloudUrl {
-    param([string]$Url)
-    try { $hostName = ([Uri]$Url).Host.ToLowerInvariant().TrimEnd('.') ; return ($hostName -eq '7caiyun.com' -or $hostName.EndsWith('.7caiyun.com')) } catch { return $false }
-}
-
 # URL_RULES_V1: keep identical to player-update-generic.ps1 (tests/fixtures/url-order-cases.json).
 function Test-LocalOrPrivateHost {
     param([string]$HostName)
@@ -140,12 +135,12 @@ function Test-UsableUpdateUrl {
 }
 
 function Get-OrderedUpdateUrls {
-    # Same order as the main updater: drop retired hosts, the first public URL,
+    # Same order as the main updater: the first public URL,
     # then listed LAN URLs in file order. LastGood cannot reorder.
     param([string[]]$Urls, [string]$LastGood = '')
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $out = New-Object System.Collections.Generic.List[string]
-    $usable = @($Urls | ForEach-Object { ([string]$_).Trim() } | Where-Object { (Test-UsableUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
+    $usable = @($Urls | ForEach-Object { ([string]$_).Trim() } | Where-Object { (Test-UsableUpdateUrl $_) })
     $public = @($usable | Where-Object { -not (Test-PrivateUpdateUrl $_) })
     foreach ($u in (@($public | Select-Object -First 1) + @($usable | Where-Object { Test-PrivateUpdateUrl $_ }))) {
         if ($seen.Add($u)) { [void]$out.Add($u) }
@@ -163,7 +158,7 @@ function Test-ManifestUrl {
 # tests/test_manifest_cache.py compares the copies (rules as in player-update-generic.py).
 # MANIFEST_CACHE_V1: the last manifest is kept with its ETag, so an unchanged manifest costs
 # one small 304 response; the server may send it gzip-compressed.
-$script:UpdaterVersion = '2.27.25'
+$script:UpdaterVersion = '2.27.26'
 $script:ManifestCacheDir = '.portable-manifest-cache'
 
 function Invoke-ManifestRequest {

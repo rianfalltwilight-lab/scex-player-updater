@@ -26,11 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES_PATH = ROOT / 'tests' / 'fixtures' / 'url-order-cases.json'
 CASES = json.loads(CASES_PATH.read_text(encoding='utf-8'))['cases']
 PS = os.environ.get('UPDATER_TEST_POWERSHELL') or (shutil.which('powershell.exe') if os.name == 'nt' else None)
-HELPERS = ['Test-LocalOrPrivateHost', 'Test-PrivateUpdateUrl', 'Test-RetiredCloudUrl', 'Test-UsableUpdateUrl']
+HELPERS = ['Test-LocalOrPrivateHost', 'Test-PrivateUpdateUrl', 'Test-UsableUpdateUrl']
 PS_RUNNER = r'''
 param([string]$Script, [string]$Function, [string]$CasesPath)
 $ErrorActionPreference = 'Stop'
-$wanted = @('Test-LocalOrPrivateHost', 'Test-PrivateUpdateUrl', 'Test-RetiredCloudUrl', 'Test-UsableUpdateUrl', $Function)
+$wanted = @('Test-LocalOrPrivateHost', 'Test-PrivateUpdateUrl', 'Test-UsableUpdateUrl', $Function)
 $ast = [Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
 foreach ($def in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     if ($wanted -contains $def.Name) { . ([scriptblock]::Create($def.Extent.Text)) }

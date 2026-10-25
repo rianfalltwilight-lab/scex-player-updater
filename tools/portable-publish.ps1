@@ -533,7 +533,7 @@ if (-not [string]::IsNullOrWhiteSpace($oldVersion) -and $Version -ne $oldVersion
 }
 
 # 增量发布：不删除发布目录，逐文件比对写入；过期文件在所有复制完成后统一清理。
-# Local-origin mode: the public 18088 source is authoritative; cloud staging is retired.
+# Local-origin mode: the public 18088 source is authoritative.
 
 $excludeGlobs = Get-ConfigArray -Object $config -Name 'excludeGlobs' -Default @()
 $includeRoots = Get-ConfigArray -Object $config -Name 'includeRoots' -Default @('mods', 'config', 'defaultconfigs', 'data', 'resourcepacks', 'datapacks', 'kubejs', 'scripts')
