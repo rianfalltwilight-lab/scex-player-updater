@@ -2596,7 +2596,8 @@ def cleanup_candidates(root, patterns):
             base = pathlib.Path(directory)
             dirs[:] = [name for name in dirs if not name.startswith((".portable-", "_disabled_"))
                        and not (base / name).is_symlink()
-                       and not getattr(base / name, "is_junction", lambda: False)()]
+                       # Path.is_junction() needs Python 3.12; the reparse tag works on 3.8+.
+                       and not _is_name_surrogate(base / name)]
             for name in names:
                 path = base / name
                 rel = path.relative_to(root).as_posix()
