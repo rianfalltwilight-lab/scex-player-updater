@@ -367,5 +367,22 @@ class StandaloneEntryTests(unittest.TestCase):
             self.assertEqual(entry.read_bytes(), expected)
 
 
+
+class PortableDownloadPolicyTests(unittest.TestCase):
+    def test_published_worker_count_and_revision_follow_config(self):
+        with fixture() as (root, config):
+            config['downloadWorkers'] = 2
+            config['updaterRevision'] = 'fixture-current'
+            server.publish(root, config)
+            manifest = server.read_json(root / config['publishDir'] / 'server-manifest.json')
+            self.assertEqual(manifest['downloadWorkers'], 2)
+            self.assertEqual(manifest['updaterRevision'], 'fixture-current')
+
+    def test_worker_limits_match_clients(self):
+        with fixture() as (root, config):
+            for supplied, expected in [(0, 1), (32, 8), (4, 4)]:
+                config['downloadWorkers'] = supplied
+                self.assertEqual(server.resolve_config(root, config)[0]['downloadWorkers'], expected)
+
 if __name__ == '__main__':
     unittest.main()

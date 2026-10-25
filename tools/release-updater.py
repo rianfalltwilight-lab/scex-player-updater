@@ -5,18 +5,19 @@ between steps; nothing is installed before `deploy`.
 
   preflight  production still serves the previous release (hashes from its receipt)
   backup     copy every file this release touches from each host (never overwrites)
-  prepare    per-host payloads and deploy plans; manifest rows; signed manifest
+  prepare    per-host payloads and deploy plans; manifest rows; files to remove
   e2e        local transition test (previous engines and entry -> this release; localhost)
   dryrun     run the generated deploy scripts against copies of the backup
   stage      copy payloads to each host's temp folder and verify every hash
-  deploy     install host by host: files, optional service restart, manifest + signature last
-  verify     HTTP checks through every address, signature, Range, live bootstrap checks
+  deploy     install host by host: files, optional service restart, manifest and removals last
+  verify     HTTP checks through every address, Range, gzip, live bootstrap checks
   finalize   confirm production hashes, remove the stages, write the receipt
 
   python tools/release-updater.py --config <hosts.json> --release <release.json> <step>
 
-The host config (addresses, users, paths, token and signing-key locations) stays outside
-the repository; see docs in the release receipt for the expected keys."""
+The host config (addresses, users, paths and the token location) stays outside
+the repository. A release may list "removeFiles" (paths under a host root) that are
+deleted after the manifest; each must still hold its backed-up hash."""
 import argparse
 import base64
 import copy
@@ -35,6 +36,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -161,9 +163,10 @@ class Release:
         for rel in self.changed_repo_files():
             server.append(rel)
             public.update(PUBLIC + p for p in mapping.get(rel, []))
-        public.update(PUBLIC + p for p in ("server-manifest.json", "server-manifest.json.sig", "update-log.txt", "使用说明.txt"))
+        public.update(PUBLIC + p for p in ("server-manifest.json", "update-log.txt", "使用说明.txt"))
         public.update(PUBLIC + p for p in self.spec.get("removeRows", []))
-        return sorted(set(server) | {"tools/portable-pack.json"}), sorted(public)
+        removed = set(self.spec.get("removeFiles", []))
+        return sorted((set(server) | {"tools/portable-pack.json"} | {r for r in removed if not r.startswith(PUBLIC)})), sorted(public | {r for r in removed if r.startswith(PUBLIC)})
 
     # ---- steps ---------------------------------------------------------------------
     def preflight(self):
@@ -214,9 +217,6 @@ class Release:
         print(json.dumps({"baseline": self.previous, "backedUpFiles": len(records), "absentOnHost": absent}, ensure_ascii=False))
 
     def prepare(self):
-        signing = load_module(REPO / "tools/manifest_signing.py", "release_signing")
-        reader = load_module(REPO / "tools/player-update-generic.py", "release_reader")
-        key_text = Path(self.config["signingKey"]).read_text(encoding="utf-8-sig")
         baseline = read_json(self.work / "baseline-receipt.json")
         mapping = self.publisher_map()
         changed = self.changed_repo_files()
@@ -270,18 +270,19 @@ class Release:
             title = f"> {dt.date.today():%Y/%m/%d} v{self.version}\n{self.spec['logTitle']}\n\n"
             payloads[PUBLIC + "update-log.txt"] = (title + "\n".join("- " + n for n in self.spec["notes"]) + "\n\n" + old_log).encode("utf-8")
             manifest_bytes = encoded(manifest)
-            signature = signing.sign(manifest_bytes, key_text)
-            key_id = reader.verify_manifest_signature(manifest_bytes, signature)  # the shipped readers trust this key
             entries = []
             for rel, data in payloads.items():
                 before_path = old / rel
                 entries.append({"path": rel, "before": sha256(before_path.read_bytes()) if before_path.is_file() and rel not in absent else None,
                                 "after": sha256(data), "size": len(data)})
-            for rel, data in ((PUBLIC + "server-manifest.json", manifest_bytes), (PUBLIC + "server-manifest.json.sig", signature)):
-                payloads[rel] = data
-                before_path = old / rel
-                entries.append({"path": rel, "before": sha256(before_path.read_bytes()) if before_path.is_file() else None,
-                                "after": sha256(data), "size": len(data), "commit": True})
+            rel = PUBLIC + "server-manifest.json"
+            payloads[rel] = manifest_bytes
+            entries.append({"path": rel, "before": sha256((old / rel).read_bytes()), "after": sha256(manifest_bytes),
+                            "size": len(manifest_bytes), "commit": True})
+            for rel in self.spec.get("removeFiles", []):
+                if (old / rel).is_file():  # files a host never had need no removal
+                    entries.append({"path": rel, "before": sha256((old / rel).read_bytes()), "after": None, "size": 0,
+                                    "commit": True, "delete": True})
             for rel, data in payloads.items():
                 target = self.out / host / "payload" / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -291,7 +292,7 @@ class Release:
             self.write_deploy_script(host)
             receipt["hosts"][host] = {"managedFiles": len(files), "changedPlayerRows": changed_rows,
                                       "addedPlayerRows": [r["path"] for r in added_rows], "removedPlayerRows": sorted(removed),
-                                      "signingKeyId": key_id, "files": entries}
+                                      "removedFiles": [e["path"] for e in entries if e.get("delete")], "files": entries}
         (self.out / "release-receipt.json").write_bytes(encoded(receipt))
         print(json.dumps({h: {k: (len(v) if isinstance(v, list) else v) for k, v in receipt["hosts"][h].items()} for h in self.order}, ensure_ascii=False))
 
@@ -328,7 +329,7 @@ class Release:
                     result = subprocess.run(command, capture_output=True, timeout=180)
                     if result.returncode:
                         raise SystemExit(f"{host} dry run failed: " + (result.stdout + result.stderr).decode("utf-8", "replace")[-1500:])
-                bad = [e["path"] for e in plan["files"] if not (root / e["path"]).is_file() or sha256((root / e["path"]).read_bytes()) != e["after"]]
+                bad = [e["path"] for e in plan["files"] if ((root / e["path"]).is_file() and sha256((root / e["path"]).read_bytes())) != (e["after"] or False)]
                 if bad or list(root.rglob("*" + self.stage_name + ".tmp")):
                     raise SystemExit(f"{host} dry run left wrong files: {bad}")
                 again = subprocess.run(commands[0], capture_output=True, timeout=180)
@@ -352,7 +353,7 @@ class Release:
             if result.returncode:
                 raise SystemExit(f"{host}: scp failed: " + result.stderr.decode("utf-8", "replace")[:400])
             plan = read_json(self.out / host / "deploy-plan.json")
-            paths = ["payload/" + e["path"] for e in plan["files"]]
+            paths = ["payload/" + e["path"] for e in plan["files"] if not e.get("delete")]
             if info["kind"] == "posix":
                 program = ("import hashlib,json,pathlib\ns=pathlib.Path(%r)\nprint(json.dumps({p:hashlib.sha256((s/p).read_bytes()).hexdigest() for p in json.loads(%r)}))\n"
                            % (stage, json.dumps(paths, ensure_ascii=False)))
@@ -362,7 +363,7 @@ class Release:
                           + base64.b64encode(json.dumps(paths, ensure_ascii=False).encode()).decode()
                           + "'))|ConvertFrom-Json)){$o[$p]=(Get-FileHash -LiteralPath (Join-Path $s $p) -Algorithm SHA256).Hash.ToLowerInvariant()};$o|ConvertTo-Json -Compress")
                 staged = json.loads(self.remote_powershell(host, script))
-            bad = [e["path"] for e in plan["files"] if staged.get("payload/" + e["path"]) != e["after"]]
+            bad = [e["path"] for e in plan["files"] if not e.get("delete") and staged.get("payload/" + e["path"]) != e["after"]]
             if bad:
                 raise SystemExit(f"{host}: staged hash mismatch: {bad}")
             print(json.dumps({"host": host, "stage": stage, "stagedFiles": len(paths)}))
@@ -444,10 +445,7 @@ class Release:
         primary = self.config["primary"]
         public = self.out / primary / "payload" / PUBLIC
         manifest_bytes = (public / "server-manifest.json").read_bytes()
-        signature = (public / "server-manifest.json.sig").read_bytes()
         manifest = json.loads(manifest_bytes.decode("utf-8"))
-        reader = load_module(REPO / "tools/player-update-generic.py", "release_verify_reader")
-        key_id = reader.verify_manifest_signature(manifest_bytes, signature)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         def fetch(url, headers=None):
@@ -457,13 +455,18 @@ class Release:
         urls = {name: url.format(token=self.token) for name, url in self.config["verifyUrls"].items() if name == primary}
         urls["playerEntry"] = manifest["updateUrl"]
         rows = receipt["hosts"][primary]["changedPlayerRows"] + receipt["hosts"][primary]["addedPlayerRows"]
-        report = {"version": self.version, "verifiedAt": now(), "signingKeyId": key_id, "endpoints": {}}
+        report = {"version": self.version, "verifiedAt": now(), "endpoints": {}}
+        removed_public = [r[len(PUBLIC):] for r in receipt["hosts"][primary].get("removedFiles", []) if r.startswith(PUBLIC)]
         for name, url in urls.items():
             data, status, _ = fetch(url)
             assert status == 200 and data == manifest_bytes, name + ": manifest differs"
-            sig, status, _ = fetch(url + ".sig")
-            assert status == 200 and sig == signature, name + ": signature differs"
             base = url.rsplit("/", 1)[0] + "/"
+            for rel in removed_public:
+                try:
+                    fetch(base + urllib.parse.quote(rel, safe="/"))
+                    raise AssertionError(name + ": still served " + rel)
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 404, (name, rel, exc.code)
             for rel in rows:
                 payload, status, _ = fetch(base + urllib.parse.quote(rel, safe="/"))
                 assert status == 200 and payload == (public / rel).read_bytes(), name + ": payload differs " + rel
@@ -473,7 +476,8 @@ class Release:
             import gzip as _gzip
             packed, status, headers = fetch(url, {"Accept-Encoding": "gzip"})
             gzip_ok = headers.get("Content-Encoding") == "gzip" and _gzip.decompress(packed) == manifest_bytes
-            report["endpoints"][name] = {"manifestSha256": sha256(data), "files": len(rows), "rangeStatus": 206, "gzip": gzip_ok}
+            report["endpoints"][name] = {"manifestSha256": sha256(data), "files": len(rows), "rangeStatus": 206, "gzip": gzip_ok,
+                                         "removedAbsent": removed_public}
             print(json.dumps({"endpoint": name, "version": self.version, "verifiedFiles": len(rows), "gzip": gzip_ok}))
         report["liveBootstrap"] = self.verify_bootstrap(manifest, public)
         (self.out / "http-verification.json").write_bytes(encoded(report))
@@ -514,8 +518,6 @@ class Release:
         old_public = self.backup / primary / PUBLIC
         manifest = json.loads((new_public / "server-manifest.json").read_text(encoding="utf-8"))
         previous = json.loads((old_public / "server-manifest.json").read_text(encoding="utf-8-sig"))
-        signing = load_module(REPO / "tools/manifest_signing.py", "release_e2e_signing")
-        key_text = Path(self.config["signingKey"]).read_text(encoding="utf-8-sig")
         server_module = load_module(REPO / "tools/secure-update-server.py", "release_e2e_server")
 
         url_rows = {"_updater/UPDATE-URL.txt", "_updater/PORTABLE-UPDATE-URL.txt", "_updater/UPDATE-URL-LAN.txt",
@@ -554,7 +556,6 @@ class Release:
             local.pop("downloadSourceStatus", None)
             raw = encoded(local)
             (web / "server-manifest.json").write_bytes(raw)
-            (web / "server-manifest.json.sig").write_bytes(signing.sign(raw, key_text))
             expected = {r["path"]: r["sha1"] for r in served}
             old_rows = scoped(previous, [old_public])
 
@@ -569,14 +570,12 @@ class Release:
                 (folder / ".portable-sync-state.json").write_text(json.dumps({"format": 3, "version": previous["version"], "files": rows}), encoding="utf-8")
                 return folder
 
-            def check(folder, label, signed=True):
-                """Rows match this release; signed=False for previous engines, which do not
-                know signatures (the next run with the new engine turns the requirement on)."""
+            def check(folder, label):
+                """Rows match this release."""
                 wrong = [p for p, s in expected.items() if not (folder / p).is_file() or hashlib.sha1((folder / p).read_bytes()).hexdigest() != s]
                 state = read_json(folder / ".portable-sync-state.json")
                 gone = [r["path"] for r in old_rows if r["path"] not in expected and (folder / r["path"]).exists()]
-                sticky = state.get("manifestSignature") == "required"
-                assert not wrong and not gone and state.get("version") == self.version and (sticky or not signed), (label, wrong, gone, state.get("version"), sticky)
+                assert not wrong and not gone and state.get("version") == self.version, (label, wrong, gone, state.get("version"))
                 return sorted(p.name for p in folder.iterdir() if p.is_file() and not p.name.startswith("."))
 
             def run(argv, cwd, **env):
@@ -592,8 +591,9 @@ class Release:
                 root_files = check(folder, "A1")
                 code, out = run(["cmd", "/d", "/c", str(folder / "更新mod-Windows端.bat")], folder, PORTABLE_SYNC_ONLY="1")
                 (self.out / "e2e-A2.log").write_text(out, encoding="utf-8")
-                assert code == 0 and "清单签名校验通过" in out, out[-1500:]
-                report["A"] = {"rootFilesAfter": root_files, "secondRunVerifiedSignature": True}
+                assert code == 0, out[-1500:]
+                check(folder, "A2")
+                report["A"] = {"rootFilesAfter": root_files, "secondRunOk": True}
                 for label, argv in (("B", [PS, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "{u}/player-update-generic.ps1", "-InstanceDir", "{c}", "-ManifestUrl", url, "-NoPause"]),
                                     ("C", [sys.executable, "{u}/player-update-generic.py", "--instance-dir", "{c}", "--manifest-url", url])):
                     folder = client(label)
@@ -602,12 +602,12 @@ class Release:
                     code, out = run([a.replace("{u}", str(engine)).replace("{c}", str(folder)) for a in argv], folder)
                     (self.out / f"e2e-{label}.log").write_text(out, encoding="utf-8")
                     assert code == 0, (label, out[-1500:])
-                    check(folder, label, signed=False)
+                    check(folder, label)
                     # The next run uses the engine that the previous one just installed.
                     code, out = run([a.replace("{u}", str(folder / "_updater")).replace("{c}", str(folder)) for a in argv], folder)
                     (self.out / f"e2e-{label}2.log").write_text(out, encoding="utf-8")
-                    assert code == 0 and "清单签名校验通过" in out, (label, out[-1500:])
-                    report[label] = {"rootFilesAfter": check(folder, label), "nextRunVerifiedSignature": True}
+                    assert code == 0, (label, out[-1500:])
+                    report[label] = {"rootFilesAfter": check(folder, label), "nextRunOk": True}
             finally:
                 server.shutdown()
                 server.server_close()
@@ -643,9 +643,9 @@ class Release:
 
 DEPLOY_POSIX = r'''from pathlib import Path
 import hashlib, json, os, shutil, sys
-# Generated by tools/release-updater.py. "payload" installs every file except the manifest
-# and its signature; "commit" installs those two last. Every target must still hold its
-# backed-up hash (new files: must not exist) before anything is replaced.
+# Generated by tools/release-updater.py. "payload" installs every file except the manifest;
+# "commit" installs the manifest last and then removes the listed files. Every target must
+# still hold its backed-up hash (new files: must not exist) before anything is replaced.
 stage = Path(__file__).resolve().parent
 root = Path(__ROOT__)
 plan = json.loads((stage / "deploy-plan.json").read_text(encoding="utf-8"))
@@ -663,10 +663,15 @@ for entry in plan["files"]:
     assert target.parent.resolve().is_relative_to(root.resolve()) and not target.is_symlink(), entry["path"]
     expected = entry["before"] if (mode == "payload" or entry.get("commit")) else entry["after"]
     assert sha(target) == expected, "Source changed: " + entry["path"]
-    assert sha(stage / "payload" / entry["path"]) == entry["after"], "Payload mismatch: " + entry["path"]
+    if not entry.get("delete"):
+        assert sha(stage / "payload" / entry["path"]) == entry["after"], "Payload mismatch: " + entry["path"]
 selected = [e for e in plan["files"] if bool(e.get("commit")) == (mode == "commit")]
 for entry in selected:
     target = root / entry["path"]
+    if entry.get("delete"):
+        target.unlink()
+        assert not target.exists()
+        continue
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(target.name + __SUFFIX__)
     assert not temp.exists(), "Unexpected deployment temporary file"
@@ -676,7 +681,8 @@ for entry in selected:
     os.replace(temp, target)
     assert sha(target) == entry["after"]
 print(json.dumps({"phase": mode, "version": plan["version"], "verifiedFiles": len(selected),
-                  "created": sum(1 for e in selected if e["before"] is None)}))
+                  "created": sum(1 for e in selected if e["before"] is None),
+                  "removed": sum(1 for e in selected if e.get("delete"))}))
 '''
 
 DEPLOY_WINDOWS = r'''param([ValidateSet('payload', 'commit')][string]$Mode)
@@ -692,12 +698,14 @@ foreach ($entry in $plan.files) {
     if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid target' }
     $expected = if ($Mode -eq 'payload' -or $entry.commit) { $entry.before } else { $entry.after }
     if ((Get-Sha $target) -ne $expected) { throw "Source changed: $($entry.path)" }
-    if ((Get-Sha (Join-Path (Join-Path $PSScriptRoot 'payload') $entry.path)) -ne $entry.after) { throw "Payload mismatch: $($entry.path)" }
+    if (-not $entry.delete -and (Get-Sha (Join-Path (Join-Path $PSScriptRoot 'payload') $entry.path)) -ne $entry.after) { throw "Payload mismatch: $($entry.path)" }
 }
 $created = 0
+$removed = 0
 $selected = @($plan.files | Where-Object { [bool]$_.commit -eq ($Mode -eq 'commit') })
 foreach ($entry in $selected) {
     $target = [IO.Path]::GetFullPath((Join-Path $root $entry.path))
+    if ($entry.delete) { [IO.File]::Delete($target); if ([IO.File]::Exists($target)) { throw 'Delete failed' }; $removed++; continue }
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $target))
     $temp = $target + __SUFFIX__
     if (Test-Path -LiteralPath $temp) { throw 'Unexpected temporary file' }
@@ -707,7 +715,7 @@ foreach ($entry in $selected) {
     else { [IO.File]::Replace($temp, $target, [System.Management.Automation.Language.NullString]::Value) }
     if ((Get-Sha $target) -ne $entry.after) { throw 'Install mismatch' }
 }
-@{ phase = $Mode; version = $plan.version; verifiedFiles = $selected.Count; created = $created } | ConvertTo-Json -Compress
+@{ phase = $Mode; version = $plan.version; verifiedFiles = $selected.Count; created = $created; removed = $removed } | ConvertTo-Json -Compress
 '''
 
 

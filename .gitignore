@@ -1,5 +1,4 @@
 /tools/portable-pack.json
-/tools/cloud.local.json
 /tools/cache/
 /tools/curseforge-api-key.txt
 /.update-server-token
@@ -19,4 +18,3 @@ PORTABLE-UPDATE-URL.txt
 /.portable-publish-lock/
 **/.portable-build-*/
 **/.portable-backup-*/
-/.update-signing-key.xml

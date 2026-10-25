@@ -195,7 +195,7 @@ class PythonHelperTests(unittest.TestCase):
         opener.open.side_effect = fetch
         with mock.patch.object(sys, 'argv', ['updater', '--instance-dir', str(self.root),
                      '--manifest-url', 'http://127.0.0.1/secret/server-manifest.json']), \
-             mock.patch.object(self.u, 'fetch_trusted_manifest', return_value=(json.dumps(manifest).encode(), None)), \
+             mock.patch.object(self.u, 'fetch_manifest', return_value=json.dumps(manifest).encode()), \
              mock.patch.object(self.u, '_DIRECT_OPENER', opener), \
              mock.patch.object(self.u.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()) as out, \
              contextlib.redirect_stderr(io.StringIO()):

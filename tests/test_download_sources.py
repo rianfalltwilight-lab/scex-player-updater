@@ -1,4 +1,4 @@
-"""Download routing, replacement, mirrors and launcher repair; synthetic data only."""
+"""Download routing, replacement and launcher repair; synthetic data only."""
 import contextlib
 import hashlib
 import importlib.util
@@ -189,52 +189,6 @@ if ($script:calls.Count -ne 1 -or $script:calls[0] -ne 'https://cdn.example/seco
                     " -Retries 0\nif ($script:waits -ne 1) { throw 'Wrong busy retry count' }")
             self.assertEqual(BusyHandler.requests, 2)
             self.assertEqual(dest.read_bytes(), data)
-
-
-class MirrorTests(unittest.TestCase):
-    def exercise_mirrors(self, engine):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data = b'expected bytes'
-            row = write(root, 'good/mods/demo.jar', data)
-            row['path'] = 'mods/demo.jar'
-            manifest = {'packId': 'demo', 'version': '2', 'files': [row]}
-            json_write(root / 'good/server-manifest.json', manifest)
-            wrong = dict(manifest, files=[dict(row, sha1='0' * 40)], forceDeleteGlobs=['*'])
-            write(root, 'wrong/mods/demo.jar', data)
-            json_write(root / 'wrong/server-manifest.json', wrong)
-            write(root, 'wrong-version/mods/demo.jar', data)
-            json_write(root / 'wrong-version/server-manifest.json', dict(manifest, version='other'))
-            with serve(root) as port:
-                base = f'http://127.0.0.1:{port}'
-                manifest['mirrorManifestUrls'] = [base + '/wrong/server-manifest.json', base + '/wrong-version/server-manifest.json', base + '/good/server-manifest.json']
-                dest = root / 'client.jar'
-                if engine == 'python':
-                    u = load_updater()
-                    u.configure_hybrid(manifest, base + '/missing/server-manifest.json')
-                    sources = u.prepare_hybrid()
-                    self.assertEqual(len(sources), 2)
-                    self.assertFalse(any('/wrong/' in s['base'] for s in sources))
-                    # Force the missing primary first, then prove per-file fallback.
-                    u._HYBRID['sources'] = sorted(sources, key=lambda s: '/missing/' not in s['base'])
-                    u.download_hybrid_entry(row, dest, row['sha1'], row['path'])
-                else:
-                    config = root / 'config.json'
-                    json_write(config, manifest)
-                    run_ps('$script:HybridManifest=Get-Content -Raw ' + ps_quote(config) + ' | ConvertFrom-Json\n' +
-                        '$script:HybridManifestUrl=' + ps_quote(base + '/missing/server-manifest.json') + '\n' +
-                        'Initialize-HybridSources\n' +
-                        "if ($script:HybridSources.Count -ne 2 -or @($script:HybridSources | Where-Object { $_.Base -like '*/wrong/*' }).Count) { throw 'Accepted different mirror release' }\n" +
-                        "$script:HybridSources=@($script:HybridSources | Sort-Object { if ($_.Base -like '*/missing/*') { 0 } else { 1 } })\n" +
-                        '[void](Download-HybridEntry $script:HybridManifest.files[0] ' + ps_quote(dest) + ' ' + ps_quote(row['sha1']) + " 'mods/demo.jar')")
-                self.assertEqual(dest.read_bytes(), data)
-
-    def test_python_mirror_inventory_and_missing_primary_fallback(self):
-        self.exercise_mirrors('python')
-
-    @unittest.skipUnless(PS and os.name == 'nt', 'Requires Windows PowerShell')
-    def test_powershell_mirror_inventory_and_missing_primary_fallback(self):
-        self.exercise_mirrors('powershell')
 
 
 class LauncherRepairTests(unittest.TestCase):

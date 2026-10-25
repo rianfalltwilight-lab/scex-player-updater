@@ -1,6 +1,0 @@
-{
-  "note": "Public manifest-signing keys trusted by every reader (MANIFEST_SIGNATURE_V1). The private key never enters the repository.",
-  "trusted": {
-    "d95f8fce25c000bb": "36G6hVExT3FYPdPFSYf/TTxIqZ0Q8ybtxLqtR8KXgZ8yc2CNEJA+kW27ZO8vzQB7wrjKG7H58r0bkyHQpFRlcU0JygsWTypUzdCeNioTe5PP9vixwORTM37E4O4Dr+/IaLfxUQK+VsWhVMV30Wn2RWBrjLsVg5d9WeK0HC/Sm/VR2NJfCH8d9PLMFRptpp3z3mAaATBdyIMFh6+wlv241rayh/hLTSj6ZGtTcedlMrbY4lNR/b9VV0C/abhvQxU32qKOgLJEHmSxHh2YdzreW9lMBvzQOPztftnZjr1uCqm1+3H0B53iqHmqwvNf5MpQiajBK5bbm/tkXM/AVwuIe5z9kNDAWgDYr7FxiwlX5Glg5C3i4KQJK5eQn8X8m4GW22e/lfYEggvfPiNNYIn9k2C7itxI3W8jxe8GBuiNKiTuDkzOjw0RoOYfOYW3IGvVqy+MRt51bEp3XoVgw/DyeTi+RDQHR56n4Pkr78ISuVWOQKqHO4R7j4jSIM9maEM5"
-  }
-}

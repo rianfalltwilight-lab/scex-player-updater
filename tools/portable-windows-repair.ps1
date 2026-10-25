@@ -157,47 +157,15 @@ function Test-RepairGlob([string]$Rel,$Globs) {
     foreach($glob in @($Globs)) { if($Rel.Replace('\','/') -like ([string]$glob).Replace('\','/')){return $true} }
     return $false
 }
-# MANIFEST_TRUST_BEGIN: identical in player-update-generic.ps1, portable-bootstrap-refresh.ps1,
+# MANIFEST_CACHE_BEGIN: identical in player-update-generic.ps1, portable-bootstrap-refresh.ps1,
 # portable-stage-daemon.ps1, player-self-repair.ps1 and portable-windows-repair.ps1;
-# tests/test_manifest_trust.py compares the copies (rules as in player-update-generic.py).
-# MANIFEST_SIGNATURE_V1: server-manifest.json.sig is an RSA PKCS#1 v1.5 SHA-256 signature by a
-# trusted key. After a sync has verified one, the state says manifestSignature = required and
-# unsigned or wrongly signed manifests are refused. MANIFEST_CACHE_V1: the last verified
-# manifest and signature are kept with their ETags, so an unchanged manifest costs two 304s.
-$script:UpdaterVersion = '2.27.24'
-$script:TrustedManifestKeys = @{ 'd95f8fce25c000bb' = '36G6hVExT3FYPdPFSYf/TTxIqZ0Q8ybtxLqtR8KXgZ8yc2CNEJA+kW27ZO8vzQB7wrjKG7H58r0bkyHQpFRlcU0JygsWTypUzdCeNioTe5PP9vixwORTM37E4O4Dr+/IaLfxUQK+VsWhVMV30Wn2RWBrjLsVg5d9WeK0HC/Sm/VR2NJfCH8d9PLMFRptpp3z3mAaATBdyIMFh6+wlv241rayh/hLTSj6ZGtTcedlMrbY4lNR/b9VV0C/abhvQxU32qKOgLJEHmSxHh2YdzreW9lMBvzQOPztftnZjr1uCqm1+3H0B53iqHmqwvNf5MpQiajBK5bbm/tkXM/AVwuIe5z9kNDAWgDYr7FxiwlX5Glg5C3i4KQJK5eQn8X8m4GW22e/lfYEggvfPiNNYIn9k2C7itxI3W8jxe8GBuiNKiTuDkzOjw0RoOYfOYW3IGvVqy+MRt51bEp3XoVgw/DyeTi+RDQHR56n4Pkr78ISuVWOQKqHO4R7j4jSIM9maEM5' }
+# tests/test_manifest_cache.py compares the copies (rules as in player-update-generic.py).
+# MANIFEST_CACHE_V1: the last manifest is kept with its ETag, so an unchanged manifest costs
+# one small 304 response; the server may send it gzip-compressed.
+$script:UpdaterVersion = '2.27.25'
 $script:ManifestCacheDir = '.portable-manifest-cache'
 
-function Test-ManifestSignature {
-    # Returns the id of the trusted key that signed Data; throws '[签名校验失败] <reason>'.
-    param([byte[]]$Data, [byte[]]$SignatureFile)
-    try {
-        $info = [Text.Encoding]::UTF8.GetString($SignatureFile).TrimStart([char]0xFEFF) | ConvertFrom-Json
-        $keyId = [string]$info.keyId
-        $signature = [Convert]::FromBase64String([string]$info.signature)
-        $algorithm = [string]$info.algorithm
-    } catch { throw '[签名校验失败] 签名文件格式错误' }
-    if ($algorithm -ne 'RSA-PKCS1-v1_5-SHA256') { throw '[签名校验失败] 签名算法不受支持' }
-    if (-not $keyId -or -not $script:TrustedManifestKeys.ContainsKey($keyId)) { throw '[签名校验失败] 签名密钥不受信任' }
-    $parameters = New-Object Security.Cryptography.RSAParameters
-    $parameters.Modulus = [Convert]::FromBase64String([string]$script:TrustedManifestKeys[$keyId])
-    $parameters.Exponent = [byte[]](1, 0, 1)
-    $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider
-    $valid = $false
-    try { $rsa.ImportParameters($parameters); $valid = $rsa.VerifyData($Data, 'SHA256', $signature) } catch { $valid = $false } finally { $rsa.Dispose() }
-    if (-not $valid) { throw '[签名校验失败] 签名与清单不符' }
-    return $keyId
-}
-
-function Test-ManifestSignatureRequired {
-    param([string]$Root)
-    try {
-        $state = [IO.File]::ReadAllText((Join-Path $Root '.portable-sync-state.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
-        return ([string]$state.manifestSignature -eq 'required')
-    } catch { return $false }
-}
-
-function Invoke-TrustRequest {
+function Invoke-ManifestRequest {
     # One direct GET, never through a proxy. Returns @{ Status; ETag; Body }.
     param([string]$Url, [string]$ETag, [int]$TimeoutSec, [string]$UserAgent)
     $request = [Net.HttpWebRequest]::Create($Url)
@@ -214,8 +182,8 @@ function Invoke-TrustRequest {
         try { $response = $request.GetResponse() } catch {
             $web = $_.Exception
             while ($web -and -not ($web -is [Net.WebException])) { $web = $web.InnerException }
-            # 304 and 404 are answers; anything else keeps the original WebException for the caller.
-            if ($web -and $web.Response -and ([int]$web.Response.StatusCode) -in @(304, 404)) { $response = $web.Response } else { throw }
+            # 304 is an answer; anything else keeps the original WebException for the caller.
+            if ($web -and $web.Response -and ([int]$web.Response.StatusCode) -eq 304) { $response = $web.Response } else { throw }
         }
         $status = [int]$response.StatusCode
         $body = $null
@@ -237,37 +205,32 @@ function Get-ManifestCacheFolder {
     return $folder
 }
 
-function Read-ManifestTrustCache {
+function Get-Sha256Hex {
+    param([byte[]]$Data)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Data))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+}
+
+function Read-ManifestCache {
     param([string]$Root)
     $folder = Get-ManifestCacheFolder $Root
     if (-not $folder) { return $null }
     try {
         $meta = [IO.File]::ReadAllText((Join-Path $folder 'meta.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
         $manifest = [IO.File]::ReadAllBytes((Join-Path $folder 'server-manifest.json'))
-        $signature = [IO.File]::ReadAllBytes((Join-Path $folder 'server-manifest.json.sig'))
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try {
-            $manifestSha = ([BitConverter]::ToString($sha.ComputeHash($manifest))).Replace('-', '').ToLowerInvariant()
-            $signatureSha = ([BitConverter]::ToString($sha.ComputeHash($signature))).Replace('-', '').ToLowerInvariant()
-        } finally { $sha.Dispose() }
-        if ($manifestSha -ne [string]$meta.manifestSha256 -or $signatureSha -ne [string]$meta.signatureSha256) { return $null }
-        return @{ Manifest = $manifest; ManifestETag = [string]$meta.manifestEtag; Signature = $signature; SignatureETag = [string]$meta.signatureEtag }
+        if ((Get-Sha256Hex $manifest) -ne [string]$meta.manifestSha256) { return $null }
+        return @{ Manifest = $manifest; ETag = [string]$meta.manifestEtag }
     } catch { return $null }
 }
 
-function Write-ManifestTrustCache {
-    param([string]$Root, [byte[]]$Manifest, [string]$ManifestETag, [byte[]]$Signature, [string]$SignatureETag)
+function Write-ManifestCache {
+    param([string]$Root, [byte[]]$Manifest, [string]$ETag)
     $folder = Get-ManifestCacheFolder $Root
-    if (-not $folder) { return }
+    if (-not $folder -or -not $ETag) { return }
     try {
         [void][IO.Directory]::CreateDirectory($folder)
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try {
-            $meta = [ordered]@{ manifestEtag = $ManifestETag; manifestSha256 = ([BitConverter]::ToString($sha.ComputeHash($Manifest))).Replace('-', '').ToLowerInvariant()
-                signatureEtag = $SignatureETag; signatureSha256 = ([BitConverter]::ToString($sha.ComputeHash($Signature))).Replace('-', '').ToLowerInvariant() }
-        } finally { $sha.Dispose() }
-        $files = @(@('server-manifest.json', $Manifest), @('server-manifest.json.sig', $Signature), @('meta.json', [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Compress))))
-        foreach ($file in $files) {
+        $meta = [ordered]@{ manifestEtag = $ETag; manifestSha256 = (Get-Sha256Hex $Manifest) }
+        foreach ($file in @(@('server-manifest.json', $Manifest), @('meta.json', [Text.Encoding]::UTF8.GetBytes(($meta | ConvertTo-Json -Compress))))) {
             $target = Join-Path $folder $file[0]
             $temporary = $target + '.' + $PID + '.tmp'
             [IO.File]::WriteAllBytes($temporary, [byte[]]$file[1])
@@ -276,43 +239,17 @@ function Write-ManifestTrustCache {
     } catch { }  # the cache only saves bandwidth
 }
 
-function Get-TrustedManifest {
-    # Returns [pscustomobject]@{ Raw = [byte[]]; KeyId = id or $null }. Throws '[签名校验失败] ...'
-    # for a missing or wrong signature, and any other exception when the source is unreachable.
+function Get-CachedManifest {
+    # Returns [pscustomobject]@{ Raw = [byte[]] }; throws when the source is unreachable.
     param([string]$Url, [string]$Root = '', [int]$TimeoutSec = 20, [string]$UserAgent = 'SCEX-updater', [switch]$NoCache)
-    $required = [bool]($Root -and (Test-ManifestSignatureRequired $Root))
-    $cache = if ($Root -and -not $NoCache) { Read-ManifestTrustCache $Root } else { $null }
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $reply = Invoke-TrustRequest -Url $Url -ETag $(if ($cache) { $cache.ManifestETag } else { '' }) -TimeoutSec $TimeoutSec -UserAgent $UserAgent
-        if ($reply.Status -eq 304 -and $cache) { $raw = $cache.Manifest; $rawTag = $cache.ManifestETag }
-        elseif ($reply.Status -eq 200) { $raw = $reply.Body; $rawTag = $reply.ETag }
-        else { throw ('HTTP ' + $reply.Status) }
-        $reply = Invoke-TrustRequest -Url ($Url + '.sig') -ETag $(if ($cache) { $cache.SignatureETag } else { '' }) -TimeoutSec $TimeoutSec -UserAgent $UserAgent
-        if ($reply.Status -eq 304 -and $cache) { $sig = $cache.Signature; $sigTag = $cache.SignatureETag }
-        elseif ($reply.Status -eq 200) { $sig = $reply.Body; $sigTag = $reply.ETag }
-        elseif ($reply.Status -eq 404) { $sig = $null }
-        else { throw ('HTTP ' + $reply.Status) }
-        if ($null -eq $sig) {
-            if ($required) { throw '[签名校验失败] 更新清单缺少签名' }
-            return [pscustomobject]@{ Raw = $raw; KeyId = $null }
-        }
-        try { $keyId = Test-ManifestSignature -Data $raw -SignatureFile $sig }
-        catch {
-            $failure = $_
-            $named = $null
-            try { $named = [string]([Text.Encoding]::UTF8.GetString($sig).TrimStart([char]0xFEFF) | ConvertFrom-Json).manifestSha256 } catch { }
-            $sha = [Security.Cryptography.SHA256]::Create()
-            try { $actual = ([BitConverter]::ToString($sha.ComputeHash($raw))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
-            if ($attempt -eq 1 -and $named -and $named -ne $actual) { $cache = $null; Start-Sleep -Milliseconds 1500; continue }
-            throw $failure
-        }
-        $fromCache = $cache -and [object]::ReferenceEquals($raw, $cache.Manifest) -and [object]::ReferenceEquals($sig, $cache.Signature)
-        if ($Root -and -not $NoCache -and -not $fromCache) { Write-ManifestTrustCache -Root $Root -Manifest $raw -ManifestETag $rawTag -Signature $sig -SignatureETag $sigTag }
-        return [pscustomobject]@{ Raw = $raw; KeyId = $keyId }
-    }
-    throw '[签名校验失败] 签名与清单不符'
+    $cache = if ($Root -and -not $NoCache) { Read-ManifestCache $Root } else { $null }
+    $reply = Invoke-ManifestRequest -Url $Url -ETag $(if ($cache) { $cache.ETag } else { '' }) -TimeoutSec $TimeoutSec -UserAgent $UserAgent
+    if ($reply.Status -eq 304 -and $cache) { return [pscustomobject]@{ Raw = $cache.Manifest } }
+    if ($reply.Status -ne 200) { throw ('HTTP ' + $reply.Status) }
+    if ($Root -and -not $NoCache) { Write-ManifestCache -Root $Root -Manifest $reply.Body -ETag $reply.ETag }
+    return [pscustomobject]@{ Raw = $reply.Body }
 }
-# MANIFEST_TRUST_END
+# MANIFEST_CACHE_END
 $script:SyncUserAgent = "SCEX-updater/$($script:UpdaterVersion) (windows-repair $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor); windows)"
 
 function Get-RepairMaskedUrl([string]$Url) {
@@ -425,8 +362,7 @@ if ($urls.Count -eq 0) {
     try {
         foreach($manifestUrl in $urls) {
             try {
-                # MANIFEST_SIGNATURE_V1: only a verified manifest may vouch for the downloaded entry.
-                $manifest=[Text.Encoding]::UTF8.GetString([byte[]](Get-TrustedManifest -Url $manifestUrl -Root $instanceDir -TimeoutSec 8 -UserAgent $script:SyncUserAgent -NoCache).Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                $manifest=[Text.Encoding]::UTF8.GetString([byte[]](Get-CachedManifest -Url $manifestUrl -Root $instanceDir -TimeoutSec 8 -UserAgent $script:SyncUserAgent -NoCache).Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
                 $rows=@($manifest.files | Where-Object { $_.path -ceq '_updater/Windows-sync.bat' })
                 if ($rows.Count -ne 1 -or [string]$rows[0].sha1 -notmatch '^[0-9a-fA-F]{40}$' -or $null -eq $rows[0].size -or [long]$rows[0].size -le 0) { throw '[校验失败] 清单没有有效的 Windows 更新入口。' }
                 $row=$rows[0]
