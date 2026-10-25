@@ -12,7 +12,7 @@
       3) 只在 manifest 文本变化时才做文件 diff；idle 轮询近乎零开销（一次 GET + 字符串比较）。
       4) 生命周期自管：游戏由 PCL/HMCL 独立进程启动，本 daemon 靠"检测 java 进程 + 最大时长 + 单例锁"自退，
          不残留后台进程。
-      5) Windows PowerShell 5.1 使用 UTF-8 BOM 识别中文；CRLF 或 LF 均可。
+      5) 编码/换行按仓库铁律：UTF-8 无 BOM 保存；本文件是 PowerShell，CRLF 或 LF 均可，但保存时勿加 BOM。
 #>
 param(
     [string]$InstanceDir = ".",
@@ -104,6 +104,11 @@ function Read-UpdateUrl {
     $urls = @(Read-UpdateUrls -Root $Root -Override $Override)
     if ($urls.Count -gt 0) { return [string]$urls[0] }
     return ""
+}
+
+function Test-RetiredCloudUrl {
+    param([string]$Url)
+    try { $hostName = ([Uri]$Url).Host.ToLowerInvariant().TrimEnd('.') ; return ($hostName -eq '7caiyun.com' -or $hostName.EndsWith('.7caiyun.com')) } catch { return $false }
 }
 
 function Test-PrivateUpdateUrl {
@@ -372,11 +377,11 @@ $addUrl = {
     $v = ([string]$Value).Trim()
     if (-not [string]::IsNullOrWhiteSpace($v) -and $seenUrl.Add($v)) { [void]$ordered.Add($v) }
 }
-$publicUrls = @($manifestUrls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
-$candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($manifestUrls) }
-if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
+$publicUrls = @($manifestUrls | Where-Object { -not (Test-PrivateUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
+$candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($manifestUrls | Where-Object { -not (Test-RetiredCloudUrl $_) }) }
+if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood) -and -not (Test-RetiredCloudUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in $candidates) { & $addUrl $u }
-if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
+if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood) -and -not (Test-RetiredCloudUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in @($manifestUrls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
 $manifestUrls = @($ordered)
 $manifestUrl = ""

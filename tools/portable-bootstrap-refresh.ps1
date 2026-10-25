@@ -63,7 +63,10 @@ function Read-UpdateUrls {
     $add = {
         param([string]$Value)
         $v = ([string]$Value).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($v) -and -not $v.StartsWith('#') -and $seen.Add($v)) { [void]$urls.Add($v) }
+        if ([string]::IsNullOrWhiteSpace($v) -or $v.StartsWith('#')) { return }
+        # 7caiyun CDN is retired: never refresh updater scripts from it.
+        try { $h = ([Uri]$v).Host.ToLowerInvariant().TrimEnd('.'); if ($h -eq '7caiyun.com' -or $h.EndsWith('.7caiyun.com')) { return } } catch {}
+        if ($seen.Add($v)) { [void]$urls.Add($v) }
     }
     if (-not [string]::IsNullOrWhiteSpace($Override)) {
         foreach ($line in ($Override -split '[\r\n\x1f]+')) { & $add $line }
@@ -195,11 +198,11 @@ $addUrl = {
     if (-not [string]::IsNullOrWhiteSpace($v) -and $seenUrl.Add($v)) { [void]$ordered.Add($v) }
 }
 $publicUrls = @($urls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
-$candidates = if ($publicUrls.Count -gt 0) { $publicUrls } else { @($urls) }
+$candidates = if ($publicUrls.Count -gt 0) { @($publicUrls[0]) } else { @($urls) }
 if ($candidates -contains $lastGood -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
 foreach ($u in $candidates) { & $addUrl $u }
-if (-not [string]::IsNullOrWhiteSpace($lastGood) -and -not (Test-PrivateUpdateUrl $lastGood)) { & $addUrl $lastGood }
-# Explicit LAN addresses remain fallback candidates when public access fails.
+
+# LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
 foreach ($u in @($urls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $addUrl $u }
 $urls = @($ordered)
 $selected = ''
@@ -215,7 +218,7 @@ for ($i = 0; $i -lt $urls.Count; $i++) {
     }
 }
 if ([string]::IsNullOrWhiteSpace($selected)) {
-    Write-Host '[更新器] 更新源暂时不可达，跳过自刷新；本地同步器会继续尝试备用地址。'
+    Write-Host '[更新器] 更新源暂时不可达，跳过自刷新；本地同步器会继续尝试主线。'
     exit 0
 }
 if ($selectedIndex -gt 0) { Write-Host '[更新器] 已切换到备用更新地址。' }

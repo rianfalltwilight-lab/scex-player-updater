@@ -26,7 +26,7 @@ import zipfile
 
 # 家宽更新源是 DDNS 直连地址，绝不该走系统代理。macOS 上 urllib 会自动读取系统代理
 # （如 Clash 的“设为系统代理”），而代理节点到不了 18088 端口就会对每个请求整齐回 503。
-# 官方 CDN 优先直连；仅在当前请求失败或持续低速后尝试现有代理。
+# 官方 CDN（cdn.modrinth.com）相反：国内直连经常能通但很慢，有系统代理就该走代理。
 # 默认 opener 仍强制直连，避免清单/家宽误入代理；官方源单独选 opener。
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 urllib.request.install_opener(_DIRECT_OPENER)
@@ -40,8 +40,11 @@ _PRIVATE_PROBE_TIMEOUT_SEC = 1.2
 _PUBLIC_PROBE_TIMEOUT_SEC = 8
 _DOWNLOAD_WORKERS = 4
 _PRINT_LOCK = threading.Lock()
+_OFFICIAL_LOCK = threading.Lock()
 _PROXY_URL = None
 _PROXY_OPENER = None
+_OFFICIAL_SKIP = False
+_OFFICIAL_SKIP_NOTIFIED = False
 
 
 def fetch_bytes(url: str, timeout: float = 20) -> bytes:
@@ -247,10 +250,12 @@ def is_official_https_url(url: str) -> bool:
 
 
 def reset_download_policy():
-    """Reset cached proxy detection for tests and each main() invocation."""
-    global _PROXY_URL, _PROXY_OPENER
+    """测试和每次 main() 开头清空缓存，避免上次运行的跳过/代理结果串台。"""
+    global _PROXY_URL, _PROXY_OPENER, _OFFICIAL_SKIP, _OFFICIAL_SKIP_NOTIFIED
     _PROXY_URL = None
     _PROXY_OPENER = None
+    _OFFICIAL_SKIP = False
+    _OFFICIAL_SKIP_NOTIFIED = False
 
 
 def normalize_proxy_url(raw: str) -> str:
@@ -351,8 +356,13 @@ def probe_timeout_for_url(url: str) -> float:
     return _PRIVATE_PROBE_TIMEOUT_SEC if is_local_or_private_host(host) else _PUBLIC_PROBE_TIMEOUT_SEC
 
 
+def is_retired_cloud_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(str(url) or "").hostname or "").lower().rstrip(".")
+    return host == "7caiyun.com" or host.endswith(".7caiyun.com")
+
+
 def order_manifest_urls(urls, last_good: str = "") -> list:
-    """Prefer public addresses, then explicit LAN fallbacks; never invent a LAN URL."""
+    """Public addresses only. Never auto-insert a LAN IP for WAN players."""
     seen = set()
     out = []
 
@@ -366,17 +376,16 @@ def order_manifest_urls(urls, last_good: str = "") -> list:
         seen.add(low)
         out.append(key)
 
-    public = [url for url in (urls or []) if not is_private_update_url(url)]
+    public = [url for url in (urls or []) if not is_private_update_url(url) and not is_retired_cloud_url(url)]
     # 玩家自己把 UPDATE-URL 写成局域网地址时保留；自动探测产生的 192.168 一律丢掉。
-    candidates = public or list(urls or [])
-    if last_good in candidates and not is_private_update_url(last_good):
+    candidates = public[:1] or [url for url in (urls or []) if not is_retired_cloud_url(url)][:1]
+    if last_good in candidates and not is_private_update_url(last_good) and not is_retired_cloud_url(last_good):
         add(last_good)
     for url in candidates:
         add(url)
-    if last_good and not is_private_update_url(last_good):
-        add(last_good)
+    # LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
     for url in (urls or []):
-        if is_private_update_url(url):
+        if is_private_update_url(url) and not is_retired_cloud_url(url):
             add(url)
     return out
 
@@ -760,6 +769,16 @@ def download_file(url: str, dest: pathlib.Path, expected_sha1: str, opener=None,
     install_verified_file(tmp, dest, expected_sha1)
 
 
+def mark_official_skip():
+    global _OFFICIAL_SKIP, _OFFICIAL_SKIP_NOTIFIED
+    with _OFFICIAL_LOCK:
+        _OFFICIAL_SKIP = True
+        notify = not _OFFICIAL_SKIP_NOTIFIED
+        _OFFICIAL_SKIP_NOTIFIED = True
+    if notify:
+        sync_print("[同步] 官方源本轮不再尝试，其余文件直接走更新服务。")
+
+
 # HYBRID_DOWNLOAD_V1: mirrors supply bytes only, never policy or a different release.
 _HYBRID = None
 _HYBRID_LOCK = threading.Lock()
@@ -798,7 +817,7 @@ def prepare_hybrid():
         seen = set()
         for url in [h['url']] + list(h['urls']):
             parsed = urllib.parse.urlsplit(str(url))
-            if url in seen or parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            if url in seen or is_retired_cloud_url(url) or parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
                 continue
             seen.add(url)
             try:
@@ -814,9 +833,7 @@ def prepare_hybrid():
                     with _DIRECT_OPENER.open(request, timeout=3) as response:
                         data = response.read(131072)
                     source['score'] = len(data) / max(time.monotonic()-started, 0.001)
-                except Exception as exc:
-                    if isinstance(exc, urllib.error.HTTPError):
-                        exc.close()
+                except Exception:
                     pass  # keep an unmeasured source as last-resort fallback
                 sources.append(source)
             except Exception:
@@ -1758,8 +1775,8 @@ def sync_instance(root, args) -> int:
             return key, rel, force_sync, None, exc
 
     if download_jobs:
+        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {_DOWNLOAD_WORKERS}）。")
         workers = max(1, min(8, int(manifest.get("downloadWorkers", _DOWNLOAD_WORKERS)), len(download_jobs)))
-        print(f"[同步] 需要更新 {len(download_jobs)} 个文件（并行 {workers}）。")
         if workers == 1:
             results = [run_download_job(job) for job in download_jobs]
         else:

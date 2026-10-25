@@ -145,6 +145,8 @@ function Backup-FileIfExists {
 
 $script:ProxyUrl = $null
 $script:ProxyResolved = $false
+$script:OfficialSkip = $false
+$script:OfficialSkipNotified = $false
 $script:OfficialMinBytes = 1MB
 $script:OfficialMinRateBps = 128KB
 $script:PrivateProbeTimeoutSec = 2
@@ -278,6 +280,14 @@ function Test-PrivateUpdateUrl {
     try { return (Test-LocalOrPrivateHost ([Uri]$Url).Host) } catch { return $false }
 }
 
+function Test-RetiredCloudUrl {
+    param([string]$Url)
+    try {
+        $hostName = ([Uri]$Url).Host.ToLowerInvariant().TrimEnd('.')
+        return ($hostName -eq '7caiyun.com' -or $hostName.EndsWith('.7caiyun.com'))
+    } catch { return $false }
+}
+
 function Get-OrderedManifestUrls {
     param([string[]]$Urls, [string]$LastGood = '')
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -287,12 +297,12 @@ function Get-OrderedManifestUrls {
         $v = ([string]$Value).Trim()
         if (-not [string]::IsNullOrWhiteSpace($v) -and $seen.Add($v)) { [void]$out.Add($v) }
     }
-    $public = @($Urls | Where-Object { -not (Test-PrivateUpdateUrl $_) })
-    $candidates = if ($public.Count -gt 0) { $public } else { @($Urls) }
-    if ($candidates -contains $LastGood -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
+    $public = @($Urls | Where-Object { -not (Test-PrivateUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })
+    $candidates = if ($public.Count -gt 0) { @($public[0]) } else { @($Urls | Where-Object { -not (Test-RetiredCloudUrl $_) }) }
+    if ($candidates -contains $LastGood -and -not (Test-PrivateUpdateUrl $LastGood) -and -not (Test-RetiredCloudUrl $LastGood)) { & $add $LastGood }
     foreach ($u in $candidates) { & $add $u }
-    if (-not [string]::IsNullOrWhiteSpace($LastGood) -and -not (Test-PrivateUpdateUrl $LastGood)) { & $add $LastGood }
-    foreach ($u in @($Urls | Where-Object { Test-PrivateUpdateUrl $_ })) { & $add $u }
+    # LAN_FALLBACK_V1: LAN URLs listed in UPDATE-URL go last, for routers without NAT hairpin.
+    foreach ($u in @($Urls | Where-Object { (Test-PrivateUpdateUrl $_) -and -not (Test-RetiredCloudUrl $_) })) { & $add $u }
     return @($out)
 }
 
@@ -609,7 +619,7 @@ function Install-VerifiedFile {
         }
         for ($attempt=0; $attempt -lt 3; $attempt++) {
             try {
-                if ([IO.File]::Exists($Destination)) { [IO.File]::Replace($Temporary,$Destination,[System.Management.Automation.Language.NullString]::Value) }
+                if ([IO.File]::Exists($Destination)) { [IO.File]::Replace($Temporary,$Destination,[NullString]::Value) }
                 else { [IO.File]::Move($Temporary,$Destination) }
                 return
             } catch { if ($attempt -eq 2) { throw }; Start-Sleep -Milliseconds 250 }
@@ -695,6 +705,14 @@ function Download-ManifestFile {
     # Verified partials survive local lock errors; incomplete downloads resume next run.
 }
 
+function Set-OfficialSkip {
+    $script:OfficialSkip = $true
+    if (-not $script:OfficialSkipNotified) {
+        $script:OfficialSkipNotified = $true
+        Write-Host '[同步] 官方源本轮不再尝试，其余文件直接走更新服务。'
+    }
+}
+
 # HYBRID_DOWNLOAD_V1: alternate manifests are byte sources, never policy overrides.
 function Initialize-HybridSources {
     if ($null -ne $script:HybridSources) { return }
@@ -706,7 +724,7 @@ function Initialize-HybridSources {
         if ($seen.ContainsKey([string]$url)) { continue }; $seen[[string]$url] = $true
         try {
             $uri = [Uri]$url
-            if ($uri.Scheme -notin @('http','https') -or -not $uri.Host -or $uri.UserInfo -or $uri.Fragment) { continue }
+            if ((Test-RetiredCloudUrl $url) -or $uri.Scheme -notin @('http','https') -or -not $uri.Host -or $uri.UserInfo -or $uri.Fragment) { continue }
             $m = if ($url -eq $script:HybridManifestUrl) { $script:HybridManifest } else { (Read-UrlUtf8Text -Url $url -TimeoutSec 4 -Retries 0) | ConvertFrom-Json }
             if ([string]$m.packId -cne [string]$script:HybridManifest.packId -or [string]$m.version -cne [string]$script:HybridManifest.version -or @($m.files).Count -ne $reference.Count) { throw 'Different mirror release' }
             $rows = @{}

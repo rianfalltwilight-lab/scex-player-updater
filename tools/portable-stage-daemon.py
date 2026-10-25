@@ -125,6 +125,11 @@ def is_private_update_url(url: str) -> bool:
         return False
 
 
+def is_retired_cloud_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(str(url) or "").hostname or "").lower().rstrip(".")
+    return host == "7caiyun.com" or host.endswith(".7caiyun.com")
+
+
 def order_update_urls(urls: list, last_good: str = "") -> list:
     seen = set()
     out = []
@@ -139,13 +144,13 @@ def order_update_urls(urls: list, last_good: str = "") -> list:
         seen.add(low)
         out.append(key)
 
-    public = [url for url in (urls or []) if not is_private_update_url(url)]
-    candidates = public or list(urls or [])
-    if last_good in candidates and not is_private_update_url(last_good):
+    public = [url for url in (urls or []) if not is_private_update_url(url) and not is_retired_cloud_url(url)]
+    candidates = public or [url for url in (urls or []) if not is_retired_cloud_url(url)]
+    if last_good in candidates and not is_private_update_url(last_good) and not is_retired_cloud_url(last_good):
         add(last_good)
     for url in candidates:
         add(url)
-    if last_good and not is_private_update_url(last_good):
+    if last_good and not is_private_update_url(last_good) and not is_retired_cloud_url(last_good):
         add(last_good)
     for url in urls or []:
         if is_private_update_url(url):

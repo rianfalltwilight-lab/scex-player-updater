@@ -19,20 +19,12 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } c
 
 function Normalize-Rel([string]$Rel) { return ([string]$Rel).Replace('\', '/').TrimStart('/') }
 function Normalize-RelKey([string]$Rel) { return (Normalize-Rel $Rel).ToLowerInvariant() }
-function Get-Sha1 {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
-    $hash = [System.Security.Cryptography.SHA1]::Create()
-    $stream = $null
-    try {
-        $stream = [System.IO.File]::OpenRead($Path)
-        return ([System.BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
-    } finally {
-        if ($stream) { $stream.Dispose() }
-        $hash.Dispose()
-    }
+function Get-Sha1([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    $hash=[Security.Cryptography.SHA1]::Create();$stream=$null
+    try { $stream=[IO.File]::OpenRead($Path);return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+    finally { if($stream){$stream.Dispose()};$hash.Dispose() }
 }
-
 function Test-RelativePathSafe([string]$Rel) {
     $n = Normalize-Rel $Rel
     if ([string]::IsNullOrWhiteSpace($n)) { return $false }
@@ -356,7 +348,7 @@ foreach ($candidateUrl in @($manifestUrls)) {
         }
         $raw = Strip-JsonComments $raw
         $candidateManifest = $raw | ConvertFrom-Json
-        if ($null -eq $candidateManifest -or $null -eq $candidateManifest.files) { throw 'manifest 缺少 files。' }
+        if (-not $candidateManifest.files) { throw 'manifest 缺少 files。' }
         $manifest = $candidateManifest
         $manifestUrl = $candidateUrl
         $fileBaseUrl = $candidateBaseUrl

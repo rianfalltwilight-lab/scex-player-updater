@@ -1,6 +1,7 @@
 ﻿param(
     [string]$ConfigPath = ".\tools\portable-pack.json",
-    [string]$Version = ""
+    [string]$Version = "",
+    [switch]$NoNotify
 )
 
 $ErrorActionPreference = "Stop"
@@ -398,7 +399,10 @@ $releaseDecision = ([string](Get-ConfigValue -Object $config -Name 'releaseDecis
 if ([string]::IsNullOrWhiteSpace($packId) -or $packId -match 'CHANGE-ME') {
     Write-Host ''
     Write-Host '[便携] 还不能发布：portable-pack.json 里整合包身份是空的（packId/packName 未填写）。' -ForegroundColor Red
-    Write-Host "请编辑 tools\portable-pack.json，填写 packId、packName 和 sourceClient。"
+    Write-Host '这是新服务端（私包出厂即中性）的正常状态，先补两步：' -ForegroundColor Yellow
+    Write-Host '  1. 面板①配置点「初始化配置向导」（或双击 一键脚本\一键便携-初始化配置.bat）——自动识别本服版本/加载器，并让你自定义整合包名称；' -ForegroundColor Yellow
+    Write-Host '  2. 确认主分发客户端已设置（向导里选，或面板点「选择分发客户端目录」）。' -ForegroundColor Yellow
+    Write-Host '完成后再点「仅发布更新」。' -ForegroundColor Yellow
     exit 1
 }
 if ([string]::IsNullOrWhiteSpace($packName)) { $packName = $packId }
@@ -411,7 +415,8 @@ if (-not (Test-Path -LiteralPath $sourceClient -PathType Container)) {
     Write-Host ''
     Write-Host "[便携] 还不能发布：主分发客户端目录不存在：$sourceClient" -ForegroundColor Red
     Write-Host '发布就是把主分发客户端的 mods/config 等复制到更新源，所以必须先有客户端：' -ForegroundColor Yellow
-    Write-Host "请将 sourceClient 设置为客户端实例目录（包含 mods/config 的目录）。"
+    Write-Host '  - 已有客户端：在面板点「选择主客户端…」指定它的实例目录（可以在服务端目录外）；' -ForegroundColor Yellow
+    Write-Host '  - 还没有客户端：在服务端根目录新建「客户端」文件夹，放入整合包客户端实例后重跑初始化配置向导。' -ForegroundColor Yellow
     exit 1
 }
 $publishDir = Resolve-InRoot -Path ([string](Get-ConfigValue -Object $config -Name 'publishDir' -Default '.\modpack-public\portable'))
@@ -504,6 +509,8 @@ if (-not [string]::IsNullOrWhiteSpace($oldVersion) -and $Version -ne $oldVersion
 }
 
 # 增量发布：不删除发布目录，逐文件比对写入；过期文件在所有复制完成后统一清理。
+# Local-origin mode: the public 18088 source is authoritative; cloud staging is retired.
+
 New-Item -ItemType Directory -Force $publishDir | Out-Null
 
 $excludeGlobs = Get-ConfigArray -Object $config -Name 'excludeGlobs' -Default @()
@@ -547,7 +554,7 @@ Copy-ToolFile -SourceName 'portable-bootstrap-refresh.ps1' -DestinationName 'por
 Copy-ToolFile -SourceName 'portable-windows-repair.ps1' -DestinationName 'portable-windows-repair.ps1' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-windows-repair.bat' -DestinationName 'portable-windows-repair.bat' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-windows-sync.bat' -DestinationName 'Windows-sync.bat' -DestinationRoot $updaterRoot
-Copy-ToolFile -SourceName 'portable-client-entry.bat' -DestinationName '更新mod-Windows端.bat' -DestinationRoot $publishDir
+Copy-ToolFile -SourceName 'portable-windows-sync.bat' -DestinationName '更新mod-Windows端.bat' -DestinationRoot $publishDir
 Copy-ToolFile -SourceName 'portable-macos-sync.command' -DestinationName 'macOS-sync.command' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-macos-sync.command' -DestinationName '更新mod-Mac端.command' -DestinationRoot $publishDir
 Copy-ToolFile -SourceName 'player-self-repair.ps1' -DestinationName 'player-self-repair.ps1' -DestinationRoot $updaterRoot
@@ -620,7 +627,7 @@ $lookupHashes = New-Object System.Collections.Generic.List[string]
 $fileRows = New-Object System.Collections.Generic.List[object]
 Get-ChildItem -LiteralPath $publishDir -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
     $rel = $_.FullName.Substring($base.Length).TrimStart('\', '/') -replace '\\', '/'
-    # A locked retired file may remain on disk; it must never re-enter the release.
+    # Retained locked files are not part of the new release.
     if (-not $script:DesiredRelKeys.Contains($rel)) { return }
     # server-manifest.json / update-log.txt 在清单生成之后才写入，不能进清单，
     # 否则增量发布时旧内容的哈希会跟着进清单、随后又被覆盖，玩家端校验必失败。
@@ -642,13 +649,7 @@ Get-ChildItem -LiteralPath $publishDir -Recurse -File -Force | Sort-Object FullN
     }
     [void]$fileRows.Add($row)
 }
-$sourceConfig = Get-ConfigValue -Object $config -Name 'officialSources' -Default $null
-$officialEnabled = [bool](Get-ConfigValue -Object $sourceConfig -Name 'enabled' -Default $true)
-$sourceIndexTool = Join-Path $PSScriptRoot 'official-source-index.py'
-$sourcePython = [string](Get-ConfigValue -Object $config.update -Name 'pythonExe' -Default 'python.exe')
-$useSourceIndex = $officialEnabled -and (Test-Path -LiteralPath $sourceIndexTool) -and [bool](Get-Command $sourcePython -ErrorAction SilentlyContinue)
-# Preserve the PowerShell-only publishing path when Python is not installed.
-$freshMap = if ($officialEnabled -and -not $useSourceIndex) { Get-ModrinthUrlMap -Sha1List @($lookupHashes) } else { @{} }
+$freshMap = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'official-source-index.py')) { @{} } else { Get-ModrinthUrlMap -Sha1List @($lookupHashes) }
 $officialEligible = 0
 $officialReused = 0
 $officialFresh = 0
@@ -665,12 +666,11 @@ foreach ($row in $fileRows) {
     }
     $files += [pscustomobject]$row
 }
-$officialMatched = $officialReused + $officialFresh
+Write-Host ("[便携] Modrinth 官方源：命中 {0} / {1}（沿用 {2}，新查 {3}）。未命中的汉化/私有文件仍走自建更新服务。" -f ($officialReused + $officialFresh), $officialEligible, $officialReused, $officialFresh)
 
 $manifest = [ordered]@{
     format = 2
     updaterRevision = [string](Get-ConfigValue -Object $config -Name 'updaterRevision' -Default '2026.10.07-official-parallel')
-    downloadWorkers = [Math]::Max(1, [Math]::Min(8, [int](Get-ConfigValue -Object $config -Name 'downloadWorkers' -Default 4)))
     packId = $packId
     pack = $packId
     packName = $packName
@@ -707,15 +707,17 @@ $manifestNextPath = Join-Path $publishDir '.server-manifest.json.next'
 $manifestText = (($manifest | ConvertTo-Json -Depth 10) + "`r`n")
 try {
     Write-Utf8NoBom -Path $manifestNextPath -Value $manifestText
-    # Resolve exact-hash official sources before switching the public manifest.
-    if ($useSourceIndex) {
+    # Resolve exact-hash official mirrors before publishing the new manifest.
+    $sourceIndexTool = Join-Path $PSScriptRoot 'official-source-index.py'
+    if (Test-Path -LiteralPath $sourceIndexTool) {
+        $sourcePython = [string](Get-ConfigValue -Object $config.update -Name 'pythonExe' -Default 'python.exe')
         $sourceArgs = @($sourceIndexTool, '--manifest', $manifestNextPath, '--directory', $publishDir, '--cache', (Join-Path $PSScriptRoot 'cache\official-source-index.json'))
+        $sourceConfig = Get-ConfigValue -Object $config -Name 'officialSources' -Default $null
         $cfKeyFile = [string](Get-ConfigValue -Object $sourceConfig -Name 'curseforgeKeyFile' -Default '')
-        if ($cfKeyFile) { $sourceArgs += @('--curseforge-key-file', (Resolve-AnyPath -Path $cfKeyFile)) }
+        if ($cfKeyFile) { $sourceArgs += @('--curseforge-key-file', $cfKeyFile) }
         & $sourcePython @sourceArgs
         if ($LASTEXITCODE -ne 0) { throw 'Official-source indexing failed; previous manifest retained' }
         $manifest = Get-Content -LiteralPath $manifestNextPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $officialMatched = [int]$manifest.downloadSourceStatus.official_unique
     }
     Assert-PublishedManifestIntegrity -Manifest $manifest -PublishRoot $publishDir
     Copy-FileWithRetry -Source $manifestNextPath -Dest $manifestPath
@@ -729,17 +731,18 @@ try {
 } finally {
     if (Test-Path -LiteralPath $manifestNextPath -PathType Leaf) { Remove-Item -LiteralPath $manifestNextPath -Force -ErrorAction SilentlyContinue }
 }
-Write-Host ("[便携] 官方源：命中 {0} / {1}。未命中的文件仍走自建更新服务。" -f $officialMatched, $officialEligible)
-Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n文件数量：$($files.Count)`r`n官方源命中：$officialMatched / $officialEligible`r`n"
+Write-Utf8NoBom -Path (Join-Path $publishDir 'update-log.txt') -Value "便携发布 $Version`r`n整合包：$packName`r`n文件数量：$($files.Count)`r`n官方源命中：$($officialReused + $officialFresh) / $officialEligible`r`n"
 Write-Host "[便携] 已发布 $packName $Version"
 Write-Host "[便携] 源客户端：$sourceClient"
 Write-Host "[便携] 发布目录：$publishDir"
+
+# Local-origin mode: do not contact or publish to 七彩云.
 Write-Host "[便携] 清单地址：$manifestUrl"
 Write-Host "[便携] 文件数：$($files.Count)，从源客户端复制：$script:CopiedFiles"
 
 # ---------------------------------------------------------------
 # 变更对比：生成本次发布的新增/删除/修改文件列表
-# 分类汇总 mods 和 config 变化，写入本地摘要文件
+# 分类汇总 mods 和 config 变化，写入摘要文件并通知 Discord/QQ
 # ---------------------------------------------------------------
 if ($oldFiles.Count -gt 0) {
     # 排除每次发布都会重新生成的元文件，避免误报
@@ -781,7 +784,7 @@ if ($oldFiles.Count -gt 0) {
     }
 
     # 把"同一 mod 的旧版删除 + 新版新增"配对识别成一次"版本变更"——mod jar 文件名带版本号，
-    # 版本一变文件名就变，diff 只会看成 add+remove（非 modify）。更新摘要使用这份配对结果，
+    # 版本一变文件名就变，diff 只会看成 add+remove（非 modify）。摘要和 RCON 广播共用这份配对结果，
     # 摘要再按版本数值方向区分为升级、回退或方向未知，而不是把所有变化都叫成升级。
     # 去掉文件名开头的"装饰前缀"：排序号 + 中文标签，如 "8.4[神秘时代]" / "[更多箱子] " / "[玉 🔍] "。
     # 前缀只是给人看的分类标记，改标签、改排序号不代表换了一个 mod，所以不能进身份。
@@ -1060,9 +1063,67 @@ if ($oldFiles.Count -gt 0) {
         Write-Host $summaryText
         Write-Host ""
 
-        Write-Host "[更新器] 更新摘要已保存。"
+        if ($NoNotify) {
+            Write-Host "[便携] 本次使用 -NoNotify：已刷新清单，但跳过 Discord / QQ 与游戏内广播。"
+        } else {
+            # 调用通知脚本转发到 Discord/QQ（best-effort，失败不阻断发布）
+            $notifyScript = Join-Path $PSScriptRoot 'send-update-notify.ps1'
+            if (Test-Path -LiteralPath $notifyScript -PathType Leaf) {
+                Write-Host "[便携] 正在发送更新通知到 Discord / QQ …"
+                try {
+                    $prevErrorAction = $ErrorActionPreference
+                    $ErrorActionPreference = "Continue"
+                    & $notifyScript -SummaryFile $summaryPath 2>&1 | ForEach-Object { Write-Host $_ }
+                    $ErrorActionPreference = $prevErrorAction
+                } catch {
+                    Write-Host "[便携] 通知发送异常：$($_.Exception.Message)，发布流程继续。"
+                }
+            } else {
+                Write-Host "[便携] 未找到通知脚本 send-update-notify.ps1，跳过通知。"
+            }
+
+            # 发布即时提醒：通过 RCON 向在线玩家广播一条游戏内消息（tellraw @a）。
+            # 这是"发布即时通知"的主通道——瞬时、游戏内、必达；后台 daemon 随后 30s 内开始预下载。
+            # best-effort：服务器没开/未启用 RCON/没在线玩家都不阻断发布。
+            $rconScript = Join-Path $PSScriptRoot 'rcon-command.ps1'
+            if (Test-Path -LiteralPath $rconScript -PathType Leaf) {
+                # 三份名单复用上面按 Get-ModKey 配对好的结果：更新（配对成功的 add+remove、以及同名 modify）、纯新增、纯移除。
+                $updatedPaths = New-Object System.Collections.Generic.List[string]
+                foreach ($u in $modVersionChanges) { [void]$updatedPaths.Add($u.New) }
+                foreach ($u in $modRenames)  { [void]$updatedPaths.Add($u.New) }   # 改名也要重下，对玩家等价于"更新"
+                foreach ($m in @($modified | Where-Object { $_ -like 'mods/*.jar' })) { [void]$updatedPaths.Add($m) }
+                $addedPaths   = @($addedFinal   | Where-Object { $_ -like 'mods/*.jar' })
+                $removedPaths = @($removedFinal | Where-Object { $_ -like 'mods/*.jar' })
+
+            # 公屏名单：去掉 mods/ 前缀与 .jar 后缀，最多列 6 个，多余折叠成"…等 N 个"。
+            function Format-ModLine {
+                param($Paths, [int]$Max = 6)
+                $names = @($Paths | ForEach-Object { ($_ -replace '^mods/', '') -replace '\.jar$', '' })
+                if ($names.Count -le $Max) { return ($names -join '、') }
+                return (($names[0..($Max - 1)] -join '、') + " …等 " + $names.Count + " 个")
+            }
+
+                $rawComponents = @(
+                    "",
+                    @{ text = "`n[整合包更新] "; color = "gold"; bold = $true },
+                    @{ text = "服务器已发布新版本，你的客户端会在后台自动下载。`n"; color = "yellow" }
+                )
+                if ($addedPaths.Count -gt 0)   { $rawComponents += @{ text = ("  新增：" + (Format-ModLine $addedPaths) + "`n"); color = "green" } }
+                if ($updatedPaths.Count -gt 0) { $rawComponents += @{ text = ("  更新：" + (Format-ModLine $updatedPaths) + "`n"); color = "aqua" } }
+                if ($removedPaths.Count -gt 0) { $rawComponents += @{ text = ("  移除：" + (Format-ModLine $removedPaths) + "`n"); color = "red" } }
+                if (($addedPaths.Count + $updatedPaths.Count + $removedPaths.Count) -eq 0) { $rawComponents += @{ text = "  本次为配置 / 资源更新`n"; color = "gray" } }
+                $rawComponents += @{ text = "退出游戏后重新双击脚本启动即可用上新内容（无需再等下载）。`n"; color = "gray" }
+                $tellrawJson = ($rawComponents | ConvertTo-Json -Compress -Depth 5)
+                try {
+                    [void](& $rconScript -Command ("tellraw @a " + $tellrawJson))
+                    Write-Host "[便携] 已通过 RCON 向在线玩家广播更新提示。"
+                } catch {
+                    Write-Host "[便携] RCON 广播跳过（服务器未运行 / 未开 RCON / 无在线玩家）：$($_.Exception.Message)"
+                }
+            }
+        }
     } else {
-        Write-Host "[便携] 本次发布与上一版的版本号、说明和文件均无变化。"
+        Write-Host "[便携] 本次发布与上一版的版本号、说明和文件均无变化，跳过通知。"
     }
 }
 
