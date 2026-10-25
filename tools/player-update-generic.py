@@ -13,6 +13,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import struct
 import sys
 import tempfile
@@ -111,13 +112,41 @@ def rel_key(rel: str) -> str:
     return safe_rel(rel).lower()
 
 
+_NAME_SURROGATE_TAGS = (0xA000000C, 0xA0000003)  # IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT
+
+
+def _is_name_surrogate(path: pathlib.Path) -> bool:
+    """A symlink or junction; cloud placeholders and other data reparse points are not."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) in _NAME_SURROGATE_TAGS
+
+
+def _canonical_base(base: pathlib.Path):
+    """SHORT_PATH_V1: the resolved form of base, or None if a link is on the way.
+    A resolved path can also differ because of 8.3 short names (C:\\Users\\RUNNER~1)
+    or letter case; those are the same directory, not a link."""
+    resolved = base.resolve()
+    if os.path.normcase(str(resolved)) == os.path.normcase(str(base)):
+        return base
+    probe = base
+    while True:
+        if _is_name_surrogate(probe):
+            return None
+        if probe.parent == probe:
+            return resolved
+        probe = probe.parent
+
+
 def join_safe(root: pathlib.Path, rel: str) -> pathlib.Path:
-    base = root.absolute()
-    target = base.joinpath(*safe_rel(rel).split("/"))
     # Do not follow a junction/symlink in any parent, even when the final file
     # itself has ordinary attributes. Root has already been resolved by main.
-    if os.path.normcase(str(base.resolve())) != os.path.normcase(str(base)):
+    base = _canonical_base(root.absolute())
+    if base is None:
         raise LocalFileUpdateError(f"[路径错误] 更新目录经过链接，已停止写入：{root}")
+    target = base.joinpath(*safe_rel(rel).split("/"))
     resolved = target.resolve()
     if not resolved.is_relative_to(base) or resolved != target:
         raise LocalFileUpdateError(f"[路径错误] 更新目标经过链接或越出目录，已停止写入：{rel}")

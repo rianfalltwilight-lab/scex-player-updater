@@ -661,7 +661,8 @@ function Download-ManifestFile {
     $tmp = Get-PartialDownloadPath -Destination $Destination -Sha1 $ExpectedSha1
     $identity = [IO.Path]::GetFileName($tmp).Substring(56)
     foreach ($stale in @(Get-ChildItem -LiteralPath (Split-Path -Parent $Destination) -Filter ('.portable-part-*' + $identity) -File -Force)) {
-        if ($stale.FullName -ne $tmp) { Assert-SafeAbsolutePath -Path $stale.FullName; [IO.File]::Delete($stale.FullName) }
+        # SHORT_PATH_V1: compare names; Get-ChildItem reports long names even for an 8.3 short directory path.
+        if ($stale.Name -ne [IO.Path]::GetFileName($tmp)) { Assert-SafeAbsolutePath -Path $stale.FullName; [IO.File]::Delete($stale.FullName) }
     }
     if ([IO.File]::Exists($tmp) -and (Get-Sha1 $tmp) -eq $ExpectedSha1) { Install-VerifiedFile -Temporary $tmp -Destination $Destination; return }
     $phase = '下载'
