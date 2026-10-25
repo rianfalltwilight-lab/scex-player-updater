@@ -99,6 +99,12 @@ PowerShell 发布器有可用 Python 时调用 `official-source-index.py`，按�
 
 地址文件可写多行 URL。scex 分支的所有入口（Python/PowerShell 同步器、自刷新、两个后台预下载、macOS 入口）使用同一规则：忽略非 http(s) 行，只使用第一个公网地址，失败后按文件顺序尝试明确写入的局域网地址；规则与用例见 `tests/fixtures/url-order-cases.json`。客户端不会修改系统代理、路由或防火墙；开启 TUN 时，应用直连不等于流量绕过 TUN。
 
+## 更新器维护工具（scex 分支）
+
+- `python3 tools/update-adoption.py [--days 7]`：在下载服务器上只读汇总访问日志，按天列出玩家用的更新器版本和组件、每位访客最后一次的版本和状态，以及需要关注的访客（例如仍在用 2.27.24、或取清单失败）。访客编号每天更换，不记录 IP。
+- `python tools/bump-updater-version.py X.Y.Z [--mac-note 说明]`：一次修改所有引擎副本里的更新器版本号，macOS 入口的 `@version` 同时加一并记一行历史；各文件的 BOM 和换行保持不变。`--check` 只检查各副本是否一致。
+- `python tools/release-updater.py --config <主机配置> --release <release.json> <步骤>`：只发布更新器、不重发整合包。preflight 会核对提交里的引擎版本并显示玩家版本分布；deploy 前检查该提交的 GitHub CI 全部通过（`--skip-ci` 可跳过并记入回执）；finalize 后自动生成中文 `发布回执.txt`。主机配置和令牌放在仓库之外。
+
 ## 来源与许可
 
 上游作者：**i0czf**，原仓库：[minecraft-server-ops-kit](https://github.com/i0czf/minecraft-server-ops-kit)。SCEX 怀旧服适配及此更新器独立提取由 **rianfalltwilight-lab / SCEX** 维护。本 fork 不代表上游官方发行版。

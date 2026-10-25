@@ -437,7 +437,7 @@ function Get-OfficialFileUrls {
 # tests/test_manifest_cache.py compares the copies (rules as in player-update-generic.py).
 # MANIFEST_CACHE_V1: the last manifest is kept with its ETag, so an unchanged manifest costs
 # one small 304 response; the server may send it gzip-compressed.
-$script:UpdaterVersion = '2.27.26'
+$script:UpdaterVersion = '2.27.28'
 $script:ManifestCacheDir = '.portable-manifest-cache'
 
 function Invoke-ManifestRequest {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @version 18
+# @version 19
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
@@ -103,7 +103,7 @@ def fetch_bytes(url, timeout=12):
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.26"
+UPDATER_VERSION = "2.27.28"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
@@ -482,3 +482,4 @@ exit "$status"
 # 同步失败时可直接运行完整检查修复（_updater/macOS-self-repair.command 是同一功能的独立入口）。
 # v17：去掉清单签名校验（只保留 ETag 缓存）。
 # v18：去掉已退役云端的地址过滤（该云端已全面停用）。
+# v19：更新器版本号改为 2.27.28，功能不变。

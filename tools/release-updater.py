@@ -3,21 +3,29 @@
 servers without a full content publish. Each step can be re-run and it is safe to stop
 between steps; nothing is installed before `deploy`.
 
-  preflight  production still serves the previous release (hashes from its receipt)
+  preflight  production still serves the previous release (hashes from its receipt), the
+             committed engines carry this version; prints the players' updater versions
   backup     copy every file this release touches from each host (never overwrites)
   prepare    per-host payloads and deploy plans; manifest rows; files to remove
   e2e        local transition test (previous engines and entry -> this release; localhost)
   dryrun     run the generated deploy scripts against copies of the backup
   stage      copy payloads to each host's temp folder and verify every hash
-  deploy     install host by host: files, optional service restart, manifest and removals last
+  ci         GitHub Actions for the release commit: every job must have passed
+  deploy     CI gate (unless --skip-ci), then install host by host: files, optional
+             service restart, manifest and removals last
   verify     HTTP checks through every address, Range, gzip, live bootstrap checks
-  finalize   confirm production hashes, remove the stages, write the receipt
+  finalize   confirm production hashes, remove the stages, write the receipts
+  receipt    rewrite the Chinese 发布回执.txt from the JSON receipts
 
-  python tools/release-updater.py --config <hosts.json> --release <release.json> <step>
+  python tools/release-updater.py --config <hosts.json> --release <release.json> [--skip-ci] <step>
 
 The host config (addresses, users, paths and the token location) stays outside
 the repository. A release may list "removeFiles" (paths under a host root) that are
-deleted after the manifest; each must still hold its backed-up hash."""
+deleted after the manifest; each must still hold its backed-up hash. "logReplace"
+([old, new] pairs) rewrites text in the existing update-log.txt history, and
+"receiptNotes" adds lines to 发布回执.txt. When a content release came after the
+previous updater release, the files the content publisher owns may differ from the
+previous receipt, and the manifest keeps that release's notes after this one's."""
 import argparse
 import base64
 import copy
@@ -30,6 +38,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -45,6 +54,8 @@ PUBLIC = "modpack-public/portable/"
 HELPERS = ["player-update-generic.ps1", "player-update-generic.py", "portable-stage-daemon.ps1", "portable-stage-daemon.py",
            "portable-bootstrap-refresh.ps1", "macOS-sync.command", "Windows-sync.bat"]
 PS = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+# Files portable-publish.ps1 rewrites on every content release.
+CONTENT_OWNED = (PUBLIC + "server-manifest.json", PUBLIC + "update-log.txt", PUBLIC + "使用说明.txt", "tools/portable-pack.json")
 
 
 def load_module(path, name):
@@ -70,8 +81,35 @@ def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def ci_verdict(runs, jobs_for):
+    """CI_GATE_V1. runs: GitHub workflow runs for one commit; jobs_for(run_id) -> its jobs.
+    The newest attempt of every workflow must be completed with every job successful."""
+    latest = {}
+    for run in runs:
+        key = run.get("workflow_id") or run.get("name")
+        order = (run.get("run_number") or 0, run.get("run_attempt") or 0)
+        if key not in latest or order > (latest[key].get("run_number") or 0, latest[key].get("run_attempt") or 0):
+            latest[key] = run
+    summary = []
+    for run in sorted(latest.values(), key=lambda r: str(r.get("name"))):
+        jobs = jobs_for(run["id"]) if run.get("status") == "completed" else []
+        summary.append({"id": run["id"], "name": run.get("name"), "status": run.get("status"), "conclusion": run.get("conclusion"),
+                        "jobs": len(jobs), "passed": sum(1 for job in jobs if job.get("conclusion") == "success")})
+    if not summary:
+        return {"ok": False, "reason": "no CI run for this commit (was it pushed?)", "runs": []}
+    waiting = [r["name"] for r in summary if r["status"] != "completed"]
+    if waiting:
+        return {"ok": False, "reason": "CI still running: " + ", ".join(map(str, waiting)), "runs": summary}
+    failed = [r["name"] for r in summary if r["conclusion"] != "success" or not r["jobs"] or r["passed"] != r["jobs"]]
+    if failed:
+        return {"ok": False, "reason": "CI did not pass: " + ", ".join(map(str, failed)), "runs": summary}
+    total = sum(r["jobs"] for r in summary)
+    return {"ok": True, "reason": f"{total}/{total} jobs passed", "runs": summary}
+
+
 class Release:
-    def __init__(self, config_path, release_path):
+    def __init__(self, config_path, release_path, skip_ci=False):
+        self.skip_ci = skip_ci
         self.config = read_json(config_path)
         self.spec = read_json(release_path)
         self.version = self.spec["version"]
@@ -171,21 +209,102 @@ class Release:
         removed = set(self.spec.get("removeFiles", []))
         return sorted((set(server) | {"tools/portable-pack.json"} | {r for r in removed if not r.startswith(PUBLIC)})), sorted(public | {r for r in removed if r.startswith(PUBLIC)})
 
+    def engine_version(self):
+        """UPDATER_VERSION of the committed engine; the release must carry the same version."""
+        text = self.committed("tools/player-update-generic.py").decode("utf-8-sig")
+        match = re.search(r'^UPDATER_VERSION = "([\d.]+)"', text, re.M)
+        return match.group(1) if match else None
+
+    def require_engine_version(self):
+        found = self.engine_version()
+        if found != self.version:
+            raise SystemExit(f"the committed engines say {found}, the release says {self.version}: "
+                             f"run python tools/bump-updater-version.py {self.version} and commit first")
+
+    def content_release_between(self):
+        """True when a content release replaced the previous updater release's manifest."""
+        return read_json(self.spec["previousReceipt"])["version"] != self.previous
+
+    def remote_python_args(self, host, program, args, timeout=180):
+        python = self.hosts[host]["python"]
+        return self.ssh(host, python + " - " + " ".join(shlex.quote(a) for a in args), stdin=program.encode("utf-8"), timeout=timeout)
+
+    def player_versions(self, days=2):
+        """Read-only: the committed update-adoption.py against the primary host's access log."""
+        host = self.config["primary"]
+        info = self.hosts[host]
+        if info["kind"] != "posix" or not info.get("python"):
+            return "(no access-log summary for a non-posix primary host)"
+        root = info["root"].rstrip("/")
+        program = self.committed("tools/update-adoption.py").decode("utf-8")
+        try:
+            return self.remote_python_args(host, program, ["--folder", root + "/logs/update-access",
+                                                           "--public", root + "/" + PUBLIC.rstrip("/"), "--days", str(days)])
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            return "(access-log summary unavailable: " + str(exc)[:200] + ")"
+
+    # ---- CI ------------------------------------------------------------------------
+    def github(self):
+        url = subprocess.run(["git", "-C", str(REPO), "remote", "get-url", "origin"], capture_output=True, text=True, check=True).stdout.strip()
+        match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+        if not match:
+            raise SystemExit("origin is not a GitHub repository: CI cannot be checked (use --skip-ci)")
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        try:
+            cred = subprocess.run(["git", "credential", "fill"], input="protocol=https\nhost=github.com\n\n", capture_output=True,
+                                  text=True, timeout=30, env=env).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            cred = ""
+        token = dict(line.split("=", 1) for line in cred.splitlines() if "=" in line).get("password", "")
+        headers = {"User-Agent": "scex-release-ci-check", "Accept": "application/vnd.github+json"}
+        if token:
+            headers["Authorization"] = "Bearer " + token  # kept in memory only
+
+        def get(path):
+            request = urllib.request.Request(f"https://api.github.com/repos/{match.group(1)}/{match.group(2)}/" + path, headers=headers)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        return get
+
+    def check_ci(self, get=None):
+        get = get or self.github()
+        try:
+            runs = get(f"actions/runs?head_sha={self.commit}&per_page=100").get("workflow_runs", [])
+            verdict = ci_verdict(runs, lambda run_id: get(f"actions/runs/{run_id}/jobs?per_page=100").get("jobs", []))
+        except (OSError, ValueError) as exc:
+            verdict = {"ok": False, "reason": "GitHub API unavailable: " + str(exc)[:200], "runs": []}
+        verdict.update(commit=self.commit, checkedAt=now())
+        return verdict
+
+    def ci(self):
+        verdict = self.check_ci()
+        self.out.mkdir(parents=True, exist_ok=True)
+        (self.out / "ci-check.json").write_bytes(encoded(verdict))
+        print(json.dumps(verdict, ensure_ascii=False))
+        return verdict["ok"]
+
     # ---- steps ---------------------------------------------------------------------
     def preflight(self):
         receipt = read_json(self.spec["previousReceipt"])
-        ok = True
-        report = {}
+        content = self.content_release_between()
+        report = {"engineVersion": self.engine_version(), "contentReleaseSincePreviousUpdater": content}
+        ok = report["engineVersion"] == self.version
         for host in self.order:
             expected = {e["path"]: e["after"] for e in receipt["hosts"][host]["files"]}
             actual = self.remote_hashes(host, list(expected))
-            bad = [p for p in expected if actual.get(p) != expected[p]]
+            differ = [p for p in expected if actual.get(p) != expected[p]]
+            # A content release rewrites its own files; everything else must be untouched.
+            bad = [p for p in differ if not (content and p in CONTENT_OWNED)]
             manifest_version = None
             if not bad:
                 manifest_version = json.loads(self.remote_text(host, PUBLIC + "server-manifest.json")).get("version")
-            report[host] = {"checked": len(expected), "mismatched": bad, "manifestVersion": manifest_version}
+            report[host] = {"checked": len(expected), "mismatched": bad, "changedByContentRelease": [p for p in differ if p not in bad],
+                            "manifestVersion": manifest_version}
             ok = ok and not bad and manifest_version == self.previous
         print(json.dumps({"productionMatchesPrevious": ok, **report}, ensure_ascii=False, indent=2))
+        if report["engineVersion"] != self.version:
+            print(f"the committed engines say {report['engineVersion']}: run python tools/bump-updater-version.py {self.version}")
+        print("players (read-only access-log summary):\n" + self.player_versions())
         return ok
 
     def remote_text(self, host, rel):
@@ -220,14 +339,17 @@ class Release:
         print(json.dumps({"baseline": self.previous, "backedUpFiles": len(records), "absentOnHost": absent}, ensure_ascii=False))
 
     def prepare(self):
+        self.require_engine_version()
         baseline = read_json(self.work / "baseline-receipt.json")
         mapping = self.publisher_map()
         changed = self.changed_repo_files()
+        content = self.content_release_between()
         if self.out.exists():
             shutil.rmtree(self.out)
         receipt = {"version": self.version, "previousVersion": self.previous, "updaterRevision": self.spec["revision"],
                    "preparedAt": now(), "sourceRepository": str(REPO), "sourceCommit": self.commit,
-                   "previousCommit": self.spec["previousCommit"], "rollbackRoot": str(self.backup), "hosts": {}}
+                   "previousCommit": self.spec["previousCommit"], "rollbackRoot": str(self.backup),
+                   "contentReleaseSincePreviousUpdater": content, "hosts": {}}
         stamp = now()
         for host in self.order:
             old = self.backup / host
@@ -235,7 +357,10 @@ class Release:
             manifest = read_json(old / (PUBLIC + "server-manifest.json"))
             original = copy.deepcopy(manifest)
             config = read_json(old / "tools/portable-pack.json")
-            manifest.update(version=self.version, generatedAt=stamp, updaterRevision=self.spec["revision"], releaseNotes=self.spec["notes"])
+            # Players who skipped the content release still see its notes after this one's.
+            carried = [n for n in (original.get("releaseNotes") or []) if content and n not in self.spec["notes"]]
+            notes = list(self.spec["notes"]) + carried
+            manifest.update(version=self.version, generatedAt=stamp, updaterRevision=self.spec["revision"], releaseNotes=notes)
             rows = {r["path"]: r for r in manifest["files"]}
             payloads, changed_rows, added_rows = {}, [], []
             for rel in changed:
@@ -266,10 +391,15 @@ class Release:
             assert keep_old == keep_new, host
             assert len({r["path"].lower() for r in files}) == len(files)
             config.update(version=self.version, releaseVersion=self.version, releaseNotesVersion=self.version, releaseLevel="patch",
-                          updaterRevision=self.spec["revision"], releaseNotes=self.spec["notes"], releaseModChanges=[],
+                          updaterRevision=self.spec["revision"], releaseNotes=notes,
+                          releaseModChanges=list(config.get("releaseModChanges") or []) if content else [],
                           releaseOtherChanges=self.spec["notes"], releaseDecision=self.spec["decision"])
             payloads["tools/portable-pack.json"] = encoded(config)
             old_log = (old / (PUBLIC + "update-log.txt")).read_text(encoding="utf-8-sig")
+            for before, after in self.spec.get("logReplace", []):
+                if before not in old_log:
+                    raise SystemExit(f"{host}: logReplace text not found in update-log.txt: {before}")
+                old_log = old_log.replace(before, after)
             title = f"> {dt.date.today():%Y/%m/%d} v{self.version}\n{self.spec['logTitle']}\n\n"
             payloads[PUBLIC + "update-log.txt"] = (title + "\n".join("- " + n for n in self.spec["notes"]) + "\n\n" + old_log).encode("utf-8")
             manifest_bytes = encoded(manifest)
@@ -304,13 +434,14 @@ class Release:
         suffix = "." + self.stage_name + ".tmp"
         if info["kind"] == "posix":
             text = DEPLOY_POSIX.replace("__ROOT__", repr(info["root"])).replace("__VERSION__", repr(self.version)).replace("__SUFFIX__", repr(suffix))
-            (self.out / host / "deploy.py").write_text(text, encoding="utf-8", newline="\n")
+            (self.out / host / "deploy.py").write_bytes(text.encode("utf-8"))
         else:
             root = info["root"].replace("/", "\\")
             text = DEPLOY_WINDOWS.replace("__ROOT__", "'" + root + "'").replace("__VERSION__", "'" + self.version + "'").replace("__SUFFIX__", "'" + suffix + "'")
-            (self.out / host / "deploy.ps1").write_text(text, encoding="utf-8-sig", newline="\r\n")
+            (self.out / host / "deploy.ps1").write_bytes(text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8-sig"))
 
     def dryrun(self):
+        report = {"checkedAt": now(), "hosts": {}}
         with tempfile.TemporaryDirectory(prefix="release-dryrun-") as tmp:
             for host in self.order:
                 info = self.hosts[host]
@@ -338,7 +469,9 @@ class Release:
                 again = subprocess.run(commands[0], capture_output=True, timeout=180)
                 if again.returncode == 0:
                     raise SystemExit(f"{host}: a second payload run was not refused")
-                print(json.dumps({"host": host, "dryRunVerified": len(plan["files"]), "secondRunRefused": True}))
+                report["hosts"][host] = {"dryRunVerified": len(plan["files"]), "secondRunRefused": True}
+                print(json.dumps({"host": host, **report["hosts"][host]}))
+        (self.out / "dryrun.json").write_bytes(encoded(report))
 
     def remote_stage(self, host):
         info = self.hosts[host]
@@ -391,6 +524,14 @@ class Release:
         return json.loads(self.ssh(host, f"powershell -NoProfile -ExecutionPolicy Bypass -File {stage}/deploy.ps1 -Mode {phase}"))
 
     def deploy(self):
+        if self.skip_ci:
+            verdict = {"ok": None, "skipped": True, "reason": "--skip-ci", "commit": self.commit, "checkedAt": now()}
+        else:
+            verdict = self.check_ci()
+        (self.out / "ci-check.json").write_bytes(encoded(verdict))
+        if verdict["ok"] is False:
+            raise SystemExit("CI gate: " + verdict["reason"] + " (nothing was installed; rerun later or pass --skip-ci)")
+        print(json.dumps({"ci": verdict["reason"]}), flush=True)
         report = {"startedAt": now(), "before": self.snapshot(), "steps": []}
         restarted = []
         try:
@@ -637,11 +778,95 @@ class Release:
         deploy = read_json(self.out / "deployment-receipt.json")
         http_report = read_json(self.out / "http-verification.json")
         assert deploy.get("gameUnchanged") and http_report["version"] == self.version
+        ci_path = self.out / "ci-check.json"
         receipt.update(status="PUBLISHED_VERIFIED", completedAt=now(), productionFilesVerified=verified,
                        restartedServices=deploy.get("restartedServices", []), validation=self.spec.get("validation", {}),
-                       cleanup={h: self.remote_stage(h) for h in self.order})
+                       ci=read_json(ci_path) if ci_path.is_file() else None, cleanup={h: self.remote_stage(h) for h in self.order})
         receipt_path.write_bytes(encoded(receipt))
         print(json.dumps({"status": "PUBLISHED_VERIFIED", "version": self.version, "productionFilesVerified": verified}))
+        self.write_receipt()
+
+    # ---- the Chinese receipt -------------------------------------------------------
+    def receipt_text(self):
+        """RELEASE_RECEIPT_TEXT_V1: 发布回执.txt from the JSON receipts in the release folder."""
+        def optional(name):
+            path = self.out / name
+            return read_json(path) if path.is_file() else {}
+        receipt = read_json(self.out / "release-receipt.json")
+        deploy, http_report = optional("deployment-receipt.json"), optional("http-verification.json")
+        e2e, dry, ci = optional("e2e-transition.json"), optional("dryrun.json"), receipt.get("ci") or optional("ci-check.json")
+        spec, primary = self.spec, self.config["primary"]
+        hosts = receipt["hosts"]
+        published = receipt.get("status") == "PUBLISHED_VERIFIED"
+        lines = [f"更新器 {self.version} 发布回执",
+                 ("状态：已发布并通过线上验收（PUBLISHED_VERIFIED），完成于 " + str(receipt.get("completedAt")) + "。") if published
+                 else "状态：尚未完成发布（没有 PUBLISHED_VERIFIED）；以下只列出已有的记录。",
+                 f"来源：{receipt['sourceRepository']} 的提交 {self.commit[:7]}；上一版 {self.previous}（更新器上一次发布的提交 {spec['previousCommit'][:7]}）。"]
+        if ci.get("skipped"):
+            lines.append("CI：部署时按 --skip-ci 跳过了检查。")
+        elif ci:
+            lines.append("CI：" + ("全部通过，" if ci.get("ok") else "未通过，") + str(ci.get("reason")) + "（运行 "
+                         + "、".join(str(r["id"]) for r in ci.get("runs", [])) + "）。")
+        else:
+            lines.append("CI：没有记录。")
+        lines.append("决定：" + spec["decision"])
+        if receipt.get("contentReleaseSincePreviousUpdater"):
+            lines.append("上一次更新器发布之后有过一次内容发布；它的更新说明留在本版说明之后，没升级的玩家仍能看到。")
+        lines.append("玩家看到的说明：")
+        lines += ["  - " + note for note in spec["notes"]]
+        first = hosts[primary]
+        lines.append(f"范围：每台主机的玩家清单改动 {len(first['changedPlayerRows'])} 项、新增 {len(first['addedPlayerRows'])} 项、"
+                     f"移除 {len(first['removedPlayerRows'])} 项，清单共 {first['managedFiles']} 项。")
+        for host in self.order:
+            entry = hosts[host]
+            installed = [e["path"] for e in entry["files"] if not e.get("delete")]
+            lines.append(f"  {host}：写入 {len(installed)} 个文件" + (("；删除（删除前已备份）" + "、".join(entry["removedFiles"])) if entry["removedFiles"] else "") + "。")
+        if spec.get("logReplace"):
+            lines.append("更新日志旧条目改写：" + "；".join(f"「{a}」→「{b}」" for a, b in spec["logReplace"]) + "。")
+        if deploy:
+            restarted = deploy.get("restartedServices") or []
+            before = deploy.get("before") or {}
+
+            def describe(key, tokens):
+                if key.endswith(":game"):
+                    return key.split(":")[0] + " 游戏监听进程 " + ",".join(t[1:] for t in tokens)
+                pid = next((tokens[i + 2] for i in range(len(tokens) - 2) if tokens[i] == "pid" and tokens[i + 1] == "="), "?")
+                return key.split(":")[0] + " 下载服务 PID " + pid
+            state = "；".join(describe(k, v) for k, v in before.items())
+            lines.append(("服务：重启了 " + "、".join(restarted) + " 的下载服务。" if restarted else "服务：未重启任何服务。")
+                         + ("部署前后一致：" + state + "。" if deploy.get("gameUnchanged") and state else ""))
+        lines.append("验证：")
+        for key, value in (spec.get("validation") or {}).items():
+            if key in ("suite", "local"):
+                lines.append("  - 本地回归：" + str(value))
+        if e2e:
+            done = [label for label in ("A", "B", "C") if label in e2e]
+            names = {"A": "旧根目录 BAT", "B": "旧 PowerShell", "C": "旧 Python"}
+            lines.append("  - 本地模拟" + "、".join(names[l] for l in done) + " 升级到本版均成功，每条连跑两次。")
+        if dry.get("hosts"):
+            lines.append("  - 部署脚本先在备份副本上演练通过（" + "、".join(f"{h} {v['dryRunVerified']} 个文件" for h, v in dry["hosts"].items())
+                         + "），重复执行会被拒绝。")
+        for name, value in (http_report.get("endpoints") or {}).items():
+            removed = value.get("removedAbsent") or []
+            lines.append(f"  - 线上 {name}：返回 {http_report.get('version')}，{value.get('files')} 个文件一致，Range {value.get('rangeStatus')}，"
+                         + ("gzip 正常" if value.get("gzip") else "gzip 未生效") + (("，已删除的 " + "、".join(removed) + " 返回 404") if removed else "") + "。")
+        live = http_report.get("liveBootstrap") or {}
+        if live:
+            lines.append(f"  - 玩家现有的自刷新脚本更新了 {live.get('previous', {}).get('refreshed', '?')} 个核心脚本；"
+                         f"新版本身无需再更新（{live.get('slim', {}).get('current', '?')} 个已是最新）。")
+        if spec.get("receiptNotes"):
+            lines.append("补充：")
+            lines += ["  " + note for note in spec["receiptNotes"]]
+        lines.append(f"回滚：{receipt.get('rollbackRoot')}")
+        evidence = [n for n in ("release-receipt.json", "deployment-receipt.json", "http-verification.json", "e2e-transition.json",
+                                "dryrun.json", "ci-check.json") if (self.out / n).is_file()]
+        lines.append("证据：同目录 " + "、".join(evidence) + "。")
+        return "\n".join(lines) + "\n"
+
+    def write_receipt(self):
+        path = self.out / "发布回执.txt"
+        path.write_bytes(self.receipt_text().encode("utf-8"))
+        print(json.dumps({"receipt": str(path)}, ensure_ascii=False))
 
 
 DEPLOY_POSIX = r'''from pathlib import Path
@@ -726,12 +951,16 @@ def main():
     parser = argparse.ArgumentParser(description="SCEX updater release tool")
     parser.add_argument("--config", required=True)
     parser.add_argument("--release", required=True)
-    parser.add_argument("step", choices=["preflight", "backup", "prepare", "e2e", "dryrun", "stage", "deploy", "verify", "finalize"])
+    parser.add_argument("--skip-ci", action="store_true", help="deploy without the GitHub Actions gate (recorded in the receipt)")
+    parser.add_argument("step", choices=["preflight", "backup", "prepare", "e2e", "dryrun", "stage", "ci", "deploy", "verify",
+                                         "finalize", "receipt"])
     args = parser.parse_args()
-    release = Release(args.config, args.release)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    release = Release(args.config, args.release, skip_ci=args.skip_ci)
     step = {"preflight": release.preflight, "backup": release.run_backup, "prepare": release.prepare, "e2e": release.e2e,
-            "dryrun": release.dryrun, "stage": release.stage, "deploy": release.deploy, "verify": release.verify,
-            "finalize": release.finalize}[args.step]
+            "dryrun": release.dryrun, "stage": release.stage, "ci": release.ci, "deploy": release.deploy, "verify": release.verify,
+            "finalize": release.finalize, "receipt": release.write_receipt}[args.step]
     result = step()
     return 1 if result is False else 0
 
