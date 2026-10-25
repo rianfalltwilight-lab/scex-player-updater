@@ -237,7 +237,7 @@ def _trust_get(url, headers, timeout):
             try:
                 address = socket.getaddrinfo(parsed.hostname, port, family, socket.SOCK_STREAM)[0][4][0]
             except (OSError, IndexError) as exc:
-                last = exc
+                last = last or exc  # a refused IPv4 connection says more than a missing IPv6 address
                 continue
             connection = http.client.HTTPConnection(address, port, timeout=timeout)
             try:

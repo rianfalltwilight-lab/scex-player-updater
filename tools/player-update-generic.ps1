@@ -2342,6 +2342,9 @@ if ($downloadJobs.Count) {
     $ast = [Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
     $defs = $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]}, $false)
     $workerCode = ($defs | ForEach-Object { $_.Extent.Text }) -join "`n"
+    # WORKER_QUEUE_V1: a few long-lived workers take jobs from one queue. Each worker parses
+    # the function definitions once; the old one-PowerShell-per-file scheme re-parsed them
+    # for every file and polled every 100 ms (about 90 ms per file in total).
     $workerCode += @'
 
 $ErrorActionPreference = 'Stop'
@@ -2352,69 +2355,80 @@ $script:OfficialMinBytes = 1MB
 $script:OfficialMinRateBps = 128KB
 $script:OfficialFailureLimit = 3
 $script:LastSourceFailureCounts = $true
-$script:HybridManifest = $null
 $script:HybridSources = $null
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
-try {
-    $script:HybridManifest = $args[2]
-    $script:HybridManifestUrl = $args[3]
-    $script:SyncRoot = $args[4]
-    $script:OfficialBreaker = $args[5]
-    $job = $args[0]
-    $source = Download-ManifestEntry -File $job.File -BaseUrl $args[1] -Destination $job.Target -ExpectedSha1 $job.Expected -Rel $job.Rel
-    [pscustomobject]@{ Job=$job; Source=$source; Record=(Get-FileVerifyRecord -Path $job.Target -Sha1 $job.Expected); Error=$null }
-} catch { [pscustomobject]@{ Job=$args[0]; Source=$null; Record=$null; Error=$_.Exception.Message } }
+$queue = $args[0]
+$results = $args[1]
+$baseUrl = $args[2]
+$script:HybridManifest = $args[3]
+$script:HybridManifestUrl = $args[4]
+$script:SyncRoot = $args[5]
+$script:OfficialBreaker = $args[6]
+$script:SyncUserAgent = $args[7]
+$job = $null
+while ($queue.TryDequeue([ref]$job)) {
+    try {
+        $source = Download-ManifestEntry -File $job.File -BaseUrl $baseUrl -Destination $job.Target -ExpectedSha1 $job.Expected -Rel $job.Rel
+        $results.Add([pscustomobject]@{ Job=$job; Source=$source; Record=(Get-FileVerifyRecord -Path $job.Target -Sha1 $job.Expected); Error=$null })
+    } catch { $results.Add([pscustomobject]@{ Job=$job; Source=$null; Record=$null; Error=$_.Exception.Message }) }
+}
 '@
+    $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    foreach ($job in $downloadJobs) { $queue.Enqueue($job) }
+    $results = New-Object 'System.Collections.Concurrent.BlockingCollection[object]'
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $workers)
     $pool.Open()
-    $pending = New-Object 'System.Collections.Generic.List[object]'
+    $shells = New-Object 'System.Collections.Generic.List[object]'
     $reportedTrips = New-Object 'System.Collections.Generic.HashSet[string]'
-    $next = 0
     $hardError = $null
+    $received = 0
     try {
-        while ($next -lt $downloadJobs.Count -or $pending.Count) {
-            while ($next -lt $downloadJobs.Count -and $pending.Count -lt $workers) {
-                $ps = [PowerShell]::Create()
-                $ps.RunspacePool = $pool
-                [void]$ps.AddScript($workerCode).AddArgument($downloadJobs[$next]).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl).AddArgument($instanceRoot).AddArgument($script:OfficialBreaker)
-                [void]$pending.Add([pscustomobject]@{ Shell=$ps; Handle=$ps.BeginInvoke(); Job=$downloadJobs[$next] })
-                $next++
-            }
-            foreach ($task in @($pending.ToArray())) {
-                if (-not $task.Handle.IsCompleted) { continue }
-                try {
-                    $results = @($task.Shell.EndInvoke($task.Handle))
-                    $result = $results | Where-Object { $_.PSObject.Properties['Record'] } | Select-Object -Last 1
-                    if (-not $result) { throw '下载任务未返回结果。' }
-                    $job = $task.Job
-                    if ($result.Error) { throw $result.Error }
-                    $verified[$job.Key] = $result.Record
-                    $downloaded++
-                    [void]$updatedPaths.Add($job.Rel)
-                    if ($job.Force) { [void]$forcedAppliedPaths.Add($job.Rel) }
-                    $label = if ($result.Source -eq 'official') { '[官方源]' } elseif ($result.Source -eq 'staged') { '[缓存]' } else { '[更新]' }
-                    Write-SyncDetail "$label $($job.Rel)"
-                } catch {
-                    if (Test-OptionalHelperFile -Rel $task.Job.Rel) {
-                        Write-SyncWarning "辅助脚本未更新：$($task.Job.Rel)"
-                        $preserved++
-                    } elseif (-not $hardError) { $hardError = Format-UpdateError -ErrorRecord $_ -Path $task.Job.Rel }
-                } finally {
-                    $task.Shell.Dispose(); [void]$pending.Remove($task)
-                    # PROGRESS_V1: one summary line every few seconds and at the end.
-                    $doneFiles++
-                    try { $doneBytes += [long]$task.Job.File.size } catch { }
-                    $now = $progressClock.Elapsed.TotalSeconds
-                    if ($doneFiles -eq $downloadJobs.Count -or $now - $lastProgress -ge 3) {
-                        $lastProgress = $now
-                        $line = '[进度] {0}/{1} 个文件，{2:N1}/{3:N1} MB' -f $doneFiles, $downloadJobs.Count, ($doneBytes / 1MB), ($totalBytes / 1MB)
-                        $rate = $doneBytes / [Math]::Max($now, 0.001)
-                        if ($doneFiles -lt $downloadJobs.Count -and $rate -gt 0) {
-                            $line += '，{0:N1} MB/s，预计还需 {1}' -f ($rate / 1MB), (Format-Duration (($totalBytes - $doneBytes) / $rate))
-                        }
-                        Write-Host ($line + '。')
-                    }
+        for ($i = 0; $i -lt $workers; $i++) {
+            $ps = [PowerShell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($workerCode).AddArgument($queue).AddArgument($results).AddArgument($baseUrl).AddArgument($script:HybridManifest).AddArgument($script:HybridManifestUrl).AddArgument($instanceRoot).AddArgument($script:OfficialBreaker).AddArgument($script:SyncUserAgent)
+            [void]$shells.Add([pscustomobject]@{ Shell = $ps; Handle = $ps.BeginInvoke() })
+        }
+        while ($received -lt $downloadJobs.Count) {
+            $result = $null
+            if (-not $results.TryTake([ref]$result, 250)) {
+                if (@($shells | Where-Object { -not $_.Handle.IsCompleted }).Count -eq 0 -and $results.Count -eq 0) {
+                    # Every worker has stopped but some jobs never reported back.
+                    $workerError = ''
+                    foreach ($shell in $shells) { foreach ($e in @($shell.Shell.Streams.Error)) { if (-not $workerError) { $workerError = [string]$e } } }
+                    if (-not $hardError) { $hardError = '[下载失败] 下载线程意外退出，' + ($downloadJobs.Count - $received) + ' 个文件未处理。' + $workerError }
+                    break
                 }
+                continue
+            }
+            $received++
+            $job = $result.Job
+            try {
+                if ($result.Error) { throw $result.Error }
+                $verified[$job.Key] = $result.Record
+                $downloaded++
+                [void]$updatedPaths.Add($job.Rel)
+                if ($job.Force) { [void]$forcedAppliedPaths.Add($job.Rel) }
+                $label = if ($result.Source -eq 'official') { '[官方源]' } elseif ($result.Source -eq 'staged') { '[缓存]' } else { '[更新]' }
+                Write-SyncDetail "$label $($job.Rel)"
+            } catch {
+                if (Test-OptionalHelperFile -Rel $job.Rel) {
+                    Write-SyncWarning "辅助脚本未更新：$($job.Rel)"
+                    $preserved++
+                } elseif (-not $hardError) { $hardError = Format-UpdateError -ErrorRecord $_ -Path $job.Rel }
+            }
+            # PROGRESS_V1: one summary line every few seconds and at the end.
+            $doneFiles++
+            try { $doneBytes += [long]$job.File.size } catch { }
+            $now = $progressClock.Elapsed.TotalSeconds
+            if ($doneFiles -eq $downloadJobs.Count -or $now - $lastProgress -ge 3) {
+                $lastProgress = $now
+                $line = '[进度] {0}/{1} 个文件，{2:N1}/{3:N1} MB' -f $doneFiles, $downloadJobs.Count, ($doneBytes / 1MB), ($totalBytes / 1MB)
+                $rate = $doneBytes / [Math]::Max($now, 0.001)
+                if ($doneFiles -lt $downloadJobs.Count -and $rate -gt 0) {
+                    $line += '，{0:N1} MB/s，预计还需 {1}' -f ($rate / 1MB), (Format-Duration (($totalBytes - $doneBytes) / $rate))
+                }
+                Write-Host ($line + '。')
             }
             [System.Threading.Monitor]::Enter($script:OfficialBreaker.SyncRoot)
             try { $breakerKeys = @($script:OfficialBreaker.Keys) } finally { [System.Threading.Monitor]::Exit($script:OfficialBreaker.SyncRoot) }
@@ -2423,9 +2437,17 @@ try {
                     Write-Host ("[同步] 官方源 {0} 连续 {1} 个文件下载失败，本轮不再尝试，其余文件直接走更新服务。" -f ([string]$tripKey).Substring(5), $script:OfficialFailureLimit)
                 }
             }
-            if ($pending.Count) { Start-Sleep -Milliseconds 100 }
         }
-    } finally { foreach ($task in $pending) { $task.Shell.Dispose() }; $pool.Dispose() }
+    } finally {
+        $job = $null
+        while ($queue.TryDequeue([ref]$job)) { }  # an early stop leaves nothing for the workers
+        foreach ($shell in $shells) {
+            try { if (-not $shell.Handle.IsCompleted) { $shell.Shell.Stop() } } catch { }
+            $shell.Shell.Dispose()
+        }
+        $pool.Dispose()
+        $results.Dispose()
+    }
     if ($hardError) { throw $hardError }
 }
 

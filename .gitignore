@@ -19,3 +19,4 @@ PORTABLE-UPDATE-URL.txt
 /.portable-publish-lock/
 **/.portable-build-*/
 **/.portable-backup-*/
+/.update-signing-key.xml

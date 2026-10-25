@@ -375,7 +375,11 @@ def main():
     if folder:
         folder = os.path.abspath(folder)
         served = os.path.abspath(args.directory)
-        if os.path.commonpath([folder, served]) == served:
+        try:
+            inside = os.path.commonpath([os.path.normcase(folder), os.path.normcase(served)]) == os.path.normcase(served)
+        except ValueError:
+            inside = False  # different drives
+        if inside:
             folder = ""  # never write logs into the served folder
     ACCESS_LOG.folder = folder
 
