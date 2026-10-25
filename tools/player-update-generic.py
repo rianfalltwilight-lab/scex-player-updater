@@ -1969,7 +1969,11 @@ def sync_instance(root, args) -> int:
                 continue
     new = file_map(files)
     verified = {}
-    raw_verified = state.get("verified") or {}
+    # MAC_REPAIR_V1: --verify-all ignores the size+mtime records and hashes every managed file,
+    # so damaged files are found and downloaded again (personal changes still follow the rules).
+    raw_verified = {} if getattr(args, "verify_all", False) else (state.get("verified") or {})
+    if getattr(args, "verify_all", False):
+        print("[检查] 完整校验：逐个计算所有受管文件的哈希，损坏或缺失的会重新下载。")
     if isinstance(raw_verified, dict):
         for raw_key, raw_val in raw_verified.items():
             try:
@@ -2285,6 +2289,7 @@ def sync_instance(root, args) -> int:
     save_state(root, state_out)
     _ACTIVE_JOURNAL.finish()
     tidy_after_sync(root, backup_root)
+    remove_root_helper_copies(root, files)
     config_applied = [
         rel for rel in updated_paths + adopted_paths
         if rel.lower().startswith(("config/", "defaultconfigs/"))
@@ -2750,6 +2755,32 @@ class DownloadProgress:
         return text + "。"
 
 
+_ROOT_HELPER_NAMES = ("player-update-generic.py", "player-update-generic.ps1", "portable-stage-daemon.py",
+                      "portable-stage-daemon.ps1", "portable-bootstrap-refresh.ps1", "Windows-sync.bat", "macOS-sync.command")
+
+
+def remove_root_helper_copies(root: pathlib.Path, files) -> int:
+    """ROOT_DELEGATE_V1: the entry points now run the _updater copies. Root copies that older
+    entry points refreshed are removed once _updater holds the verified same file."""
+    rows = {str(row.get("path")): row for row in files or [] if isinstance(row, dict)}
+    removed = 0
+    for name in _ROOT_HELPER_NAMES:
+        row = rows.get("_updater/" + name)
+        copy = root / name
+        if not row or name in rows or _is_link_or_reparse(copy) or not copy.is_file():
+            continue
+        try:
+            if sha1(join_safe(root, "_updater/" + name)) != str(row.get("sha1") or "").lower():
+                continue
+            copy.unlink()
+            removed += 1
+        except (OSError, UpdateError):
+            continue
+    if removed:
+        print(f"[清理] 已删除实例根目录里 {removed} 个旧的更新器副本（_updater 里有校验过的同一版本）。")
+    return removed
+
+
 def tidy_after_sync(root: pathlib.Path, backup_root: pathlib.Path) -> None:
     try:
         stale = join_safe(root, DIAGNOSTIC_NAME)
@@ -2807,6 +2838,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="便携 Minecraft 玩家更新器")
     parser.add_argument("--instance-dir", default=".")
     parser.add_argument("--manifest-url", default="")
+    parser.add_argument("--verify-all", action="store_true", help="hash every managed file and repair damaged ones")
     args = parser.parse_args()
     root = pathlib.Path(args.instance_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)

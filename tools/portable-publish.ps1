@@ -37,7 +37,8 @@ function Get-PlayerGuideText {
         '1. 先完全退出 Minecraft（不是返回标题界面）。',
         '2. Windows：双击「更新mod-Windows端.bat」。Mac：双击「更新mod-Mac端.command」。',
         '   更新完成后会自动打开启动器（找得到的话）。',
-        '3. 遇到问题：Windows 双击「一键客户端自助修复.bat」，按提示操作。',
+        '3. 遇到问题：Windows 双击「一键客户端自助修复.bat」，按提示操作；',
+        '   Mac 双击 _updater 文件夹里的「macOS-self-repair.command」（完整检查并修复）。',
         '   更新失败时，把这个文件夹里的「更新诊断包.zip」发给管理员。',
         '',
         "服务器地址：$ServerAddress",
@@ -662,6 +663,7 @@ Copy-ToolFile -SourceName 'portable-windows-repair.bat' -DestinationName 'portab
 Copy-ToolFile -SourceName 'portable-windows-sync.bat' -DestinationName 'Windows-sync.bat' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-windows-sync.bat' -DestinationName '更新mod-Windows端.bat' -DestinationRoot $publishDir
 Copy-ToolFile -SourceName 'portable-macos-sync.command' -DestinationName 'macOS-sync.command' -DestinationRoot $updaterRoot
+Copy-ToolFile -SourceName 'portable-macos-repair.command' -DestinationName 'macOS-self-repair.command' -DestinationRoot $updaterRoot
 Copy-ToolFile -SourceName 'portable-macos-sync.command' -DestinationName '更新mod-Mac端.command' -DestinationRoot $publishDir
 Copy-ToolFile -SourceName 'player-self-repair.ps1' -DestinationName 'player-self-repair.ps1' -DestinationRoot $updaterRoot
 Copy-RootFile -SourceRel '一键脚本\一键客户端自助修复.bat' -DestinationName '一键客户端自助修复.bat' -DestinationRoot $publishDir

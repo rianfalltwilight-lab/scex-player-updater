@@ -40,6 +40,9 @@ rem Strip trailing backslash: %%~dp keeps it, and a trailing backslash before
 rem the closing quote in -InstanceDir "..." escapes the quote inside powershell
 rem argument parsing, injecting a literal quote into the path (Illegal characters).
 if "%PORTABLE_INSTANCE_DIR:~-1%"=="\" set "PORTABLE_INSTANCE_DIR=%PORTABLE_INSTANCE_DIR:~0,-1%"
+rem ROOT_DELEGATE_V1: started from the instance root, use the _updater copies, so the
+rem bootstrap refreshes them there and the root keeps only the entry files.
+if /I "%PORTABLE_SCRIPT_DIR%"=="%PORTABLE_INSTANCE_DIR%" if exist "%PORTABLE_INSTANCE_DIR%\_updater\player-update-generic.ps1" set "PORTABLE_SCRIPT_DIR=%PORTABLE_INSTANCE_DIR%\_updater"
 
 if exist "%PORTABLE_INSTANCE_DIR%\player-update-generic.ps1" if /I not "%PORTABLE_SCRIPT_DIR%"=="%PORTABLE_INSTANCE_DIR%" powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$s=Join-Path $env:PORTABLE_SCRIPT_DIR 'player-update-generic.ps1';$r=Join-Path $env:PORTABLE_INSTANCE_DIR 'player-update-generic.ps1';$t=$null;$e=$null;if((Test-Path -LiteralPath $s -PathType Leaf) -and (Test-Path -LiteralPath $r -PathType Leaf)){[System.Management.Automation.Language.Parser]::ParseFile($s,[ref]$t,[ref]$e)|Out-Null;if($e.Count -gt 0){$t=$null;$e=$null;[System.Management.Automation.Language.Parser]::ParseFile($r,[ref]$t,[ref]$e)|Out-Null;if($e.Count -eq 0){$tmp=$s+'.repair';Copy-Item -LiteralPath $r -Destination $tmp -Force;Move-Item -LiteralPath $tmp -Destination $s -Force;Write-Host '[repair] restored invalid updater from package root.'}}}"
 

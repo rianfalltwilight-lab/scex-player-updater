@@ -1991,6 +1991,27 @@ function Write-DiagnosticPackage {
     } catch { return $null }
 }
 
+function Remove-RootHelperCopies {
+    # ROOT_DELEGATE_V1: same rule as remove_root_helper_copies in player-update-generic.py.
+    param([string]$Root, $Files)
+    $rows = @{}
+    foreach ($row in @($Files)) { if ($row -and $row.path) { $rows[[string]$row.path] = $row } }
+    $removed = 0
+    foreach ($name in @('player-update-generic.py', 'player-update-generic.ps1', 'portable-stage-daemon.py', 'portable-stage-daemon.ps1', 'portable-bootstrap-refresh.ps1', 'Windows-sync.bat', 'macOS-sync.command')) {
+        $row = $rows['_updater/' + $name]
+        $copy = Join-Path $Root $name
+        if (-not $row -or $rows.ContainsKey($name) -or -not [IO.File]::Exists($copy)) { continue }
+        try {
+            if ([IO.File]::GetAttributes($copy) -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $current = Join-Path (Join-Path $Root '_updater') $name
+            if (-not [IO.File]::Exists($current) -or (Get-Sha1 -Path $current) -ne ([string]$row.sha1).ToLowerInvariant()) { continue }
+            [IO.File]::Delete($copy)
+            $removed++
+        } catch { }
+    }
+    return $removed
+}
+
 function Clear-TreeNoFollow {
     # Delete regular files and empty folders below Directory; never follow or delete
     # links or other reparse points. Returns the number of files removed.
@@ -2552,6 +2573,10 @@ try {
     $clearedStage = Clear-StageCache -Root $instanceRoot
     if ($clearedStage -gt 0) { Write-Host "[清理] 已清理预下载缓存 $clearedStage 个文件。" }
 } catch { Write-Host '[清理] 预下载缓存未能清理，不影响本次更新。' }
+try {
+    $removedCopies = Remove-RootHelperCopies -Root $instanceRoot -Files $manifest.files
+    if ($removedCopies -gt 0) { Write-Host "[清理] 已删除实例根目录里 $removedCopies 个旧的更新器副本（_updater 里有校验过的同一版本）。" }
+} catch { }
 $staleDiagnostic = Join-Path $instanceRoot $script:DiagnosticName
 if ([IO.File]::Exists($staleDiagnostic)) { try { [IO.File]::Delete($staleDiagnostic) } catch { } }
 $configApplied = @(@($updatedPaths) + @($adoptedPaths) | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })

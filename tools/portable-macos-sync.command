@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
-# @version 15
+# @version 16
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
 INSTANCE_DIR="$SCRIPT_DIR"
 if [ "$(basename "$SCRIPT_DIR")" = "_updater" ]; then
   INSTANCE_DIR="$(cd .. && pwd)"
+fi
+# ROOT_DELEGATE_V1: started from the instance root, run the _updater copy, so the helper
+# refresh happens there and the instance root keeps only the entry files. A copy that does
+# not parse is skipped; this run then repairs it through the normal sync.
+if [ "$SCRIPT_DIR" = "$INSTANCE_DIR" ] && [ -z "${PORTABLE_ROOT_DELEGATED:-}" ] && [ -f "$INSTANCE_DIR/_updater/macOS-sync.command" ]; then
+  if bash -n "$INSTANCE_DIR/_updater/macOS-sync.command" >/dev/null 2>&1; then
+    export PORTABLE_ROOT_DELEGATED=1
+    exec bash "$INSTANCE_DIR/_updater/macOS-sync.command" "$@"
+  fi
 fi
 
 printf '\033]0;便携 Minecraft 玩家同步\007'
@@ -525,11 +534,27 @@ if [ "$status" = "0" ]; then
   fi
 else
   echo "[同步] 失败，退出码 $status。"
-  if [ -f "$INSTANCE_DIR/更新诊断包.zip" ]; then
+  # MAC_REPAIR_V1: offer the full check (every file hashed, damaged ones downloaded again).
+  if [ -t 0 ] && [ -f "$SCRIPT_DIR/player-update-generic.py" ]; then
+    echo
+    read -r -p "是否运行完整检查修复（逐个校验所有文件，损坏的重新下载）？输入 Y 回车确认，直接回车跳过：" answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES|是)
+        set +e
+        PORTABLE_SYNC_INTERACTIVE=1 python3 "$SCRIPT_DIR/player-update-generic.py" --instance-dir "$INSTANCE_DIR" --verify-all
+        status=$?
+        set -e
+        if [ "$status" = "0" ]; then
+          echo "[检查] 修复完成，可以启动游戏了。"
+        fi
+        ;;
+    esac
+  fi
+  if [ "$status" != "0" ] && [ -f "$INSTANCE_DIR/更新诊断包.zip" ]; then
     echo "[诊断] 请把实例目录里的「更新诊断包.zip」发给管理员，不需要截图。"
   fi
 fi
-read -r -p "按回车关闭。"
+read -r -p "按回车关闭。" _ || true
 exit "$status"
 
 # 维护注意（新代 os.replace 版）：本文件自更新改为「同目录临时文件 + os.replace
@@ -545,3 +570,5 @@ exit "$status"
 # 自刷新先比对本地哈希，一致就不下载。
 # v15：缺 python3 时说明命令行开发者工具弹窗；也从 _updater 读取更新地址；
 # 文件被占用时可按回车重试；失败时提示发送「更新诊断包.zip」。
+# v16：清单签名校验（MANIFEST_SIGNATURE_V1）；从根目录启动时改为运行 _updater 里的副本；
+# 同步失败时可直接运行完整检查修复（_updater/macOS-self-repair.command 是同一功能的独立入口）。
