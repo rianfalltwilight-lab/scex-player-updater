@@ -2,6 +2,8 @@ name: Updater regression
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
+env:
+  PYTHONUTF8: "1"
 jobs:
   synthetic:
     strategy:

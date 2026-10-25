@@ -317,7 +317,8 @@ class ParallelDownloadTests(unittest.TestCase):
                 url = f'http://127.0.0.1:{port}/server-manifest.json'
                 command = ([sys.executable, str(ROOT / 'tools/player-update-generic.py'), '--instance-dir', str(client), '--manifest-url', url]
                     if engine == 'python' else [PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(ROOT / 'tools/player-update-generic.ps1'), '-InstanceDir', str(client), '-ManifestUrl', url, '-NoPause'])
-                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
+                env = dict(os.environ, PYTHONUTF8='1')
+                result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
                 self.assertEqual(result.returncode, 0, result.stdout.decode('utf-8', errors='replace'))
                 self.assertEqual(SlowHandler.maximum, 2)
                 state = (client / '.portable-sync-state.json').read_bytes()
@@ -326,7 +327,7 @@ class ParallelDownloadTests(unittest.TestCase):
                 manifest['files'] = [dict(rows[0], sha1='0' * 40)] + rows[1:]
                 json_write(web / 'server-manifest.json', manifest)
                 (client / rows[0]['path']).write_bytes(b'prior local file')
-                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
+                result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual((client / '.portable-sync-state.json').read_bytes(), state)
                 self.assertEqual((client / rows[0]['path']).read_bytes(), b'prior local file')
