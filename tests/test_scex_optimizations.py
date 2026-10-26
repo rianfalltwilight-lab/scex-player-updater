@@ -253,7 +253,7 @@ class MacSelfRefreshTests(unittest.TestCase):
             output = (result.stdout + result.stderr).decode('utf-8', errors='replace')
             self.assertEqual(result.returncode, 0, output)
             self.assertEqual(requested, ['/m.json'], output)
-            self.assertIn('已是最新 player-update-generic.py', output)
+            self.assertIn('核心脚本已是最新（1 个）', output)
 
 
 @unittest.skipUnless(PS and os.name == 'nt', 'Windows PowerShell required')
@@ -368,7 +368,7 @@ Write-Output 'PS-OK'
         output = result.stdout.decode('utf-8-sig', errors='replace')
         self.assertEqual(result.returncode, 0, output)
         self.assertEqual(requested, ['/m.json'], output)
-        self.assertIn('已是最新 player-update-generic.py', output)
+        self.assertIn('核心脚本已是最新（1 个）', output)
 
 
 if __name__ == '__main__':

@@ -81,6 +81,17 @@ def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def bootstrap_counts(log):
+    """Helper counts from a bootstrap log: the one-line summary (2.27.28+) or one line per helper."""
+    match = re.search(r"已更新 (\d+) 个核心脚本(?:，另 (\d+) 个已是最新)?", log)
+    if match:
+        return {"current": int(match.group(2) or 0), "refreshed": int(match.group(1))}
+    match = re.search(r"核心脚本已是最新（(\d+) 个）", log)
+    if match:
+        return {"current": int(match.group(1)), "refreshed": 0}
+    return {"current": log.count("已是最新"), "refreshed": log.count("已刷新")}
+
+
 def ci_verdict(runs, jobs_for):
     """CI_GATE_V1. runs: GitHub workflow runs for one commit; jobs_for(run_id) -> its jobs.
     The newest attempt of every workflow must be completed with every job successful."""
@@ -357,10 +368,16 @@ class Release:
             manifest = read_json(old / (PUBLIC + "server-manifest.json"))
             original = copy.deepcopy(manifest)
             config = read_json(old / "tools/portable-pack.json")
-            # Players who skipped the content release still see its notes after this one's.
+            # Players who skipped the content release still see its notes after this one's, grouped
+            # by version (RELEASE_NOTE_GROUPS_V1); engines before 2.27.28 read the flat list.
             carried = [n for n in (original.get("releaseNotes") or []) if content and n not in self.spec["notes"]]
             notes = list(self.spec["notes"]) + carried
-            manifest.update(version=self.version, generatedAt=stamp, updaterRevision=self.spec["revision"], releaseNotes=notes)
+            manifest.update(version=self.version, generatedAt=stamp, updaterRevision=self.spec["revision"],
+                            releaseNotes=list(self.spec["notes"]) + [f"（{self.previous}）" + n for n in carried])
+            manifest.pop("releaseNoteGroups", None)
+            if carried:
+                manifest["releaseNoteGroups"] = [{"version": self.version, "title": self.spec["logTitle"], "notes": list(self.spec["notes"])},
+                                                 {"version": self.previous, "title": "内容更新", "notes": carried}]
             rows = {r["path"]: r for r in manifest["files"]}
             payloads, changed_rows, added_rows = {}, [], []
             for rel in changed:
@@ -651,7 +668,7 @@ class Release:
                 for name in HELPERS:
                     row = next(r for r in manifest["files"] if r["path"] == "_updater/" + name)
                     assert hashlib.sha1((scripts / name).read_bytes()).hexdigest() == row["sha1"], (label, name)
-                results[label] = {"current": log.count("已是最新"), "refreshed": log.count("已刷新")}
+                results[label] = bootstrap_counts(log)
         assert results["slim"]["refreshed"] == 0, results
         return results
 

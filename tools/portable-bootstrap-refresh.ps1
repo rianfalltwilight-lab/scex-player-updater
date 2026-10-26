@@ -340,6 +340,9 @@ if ([string]::IsNullOrWhiteSpace($selected)) {
 if ($selectedIndex -gt 0) { Write-Host '[更新器] 已切换到备用更新地址。' }
 $base = $selected.Substring(0, $selected.LastIndexOf('/'))
 $names = @('player-update-generic.ps1', 'player-update-generic.py', 'portable-stage-daemon.ps1', 'portable-stage-daemon.py', 'portable-bootstrap-refresh.ps1', 'macOS-sync.command', 'Windows-sync.bat')
+# QUIET_CONSOLE_V1: one summary line instead of a line per helper.
+$currentNames = New-Object System.Collections.Generic.List[string]
+$refreshedNames = New-Object System.Collections.Generic.List[string]
 # One pass over the manifest instead of a Where-Object scan per helper.
 $rowsByPath = @{}
 foreach ($row in @($selectedManifest.files)) {
@@ -361,7 +364,7 @@ foreach ($name in $names) {
     $destination = Join-Path $toolsRoot $name
     # SELF_REFRESH_LOCAL_FIRST_V1: a local copy matching the manifest needs no download.
     if ([IO.File]::Exists($destination) -and (Get-Item -LiteralPath $destination).Length -eq $expectedSize -and (Get-Sha1 -Path $destination) -eq $expectedHash) {
-        Write-Host "[更新器] 已是最新 $name"
+        [void]$currentNames.Add($name)
         continue
     }
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('portable-refresh-' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -379,8 +382,8 @@ foreach ($name in $names) {
         }
         if ($done) {
             try {
-                if (Install-RefreshedFile -Source $temp -Destination $destination -Name $name) { Write-Host "[更新器] 已刷新 $name" }
-                else { Write-Host "[更新器] 已是最新 $name" }
+                if (Install-RefreshedFile -Source $temp -Destination $destination -Name $name) { [void]$refreshedNames.Add($name) }
+                else { [void]$currentNames.Add($name) }
             } catch {
                 Write-Host ("[更新器] 跳过自刷新 $name（文件校验失败）。")
             }
@@ -388,5 +391,11 @@ foreach ($name in $names) {
     } finally {
         if (Test-Path -LiteralPath $temp -PathType Leaf) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
     }
+}
+if ($refreshedNames.Count -gt 0) {
+    $tail = if ($currentNames.Count -gt 0) { "，另 $($currentNames.Count) 个已是最新" } else { '' }
+    Write-Host "[更新器] 已更新 $($refreshedNames.Count) 个核心脚本$tail。"
+} elseif ($currentNames.Count -gt 0) {
+    Write-Host "[更新器] 核心脚本已是最新（$($currentNames.Count) 个）。"
 }
 exit 0

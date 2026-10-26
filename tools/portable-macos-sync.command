@@ -338,6 +338,7 @@ def install_bytes(payload, dest, executable=False):
             temp.unlink()
 
 restart = False
+current_names, refreshed_names = [], []  # QUIET_CONSOLE_V1: one summary line
 rows_by_path = {}
 for row in selected_manifest["files"]:
     if isinstance(row, dict) and isinstance(row.get("path"), str):
@@ -365,9 +366,9 @@ for name in ("player-update-generic.py", "player-update-generic.ps1", "portable-
                 compile(payload.decode("utf-8-sig"), name, "exec")  # Parse only; never execute downloaded code.
         if fresh:
             install_bytes(payload, dest, executable=name.endswith(".command"))
-            print(f"[更新器] 已刷新 {name}")
+            refreshed_names.append(name)
         else:
-            print(f"[更新器] 已是最新 {name}")
+            current_names.append(name)
         if name == "macOS-sync.command" and self_path != dest and self_path.read_bytes() != payload:
             install_bytes(payload, self_path, executable=True)
             restart = True
@@ -376,6 +377,11 @@ for name in ("player-update-generic.py", "player-update-generic.ps1", "portable-
             restart = payload != original_self
     except (OSError, ValueError, SyntaxError, http.client.HTTPException):
         print(f"[更新器] 跳过自刷新 {name}（下载或清单校验失败，已保留原文件）。")
+if refreshed_names:
+    tail = f"，另 {len(current_names)} 个已是最新" if current_names else ""
+    print(f"[更新器] 已更新 {len(refreshed_names)} 个核心脚本{tail}。")
+elif current_names:
+    print(f"[更新器] 核心脚本已是最新（{len(current_names)} 个）。")
 if restart:
     raise SystemExit(42)
 
@@ -404,7 +410,6 @@ done
 
 echo
 if [ "$status" = "0" ]; then
-  echo "[同步] 完成。"
   if [ "${PORTABLE_SYNC_ONLY:-}" = "1" ]; then exit 0; fi
   LAUNCHER_DIR="$INSTANCE_DIR/_launchers"
   HMCL_JAR="$INSTANCE_DIR/HMCL.jar"
@@ -462,7 +467,14 @@ else
     echo "[诊断] 请把实例目录里的「更新诊断包.zip」发给管理员，不需要截图。"
   fi
 fi
-read -r -p "按回车关闭。" _ || true
+# AUTO_CLOSE_V1: close by itself only after a successful run that showed nothing new.
+RUN_RESULT="$INSTANCE_DIR/.portable-sync-logs/last-run.json"
+if [ "$status" = "0" ] && [ -t 0 ] && [ -f "$RUN_RESULT" ] && grep -Eq '"notesShown": *false' "$RUN_RESULT" 2>/dev/null; then
+  read -r -t 5 -p "5 秒后自动关闭（按回车立即关闭）。" _ || true
+  echo
+else
+  read -r -p "按回车关闭。" _ || true
+fi
 exit "$status"
 
 # 维护注意（新代 os.replace 版）：本文件自更新改为「同目录临时文件 + os.replace
@@ -482,4 +494,4 @@ exit "$status"
 # 同步失败时可直接运行完整检查修复（_updater/macOS-self-repair.command 是同一功能的独立入口）。
 # v17：去掉清单签名校验（只保留 ETag 缓存）。
 # v18：去掉已退役云端的地址过滤（该云端已全面停用）。
-# v19：更新器版本号改为 2.27.28，功能不变。
+# v19：更新器 2.27.28；核心脚本自刷新合并为一行提示；没有新内容时 5 秒后自动关闭。

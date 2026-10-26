@@ -1699,9 +1699,92 @@ def disable_duplicate_mods(root: pathlib.Path, manifest: dict):
         print(f"[修复] 重复 mod 清理完成，移动 {moved} 个")
 
 
+def sync_summary(version, downloaded, removed, adopted, preserved, skipped, backup_root) -> str:
+    """QUIET_CONSOLE_V1: one plain sentence; the counters and the backup path stay in the log."""
+    kept = f"，保留了你改过的 {preserved} 个文件" if preserved else ""
+    if not (downloaded or removed or adopted):
+        return f"[同步] 已是最新版本 {version}，无需下载{kept}。" if version else f"[同步] 已是最新，无需下载{kept}。"
+    parts = []
+    if downloaded:
+        parts.append(f"下载 {downloaded} 个文件")
+    if removed:
+        parts.append(f"删除 {removed} 个旧文件")
+    if adopted:
+        parts.append(f"沿用本地已有的 {adopted} 个文件")
+    if skipped:
+        parts.append(f"其余 {skipped} 个已是最新")
+    text = (f"[同步] 更新完成（{version}）：" if version else "[同步] 更新完成：") + "，".join(parts) + kept + "。"
+    try:
+        if backup_root.is_dir() and any(backup_root.iterdir()):
+            text += "被替换的旧文件已备份。"
+    except OSError:
+        pass
+    return text
+
+
+def release_note_lines(manifest, version) -> list:
+    """RELEASE_NOTE_GROUPS_V1: notes grouped by version when the manifest has them,
+    otherwise the flat releaseNotes list under the current version."""
+    groups = []
+    for group in manifest.get("releaseNoteGroups") or []:
+        if not isinstance(group, dict):
+            continue
+        notes = [str(n).strip() for n in (group.get("notes") or []) if str(n).strip()]
+        if notes:
+            groups.append((str(group.get("version") or "").strip(), str(group.get("title") or "").strip(), notes))
+    if groups:
+        lines = ["[更新说明]"]
+        for number, title, notes in groups:
+            lines.append("  " + " ".join(p for p in (number, title) if p) + "：")
+            lines.extend("    - " + note for note in notes)
+        return lines
+    notes = [str(note).strip() for note in (manifest.get("releaseNotes") or []) if str(note).strip()]
+    if not notes:
+        return []
+    return [f"[本版说明] {version or '当前版本'}"] + ["  - " + note for note in notes]
+
+
+RUN_RESULT = ".portable-sync-logs/last-run.json"
+
+
+def write_run_result(root, version, notes_shown, changed) -> None:
+    """AUTO_CLOSE_V1: the entry script closes the window by itself only when nothing new was shown."""
+    try:
+        atomic_json(join_safe(root, RUN_RESULT), {"version": version, "notesShown": notes_shown, "changed": changed,
+                                                  "finishedAt": dt.datetime.now().astimezone().isoformat(timespec="seconds")})
+    except (OSError, UpdateError):
+        pass
+
+
+INTERNAL_DIRS = (".portable-sync-logs", ".portable-sync-backups", ".portable-staging", ".portable-manifest-cache")
+
+
+def hide_internal_dirs(root) -> None:
+    """HIDE_INTERNAL_V1: Windows shows dot folders; mark the updater's own folders hidden.
+    Only folders: a hidden *file* makes CREATE_ALWAYS writers fail on Windows."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for name in INTERNAL_DIRS:
+            path = root / name
+            if not path.is_dir() or path.is_symlink() or _is_name_surrogate(path):
+                continue
+            attributes = kernel32.GetFileAttributesW(str(path))
+            if attributes != 0xFFFFFFFF and not attributes & 0x2:
+                kernel32.SetFileAttributesW(str(path), attributes | 0x2)
+    except Exception:
+        pass
+
+
 def sync_instance(root, args) -> int:
     global _ACTIVE_JOURNAL
     reset_download_policy()
+    try:
+        join_safe(root, RUN_RESULT).unlink()
+    except (OSError, UpdateError):
+        pass
     manifest_urls = read_update_urls(root, args.manifest_url)
     state_path = join_safe(root, ".portable-sync-state.json")
     state = read_state(root)
@@ -1710,12 +1793,15 @@ def sync_instance(root, args) -> int:
         manifest_urls = order_manifest_urls(manifest_urls, last_good)
         if not manifest_urls:
             raise SystemExit("[清单获取失败] UPDATE-URL.txt 里没有可用的 http/https 更新地址，请重新获取玩家包。")
-    print("[同步] 清单候选：" + "；".join(mask_url(url) for url in manifest_urls))
+    # QUIET_CONSOLE_V1: addresses, proxy and engine details go to the log only.
+    detail_print(f"[同步] 更新器 {UPDATER_VERSION}（Python {sys.version.split()[0]}，{sys.platform}）")
+    detail_print("[同步] 清单候选：" + "；".join(mask_url(url) for url in manifest_urls))
     proxy = get_proxy_url()
     if proxy:
-        print(f"[同步] 已检测到系统代理 {describe_proxy(proxy)}，官方源先直连，受阻后可使用现有代理；更新服务直连。")
+        detail_print(f"[同步] 已检测到系统代理 {describe_proxy(proxy)}，官方源先直连，受阻后可使用现有代理；更新服务直连。")
     else:
-        print("[同步] 未检测到系统代理，官方源直连（太慢会在约 8 秒内回落更新服务）。")
+        detail_print("[同步] 未检测到系统代理，官方源直连（太慢会在约 8 秒内回落更新服务）。")
+    print("[同步] 正在连接更新服务器…")
     manifest = None
     selected_manifest_url = ""
     last_exc = None
@@ -1754,15 +1840,17 @@ def sync_instance(root, args) -> int:
         except Exception:
             manifest = None
     if manifest is None:
+        for line in endpoint_errors:
+            detail_print("[同步] 地址不可用：" + line)
         raise SystemExit(
-            f"[清单获取失败] {network_error_reason(last_exc)}。已尝试 {len(manifest_urls)} 个更新地址。"
-            "请确认当前更新地址可达，以及路由器已把更新端口转到服机。"
+            f"[清单获取失败] 连不上更新服务器：{network_error_reason(last_exc)}（已尝试 {len(manifest_urls)} 个地址）。"
         )
     manifest_url = selected_manifest_url
     if last_good and manifest_url == last_good:
-        print(f"[同步] 沿用上次可用更新地址：{mask_url(manifest_url)}")
+        detail_print(f"[同步] 沿用上次可用更新地址：{mask_url(manifest_url)}")
     elif manifest_url != manifest_urls[0]:
-        print(f"[同步] 已切换到可用备用地址：{mask_url(manifest_url)}")
+        print("[同步] 主更新地址连不上，已改用备用地址。")
+        detail_print(f"[同步] 已切换到可用备用地址：{mask_url(manifest_url)}")
     validate_manifest(root, manifest)
     files = manifest.get("files") or []
     _ACTIVE_JOURNAL = RecoveryJournal(root, manifest)
@@ -2108,17 +2196,20 @@ def sync_instance(root, args) -> int:
         if rel.lower().startswith(("config/", "defaultconfigs/"))
     ]
     forced_keys = {rel.lower() for rel in forced_applied_paths}
-    print(f"[同步] 完成。更新={downloaded} 配置变更={len(config_applied)} 接管={adopted} 跳过={skipped} 保留={preserved} 删除={removed} 备份={backup_root}")
+    detail_print(f"[同步] 完成。更新={downloaded} 配置变更={len(config_applied)} 接管={adopted} 跳过={skipped} 保留={preserved} 删除={removed} 备份={backup_root}")
+    print(sync_summary(current_version, downloaded, removed, adopted, preserved, skipped, backup_root))
     if config_applied:
         print(f"[配置已应用] 共 {len(config_applied)} 项：")
         for rel in config_applied:
             suffix = "（强制同步；原文件如存在已备份）" if rel.lower() in forced_keys else ""
             print(f"  - {rel}{suffix}")
-    release_notes = [str(note).strip() for note in (manifest.get("releaseNotes") or []) if str(note).strip()]
-    if release_notes and (version_changed or downloaded or adopted or removed or initial_sync):
-        print(f"[本版说明] {current_version or '当前版本'}")
-        for note in release_notes:
-            print(f"  - {note}")
+    notes_shown = False
+    if version_changed or downloaded or adopted or removed or initial_sync:
+        lines = release_note_lines(manifest, current_version)
+        for line in lines:
+            print(line)
+        notes_shown = bool(lines)
+    write_run_result(root, current_version, notes_shown, bool(downloaded or removed or adopted))
     if preserved_conflicts:
         print(f"[提示] 以下 {len(preserved_conflicts)} 个文件保留了你的本地修改，但服务端本次也更新了它们（未应用服务端版）：")
         for rel in preserved_conflicts:
@@ -2655,32 +2746,53 @@ def main() -> int:
     args = parser.parse_args()
     root = pathlib.Path(args.instance_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    with instance_lock(root):
-        with sync_log(root):
-            try:
-                return sync_instance(root, args)
-            except SystemExit as exc:
-                if exc.code and not isinstance(exc.code, int):
-                    print(str(exc), file=sys.stderr)
-                    report_failure(root, str(exc))
-                raise
-            except Exception as exc:
-                if isinstance(exc, UpdateError):
-                    message = str(exc)
-                elif isinstance(exc, OSError):
-                    message = str(local_file_error(exc, getattr(exc, "filename", None) or "客户端目录"))
-                else:
-                    message = f"[更新失败] 更新未完成，请联系管理员（{type(exc).__name__}）。"
-                print(message, file=sys.stderr)
-                report_failure(root, message)
-                raise UpdateError(message) from None
-            finally:
-                _ACTIVE_JOURNAL = None
+    try:
+        with instance_lock(root):
+            with sync_log(root):
+                try:
+                    return sync_instance(root, args)
+                except SystemExit as exc:
+                    if exc.code and not isinstance(exc.code, int):
+                        print(str(exc), file=sys.stderr)
+                        report_failure(root, str(exc))
+                        # Shown once: a SystemExit carrying the text would print it again on exit.
+                        raise SystemExit(1) from None
+                    raise
+                except Exception as exc:
+                    if isinstance(exc, UpdateError):
+                        message = str(exc)
+                    elif isinstance(exc, OSError):
+                        message = str(local_file_error(exc, getattr(exc, "filename", None) or "客户端目录"))
+                    else:
+                        message = f"[更新失败] 更新未完成，请联系管理员（{type(exc).__name__}）。"
+                    print(message, file=sys.stderr)
+                    report_failure(root, message)
+                    error = UpdateError(message)
+                    error.reported = True
+                    raise error from None
+                finally:
+                    _ACTIVE_JOURNAL = None
+    finally:
+        hide_internal_dirs(root)
+
+
+# FAILURE_HINT_V1: what the player can do, by error code (codes whose message already says it are left out).
+FAILURE_HINTS = {
+    "E-FETCH": "连不上更新服务器。先确认能正常上网；开着加速器或代理的 TUN（虚拟网卡）模式时先关掉再试；服务器也可能在维护，过几分钟再运行一次。",
+    "E-NET": "下载中途断了。直接重新运行更新器，已下完的文件不会重下；开着加速器或代理的 TUN 模式时先关掉再试。",
+    "E-HASH": "下载的文件和服务器上的不一致，多半是网络传输出错。重新运行一次；反复出现时把诊断包发给管理员。",
+    "E-MANIFEST": "服务器上的更新清单有问题，不是你这边的原因。请把诊断包发给管理员。",
+    "E-STATE": "本地的更新记录损坏了，请把诊断包发给管理员。",
+    "E-BUSY": "已经有一个更新窗口在运行。等它结束，或关掉另一个更新窗口后再试。",
+    "E-PRECHECK": "更新前的检查没通过。按上面的提示处理后重新运行。",
+}
 
 
 def report_failure(root, message):
     code = error_code(message)
     print(f"[错误编号] {code}", file=sys.stderr)
+    if code in FAILURE_HINTS:
+        print(f"[怎么办] {FAILURE_HINTS[code]}", file=sys.stderr)
     package = write_diagnostic_package(root, code, message)
     if package is not None:
         print(f"[诊断] 已生成「{DIAGNOSTIC_NAME}」（在实例目录里），请把这个文件发给管理员，不需要截图。", file=sys.stderr)
@@ -2694,7 +2806,8 @@ if __name__ == "__main__":
         print("[同步已取消] 更新尚未完成，请重新运行更新器后再启动游戏。", file=sys.stderr)
         raise SystemExit(130)
     except UpdateError as exc:
-        print(str(exc), file=sys.stderr)
+        if not getattr(exc, "reported", False):
+            print(str(exc), file=sys.stderr)
         print("[同步失败] 更新尚未完成，请处理上述问题后重新运行更新器。", file=sys.stderr)
         raise SystemExit(1)
     except Exception as exc:

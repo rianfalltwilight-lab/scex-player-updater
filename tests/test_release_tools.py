@@ -294,7 +294,9 @@ class FakeHostReleaseTests(unittest.TestCase):
         payload = out_dir / 'fake' / 'payload'
         manifest = json.loads((payload / PUBLIC / 'server-manifest.json').read_text(encoding='utf-8'))
         self.assertEqual(manifest['version'], '1.0.2')
-        self.assertEqual(manifest['releaseNotes'], ['更新器维护说明', '内容更新说明'])
+        self.assertEqual(manifest['releaseNotes'], ['更新器维护说明', '（1.0.1）内容更新说明'])
+        self.assertEqual(manifest['releaseNoteGroups'], [{'version': '1.0.2', 'title': '更新器维护', 'notes': ['更新器维护说明']},
+                                                         {'version': '1.0.1', 'title': '内容更新', 'notes': ['内容更新说明']}])
         rows = {r['path']: r for r in manifest['files']}
         self.assertEqual(rows['_updater/player-update-generic.py']['sha1'], sha1(self.engine_b))
         self.assertEqual(rows['mods/a.jar']['sha1'], sha1(b'jar'))

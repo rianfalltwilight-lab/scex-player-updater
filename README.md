@@ -79,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _updater\player-update-gener
 python3 _updater/player-update-generic.py --instance-dir .
 ```
 
-异常时先运行 `一键客户端自助修复.bat` 检查；确认需要修补后使用 `player-self-repair.ps1 -Fix`。同步状态位于 `.portable-sync-state.json`，被替换文件的备份位于 `.portable-sync-backups`，预下载位于 `.portable-staging`。
+异常时先运行 `一键客户端自助修复.bat` 检查；确认需要修补后使用 `player-self-repair.ps1 -Fix`。同步状态位于 `.portable-sync-state.json`，被替换文件的备份位于 `.portable-sync-backups`，预下载位于 `.portable-staging`。Windows 上更新器会把这几个内部文件夹（以及 `.portable-sync-logs`、`.portable-manifest-cache`）设为隐藏；文件不设隐藏，因为隐藏文件会让部分写入方式失败。
 
 ## 配置与边界
 

@@ -1711,7 +1711,88 @@ function Start-SyncLog {
     $script:SyncLogPath = Join-SafeRelativePath -Root $Root -Rel '.portable-sync-logs/latest.log'
     if ([IO.File]::Exists($script:SyncLogPath)) { [IO.File]::Copy($script:SyncLogPath, (Join-SafeRelativePath -Root $Root -Rel '.portable-sync-logs/previous.log'), $true) }
     [IO.File]::WriteAllText($script:SyncLogPath, ('[诊断] 开始同步 ' + (Get-Date -Format o) + "`n"), [Text.UTF8Encoding]::new($false))
-    Write-Host "[诊断] 日志：$script:SyncLogPath"
+    # QUIET_CONSOLE_V1: engine, addresses and proxy details go to the log only.
+    Write-SyncDetail ("[同步] 更新器 $($script:UpdaterVersion)（PowerShell $($PSVersionTable.PSVersion)）")
+}
+
+function Get-SyncSummary {
+    # QUIET_CONSOLE_V1: one plain sentence; the counters and the backup path stay in the log.
+    param([string]$Version, [int]$Downloaded, [int]$Removed, [int]$Adopted, [int]$Preserved, [int]$Skipped, [string]$BackupRoot)
+    $kept = if ($Preserved -gt 0) { "，保留了你改过的 $Preserved 个文件" } else { '' }
+    if ($Downloaded -eq 0 -and $Removed -eq 0 -and $Adopted -eq 0) {
+        if ($Version) { return "[同步] 已是最新版本 $Version，无需下载$kept。" }
+        return "[同步] 已是最新，无需下载$kept。"
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($Downloaded -gt 0) { [void]$parts.Add("下载 $Downloaded 个文件") }
+    if ($Removed -gt 0) { [void]$parts.Add("删除 $Removed 个旧文件") }
+    if ($Adopted -gt 0) { [void]$parts.Add("沿用本地已有的 $Adopted 个文件") }
+    if ($Skipped -gt 0) { [void]$parts.Add("其余 $Skipped 个已是最新") }
+    $text = $(if ($Version) { "[同步] 更新完成（$Version）：" } else { '[同步] 更新完成：' }) + ($parts -join '，') + $kept + '。'
+    try {
+        if ([IO.Directory]::Exists($BackupRoot) -and [IO.Directory]::EnumerateFileSystemEntries($BackupRoot).GetEnumerator().MoveNext()) { $text += '被替换的旧文件已备份。' }
+    } catch { }
+    return $text
+}
+
+function Get-ReleaseNoteLines {
+    # RELEASE_NOTE_GROUPS_V1: notes grouped by version when the manifest has them,
+    # otherwise the flat releaseNotes list under the current version.
+    param($Manifest, [string]$Version)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($group in @(Get-ArrayValue -Object $Manifest -Name 'releaseNoteGroups' -Default @())) {
+        if ($null -eq $group -or $group -is [string]) { continue }
+        $notes = @(Get-ArrayValue -Object $group -Name 'notes' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        if ($notes.Count -eq 0) { continue }
+        if ($lines.Count -eq 0) { [void]$lines.Add('[更新说明]') }
+        $label = (@([string](Get-PropertyValue -Object $group -Name 'version' -Default ''), [string](Get-PropertyValue -Object $group -Name 'title' -Default '')) |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '
+        [void]$lines.Add('  ' + $label + '：')
+        foreach ($note in $notes) { [void]$lines.Add('    - ' + $note) }
+    }
+    if ($lines.Count -gt 0) { return ,$lines.ToArray() }
+    $flat = @(Get-ArrayValue -Object $Manifest -Name 'releaseNotes' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    if ($flat.Count -eq 0) { return ,@() }
+    [void]$lines.Add('[本版说明] ' + $(if ($Version) { $Version } else { '当前版本' }))
+    foreach ($note in $flat) { [void]$lines.Add('  - ' + $note) }
+    return ,$lines.ToArray()
+}
+
+function Write-RunResult {
+    # AUTO_CLOSE_V1: the entry script closes the window by itself only when nothing new was shown.
+    param([string]$Root, [string]$Version, [bool]$NotesShown, [bool]$Changed)
+    try {
+        $path = Join-SafeRelativePath -Root $Root -Rel '.portable-sync-logs/last-run.json'
+        $json = [ordered]@{ version = $Version; notesShown = $NotesShown; changed = $Changed; finishedAt = (Get-Date).ToString('o') } | ConvertTo-Json -Compress
+        $temp = $path + '.tmp'
+        [IO.File]::WriteAllText($temp, $json, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+        [IO.File]::Move($temp, $path)
+    } catch { }
+}
+
+function Hide-InternalDirs {
+    # HIDE_INTERNAL_V1: Windows shows dot folders; mark the updater's own folders hidden.
+    # Only folders: a hidden *file* makes [IO.File]::WriteAllText and other CREATE_ALWAYS writers fail.
+    param([string]$Root)
+    foreach ($name in @('.portable-sync-logs', '.portable-sync-backups', '.portable-staging', '.portable-manifest-cache')) {
+        try {
+            $info = New-Object IO.DirectoryInfo (Join-Path $Root $name)
+            if (-not $info.Exists -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+            if (-not ($info.Attributes -band [IO.FileAttributes]::Hidden)) { $info.Attributes = $info.Attributes -bor [IO.FileAttributes]::Hidden }
+        } catch { }
+    }
+}
+
+# FAILURE_HINT_V1: what the player can do, by error code (same table as the Python updater).
+$script:FailureHints = @{
+    'E-FETCH' = '连不上更新服务器。先确认能正常上网；开着加速器或代理的 TUN（虚拟网卡）模式时先关掉再试；服务器也可能在维护，过几分钟再运行一次。'
+    'E-NET' = '下载中途断了。直接重新运行更新器，已下完的文件不会重下；开着加速器或代理的 TUN 模式时先关掉再试。'
+    'E-HASH' = '下载的文件和服务器上的不一致，多半是网络传输出错。重新运行一次；反复出现时把诊断包发给管理员。'
+    'E-MANIFEST' = '服务器上的更新清单有问题，不是你这边的原因。请把诊断包发给管理员。'
+    'E-STATE' = '本地的更新记录损坏了，请把诊断包发给管理员。'
+    'E-BUSY' = '已经有一个更新窗口在运行。等它结束，或关掉另一个更新窗口后再试。'
+    'E-PRECHECK' = '更新前的检查没通过。按上面的提示处理后重新运行。'
 }
 
 function Get-PartialDownloadPath {
@@ -1936,6 +2017,7 @@ New-Item -ItemType Directory -Force $instanceRoot | Out-Null
 $script:SyncRoot=$instanceRoot.TrimEnd('\')
 $syncLock=Enter-SyncLock -Root $instanceRoot
 Start-SyncLog -Root $instanceRoot
+try { [IO.File]::Delete((Join-Path $instanceRoot '.portable-sync-logs\last-run.json')) } catch { }
 Set-Location -LiteralPath $instanceRoot
 
 # 老系统/未开启强加密的 .NET 默认拿不到 TLS 1.2，https 更新源会直接失败；入口 bat 已设，
@@ -1953,13 +2035,14 @@ if ([string]::IsNullOrWhiteSpace($ManifestUrl)) {
     $manifestUrls = @(Get-OrderedManifestUrls -Urls $manifestUrls -LastGood $lastGood)
     if ($manifestUrls.Count -eq 0) { throw '[清单获取失败] UPDATE-URL.txt 里没有可用的 http/https 更新地址，请重新获取玩家包。' }
 }
-Write-Host ("[同步] 清单候选：" + (($manifestUrls | ForEach-Object { Get-MaskedUrl $_ }) -join '；'))
+Write-SyncDetail ("[同步] 清单候选：" + (($manifestUrls | ForEach-Object { Get-MaskedUrl $_ }) -join '；'))
 $detectedProxy = Get-SystemProxyUrl
 if ($detectedProxy) {
-    Write-Host ("[同步] 已检测到系统代理 {0}，官方源先直连，受阻后可使用现有代理；更新服务直连。" -f (Get-ProxyDescription $detectedProxy))
+    Write-SyncDetail ("[同步] 已检测到系统代理 {0}，官方源先直连，受阻后可使用现有代理；更新服务直连。" -f (Get-ProxyDescription $detectedProxy))
 } else {
-    Write-Host '[同步] 未检测到系统代理，官方源直连（太慢会在约 8 秒内回落更新服务）。'
+    Write-SyncDetail '[同步] 未检测到系统代理，官方源直连（太慢会在约 8 秒内回落更新服务）。'
 }
+Write-Host '[同步] 正在连接更新服务器…'
 $manifest = $null
 $manifestText = $null
 $selectedManifestUrl = $null
@@ -1972,8 +2055,9 @@ foreach ($candidate in $manifestUrls) {
         try { $trusted = Get-CachedManifest -Url $candidate -Root $instanceRoot -TimeoutSec $probeTimeout -UserAgent $script:SyncUserAgent }
         catch {
             $lastManifestError = $_.Exception
+            Write-SyncDetail ("[同步] 清单获取失败（第 " + ($attempt + 1) + " 次）：" + (Get-MaskedUrl $candidate) + " -> " + $_.Exception.Message)
             if ($attempt -lt $retries) {
-                Write-Host ("[同步] 清单获取失败（第 " + ($attempt + 1) + " 次）：" + $_.Exception.Message + "；3 秒后重试...")
+                Write-Host '[同步] 这次没连上，3 秒后重试…'
                 Start-Sleep -Seconds 3
             }
         }
@@ -2012,13 +2096,14 @@ if (-not $manifest) {
 }
 $manifestUrl = [string]$selectedManifestUrl
 if (-not [string]::IsNullOrWhiteSpace($lastGood) -and $manifestUrl -eq $lastGood) {
-    Write-Host "[同步] 沿用上次可用更新地址：$(Get-MaskedUrl $manifestUrl)"
+    Write-SyncDetail "[同步] 沿用上次可用更新地址：$(Get-MaskedUrl $manifestUrl)"
 } elseif ($manifestUrl -ne [string]$manifestUrls[0]) {
-    Write-Host "[同步] 已切换到可用备用地址：$(Get-MaskedUrl $manifestUrl)"
+    Write-Host '[同步] 主更新地址连不上，已改用备用地址。'
+    Write-SyncDetail "[同步] 已切换到可用备用地址：$(Get-MaskedUrl $manifestUrl)"
 }
 if (-not $manifest.files) { throw 'manifest 缺少 files。' }
 Assert-ManifestFiles -Root $instanceRoot -Files $manifest.files -DeleteGlobs @(Get-ArrayValue -Object $manifest -Name 'forceDeleteGlobs' -Default @())
-Write-Host ('[版本] ' + [string]$manifest.version)
+Write-SyncDetail ('[版本] ' + [string]$manifest.version)
 
 $slash = $manifestUrl.LastIndexOf('/')
 if ($slash -lt 0) { throw "manifest URL 格式异常：$manifestUrl" }
@@ -2423,7 +2508,8 @@ if ([IO.File]::Exists($staleDiagnostic)) { try { [IO.File]::Delete($staleDiagnos
 $configApplied = @(@($updatedPaths) + @($adoptedPaths) | Where-Object { $_ -like 'config/*' -or $_ -like 'defaultconfigs/*' })
 $forcedAppliedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($rel in $forcedAppliedPaths) { [void]$forcedAppliedSet.Add($rel) }
-Write-Host "[同步] 完成。更新=$downloaded 配置变更=$($configApplied.Count) 接管=$adopted 跳过=$skipped 保留=$preserved 删除=$removed 备份=$backupRoot"
+Write-SyncDetail "[同步] 完成。更新=$downloaded 配置变更=$($configApplied.Count) 接管=$adopted 跳过=$skipped 保留=$preserved 删除=$removed 备份=$backupRoot"
+Write-Host (Get-SyncSummary -Version $currentVersion -Downloaded $downloaded -Removed $removed -Adopted $adopted -Preserved $preserved -Skipped $skipped -BackupRoot $backupRoot) -ForegroundColor Green
 if ($configApplied.Count -gt 0) {
     Write-Host "[配置已应用] 共 $($configApplied.Count) 项："
     foreach ($rel in $configApplied) {
@@ -2431,11 +2517,13 @@ if ($configApplied.Count -gt 0) {
         Write-Host ("  - " + $rel + $suffix)
     }
 }
-$releaseNotes = @(Get-ArrayValue -Object $manifest -Name 'releaseNotes' -Default @() | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ($releaseNotes.Count -gt 0 -and ($versionChanged -or $downloaded -gt 0 -or $adopted -gt 0 -or $removed -gt 0 -or $script:InitialSync)) {
-    Write-Host ("[本版说明] " + $(if ($currentVersion) { $currentVersion } else { '当前版本' }))
-    foreach ($note in $releaseNotes) { Write-Host ("  - " + $note) }
+$notesShown = $false
+if ($versionChanged -or $downloaded -gt 0 -or $adopted -gt 0 -or $removed -gt 0 -or $script:InitialSync) {
+    $noteLines = @(Get-ReleaseNoteLines -Manifest $manifest -Version $currentVersion)
+    foreach ($line in $noteLines) { Write-Host $line }
+    $notesShown = $noteLines.Count -gt 0
 }
+Write-RunResult -Root $instanceRoot -Version $currentVersion -NotesShown $notesShown -Changed ($downloaded -gt 0 -or $removed -gt 0 -or $adopted -gt 0)
 if ($script:PreservedConflicts.Count -gt 0) {
     Write-Host ("[提示] 以下 " + $script:PreservedConflicts.Count + " 个文件保留了你的本地修改，但服务端本次也更新了它们（未应用服务端版）：")
     foreach ($r in $script:PreservedConflicts) { Write-Host ("  - " + $r) }
@@ -2452,10 +2540,14 @@ if (-not $NoPause) {
     Write-Host $failure -ForegroundColor Red
     $failureCode = Get-UpdateErrorCode $failure
     Write-Host "[错误编号] $failureCode"
+    if ($script:FailureHints.ContainsKey($failureCode)) { Write-Host ('[怎么办] ' + $script:FailureHints[$failureCode]) -ForegroundColor Yellow }
     if ($failureCode -ne 'E-BUSY' -and $instanceRoot -and (Write-DiagnosticPackage -Root $instanceRoot -Code $failureCode -Message $failure)) {
         Write-Host "[诊断] 已生成「$($script:DiagnosticName)」（在实例目录里），请把这个文件发给管理员，不需要截图。"
     }
     Write-Host '[同步] 更新未完成，请处理上述问题后重新运行；成功前不要启动游戏。' -ForegroundColor Yellow
     if (-not $NoPause) { Write-Host '按回车关闭。'; [void][Console]::ReadLine() }
     exit 1
-} finally { Exit-SyncLock -Handle $syncLock }
+} finally {
+    Exit-SyncLock -Handle $syncLock
+    if ($instanceRoot) { Hide-InternalDirs -Root $instanceRoot }
+}
