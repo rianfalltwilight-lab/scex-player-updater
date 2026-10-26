@@ -2519,7 +2519,8 @@ if ($configApplied.Count -gt 0) {
 }
 $notesShown = $false
 if ($versionChanged -or $downloaded -gt 0 -or $adopted -gt 0 -or $removed -gt 0 -or $script:InitialSync) {
-    $noteLines = @(Get-ReleaseNoteLines -Manifest $manifest -Version $currentVersion)
+    # The function returns its array as one pipeline object; assign it, do not wrap it in @().
+    $noteLines = Get-ReleaseNoteLines -Manifest $manifest -Version $currentVersion
     foreach ($line in $noteLines) { Write-Host $line }
     $notesShown = $noteLines.Count -gt 0
 }
