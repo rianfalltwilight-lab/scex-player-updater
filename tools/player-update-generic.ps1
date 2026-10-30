@@ -1784,6 +1784,82 @@ function Hide-InternalDirs {
     }
 }
 
+$script:LanOnlyHint = '请向管理员要最新的「UPDATE-URL.txt」，放进实例文件夹和里面的 _updater 文件夹（覆盖原文件），再重新运行更新器。'
+$script:AddressFiles = @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt', '_updater\UPDATE-URL.txt', '_updater\PORTABLE-UPDATE-URL.txt', 'UPDATE-URL-LAN.txt', '_updater\UPDATE-URL-LAN.txt')
+# Root copies are not manifest rows; _updater\UPDATE-URL.txt is, and a sync keeps it current.
+$script:RootAddressFiles = @('UPDATE-URL.txt', 'PORTABLE-UPDATE-URL.txt', 'TFCR-update-url.txt')
+
+function Get-UrlEndpoint {
+    # host:port of an update URL, never its token path.
+    param([string]$Url)
+    try { return ([Uri]$Url.Trim()).Authority } catch { return '?' }
+}
+
+function Get-FallbackManifestUrls {
+    # ADDRESS_FALLBACK_V1: addresses this instance recorded before (the last one that worked, the
+    # updateUrl of the bundled and of the cached manifest). Tried only after every address in the
+    # address files failed; public addresses first.
+    param([string]$Root, $State)
+    $found = New-Object System.Collections.Generic.List[string]
+    if ($State) {
+        [void]$found.Add([string](Get-PropertyValue -Object $State -Name 'lastManifestUrl' -Default ''))
+        [void]$found.Add([string](Get-PropertyValue -Object $State -Name 'manifestUrl' -Default ''))
+    }
+    foreach ($rel in @('server-manifest.json', ($script:ManifestCacheDir + '\server-manifest.json'))) {
+        try {
+            $path = Join-SafeRelativePath -Root $Root -Rel $rel
+            if ([IO.File]::Exists($path)) {
+                $json = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                [void]$found.Add([string](Get-PropertyValue -Object $json -Name 'updateUrl' -Default ''))
+            }
+        } catch { }
+    }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $usable = @($found | ForEach-Object { ([string]$_).Trim() } | Where-Object { (Test-UsableUpdateUrl $_) -and $seen.Add($_) })
+    return @(@($usable | Where-Object { -not (Test-PrivateUpdateUrl $_) }) + @($usable | Where-Object { Test-PrivateUpdateUrl $_ }))
+}
+
+function Get-AddressSummary {
+    # Diagnostics: every address file as masked scheme://host:port/*** lines.
+    param([string]$Root)
+    $out = [ordered]@{}
+    foreach ($rel in $script:AddressFiles) {
+        $path = Join-Path $Root $rel
+        if (-not [IO.File]::Exists($path)) { continue }
+        try {
+            $lines = @(([IO.File]::ReadAllText($path, [Text.Encoding]::UTF8).TrimStart([char]0xFEFF) -split "`r?`n") |
+                ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } | Select-Object -First 8 | ForEach-Object { Get-MaskedText $_ })
+            $out[$rel.Replace('\', '/')] = $lines
+        } catch { $out[$rel.Replace('\', '/')] = @('<无法读取>') }
+    }
+    return $out
+}
+
+function Repair-RootAddressFiles {
+    # ADDRESS_FALLBACK_V1: after a recorded address rescued the sync, stale root address files take
+    # the content of the _updater\UPDATE-URL.txt the sync has just verified (originals backed up).
+    param([string]$Root, [string]$BackupRoot)
+    $source = Join-SafeRelativePath -Root $Root -Rel '_updater/UPDATE-URL.txt'
+    if (-not [IO.File]::Exists($source)) { return 0 }
+    $data = [IO.File]::ReadAllBytes($source)
+    $text = [Text.Encoding]::UTF8.GetString($data).TrimStart([char]0xFEFF)
+    if (-not @(($text -split "`r?`n") | Where-Object { Test-UsableUpdateUrl $_.Trim() }).Count) { return 0 }
+    $fixed = 0
+    foreach ($rel in $script:RootAddressFiles) {
+        $path = Join-SafeRelativePath -Root $Root -Rel $rel
+        if (-not [IO.File]::Exists($path)) { continue }
+        $current = [IO.File]::ReadAllBytes($path)
+        if ($current.Length -eq $data.Length -and [Convert]::ToBase64String($current) -eq [Convert]::ToBase64String($data)) { continue }
+        Backup-FileIfExists -Path $path -Rel $rel -BackupRoot $BackupRoot
+        $temp = $path + '.portable-new.tmp'
+        [IO.File]::WriteAllBytes($temp, $data)
+        [IO.File]::Copy($temp, $path, $true)
+        [IO.File]::Delete($temp)
+        $fixed++
+    }
+    return $fixed
+}
+
 # FAILURE_HINT_V1: what the player can do, by error code (same table as the Python updater).
 $script:FailureHints = @{
     'E-FETCH' = '连不上更新服务器。先确认能正常上网；开着加速器或代理的 TUN（虚拟网卡）模式时先关掉再试；服务器也可能在维护，过几分钟再运行一次。'
@@ -1869,7 +1945,8 @@ function Get-UpdateErrorCode {
 
 function Get-MaskedText {
     param([string]$Text)
-    return [regex]::Replace([string]$Text, 'https?://[^\s；，。"'']+', { param($m) try { $u = [Uri]$m.Value; $u.Scheme + '://' + $u.Host + '/***' } catch { '[更新地址已隐藏]' } })
+    # The port is not secret and tells LAN, forwarded and public endpoints apart (Authority = host:port).
+    return [regex]::Replace([string]$Text, 'https?://[^\s；，。"'']+', { param($m) try { $u = [Uri]$m.Value; $u.Scheme + '://' + $u.Authority + '/***' } catch { '[更新地址已隐藏]' } })
 }
 
 function Write-SyncDetail {
@@ -1903,13 +1980,19 @@ function Write-DiagnosticPackage {
         $target = Join-Path $Root $script:DiagnosticName
         $temporary = $target + '.tmp'
         if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
-        $summary = [ordered]@{ errorCode = $Code; message = (Get-MaskedText $Message); engine = 'powershell'
+        $summary = [ordered]@{ errorCode = $Code; message = (Get-MaskedText $Message); engine = 'powershell'; updaterVersion = $script:UpdaterVersion
             powershell = $PSVersionTable.PSVersion.ToString(); os = [Environment]::OSVersion.VersionString; createdAt = (Get-Date).ToString('o') }
+        $state = $null
         try {
             $state = [IO.File]::ReadAllText((Join-Path $Root '.portable-sync-state.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
             $summary.packId = [string]$state.packId; $summary.syncedVersion = [string]$state.version
             $summary.syncedAt = [string]$state.syncedAt; $summary.managedFiles = @($state.files).Count
         } catch { $summary.syncedVersion = $null }
+        # DIAGNOSTIC_V2: which addresses the instance has (host:port only; tokens are masked).
+        try {
+            $summary.addressFiles = Get-AddressSummary -Root $Root
+            $summary.recordedAddresses = @(Get-FallbackManifestUrls -Root $Root -State $state | ForEach-Object { Get-MaskedText $_ })
+        } catch { $summary.addressFiles = $null }
         $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew)
         try {
             $zip = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create)
@@ -2047,33 +2130,55 @@ $manifest = $null
 $manifestText = $null
 $selectedManifestUrl = $null
 $lastManifestError = $null
-foreach ($candidate in $manifestUrls) {
-    $probeTimeout = Get-ProbeTimeoutSec -Url $candidate
-    $retries = if ($probeTimeout -le 2) { 0 } else { 1 }
-    $trusted = $null
-    for ($attempt = 0; $attempt -le $retries -and -not $trusted; $attempt++) {
-        try { $trusted = Get-CachedManifest -Url $candidate -Root $instanceRoot -TimeoutSec $probeTimeout -UserAgent $script:SyncUserAgent }
-        catch {
-            $lastManifestError = $_.Exception
-            Write-SyncDetail ("[同步] 清单获取失败（第 " + ($attempt + 1) + " 次）：" + (Get-MaskedUrl $candidate) + " -> " + $_.Exception.Message)
-            if ($attempt -lt $retries) {
-                Write-Host '[同步] 这次没连上，3 秒后重试…'
-                Start-Sleep -Seconds 3
+$tried = New-Object System.Collections.Generic.List[string]
+$usedFallback = $false
+$known = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($u in $manifestUrls) { [void]$known.Add([string]$u) }
+# ADDRESS_FALLBACK_V1: the address files first; when all fail, addresses this instance recorded before.
+foreach ($phase in @('files', 'recorded')) {
+    if ($manifest) { break }
+    if ($phase -eq 'files') { $candidates = @($manifestUrls) }
+    elseif (-not [string]::IsNullOrWhiteSpace($ManifestUrl)) { break }
+    else { $candidates = @(Get-FallbackManifestUrls -Root $instanceRoot -State $state | Where-Object { $known.Add([string]$_) }) }
+    foreach ($candidate in $candidates) {
+        [void]$tried.Add([string]$candidate)
+        if ($phase -eq 'recorded') { Write-SyncDetail "[同步] 改试本地记录的地址：$(Get-MaskedUrl $candidate)" }
+        $probeTimeout = Get-ProbeTimeoutSec -Url $candidate
+        $retries = if ($probeTimeout -le 2) { 0 } else { 1 }
+        $trusted = $null
+        for ($attempt = 0; $attempt -le $retries -and -not $trusted; $attempt++) {
+            try { $trusted = Get-CachedManifest -Url $candidate -Root $instanceRoot -TimeoutSec $probeTimeout -UserAgent $script:SyncUserAgent }
+            catch {
+                $lastManifestError = $_.Exception
+                Write-SyncDetail ("[同步] 清单获取失败（第 " + ($attempt + 1) + " 次）：" + (Get-MaskedUrl $candidate) + " -> " + $_.Exception.Message)
+                if ($attempt -lt $retries) {
+                    Write-Host '[同步] 这次没连上，3 秒后重试…'
+                    Start-Sleep -Seconds 3
+                }
             }
         }
+        if (-not $trusted) { continue }
+        try {
+            $candidateText = [Text.Encoding]::UTF8.GetString([byte[]]$trusted.Raw).TrimStart([char]0xFEFF)
+            $candidateManifest = $candidateText | ConvertFrom-Json
+            if (-not $candidateManifest.files) { throw 'manifest 缺少 files。' }
+            $manifestText = $candidateText
+            $manifest = $candidateManifest
+            $selectedManifestUrl = $candidate
+            break
+        } catch {
+            $lastManifestError = $_.Exception
+        }
     }
-    if (-not $trusted) { continue }
-    try {
-        $candidateText = [Text.Encoding]::UTF8.GetString([byte[]]$trusted.Raw).TrimStart([char]0xFEFF)
-        $candidateManifest = $candidateText | ConvertFrom-Json
-        if (-not $candidateManifest.files) { throw 'manifest 缺少 files。' }
-        $manifestText = $candidateText
-        $manifest = $candidateManifest
-        $selectedManifestUrl = $candidate
-        break
-    } catch {
-        $lastManifestError = $_.Exception
+    if ($manifest -and $phase -eq 'recorded') {
+        $usedFallback = $true
+        Write-Host '[同步] 地址文件里的地址都连不上，已改用以前记录的更新地址；更新完成后会把地址文件换成最新的。'
     }
+}
+$lanNote = ''
+if (-not $manifest -and [string]::IsNullOrWhiteSpace($ManifestUrl) -and $tried.Count -gt 0 -and
+        @($tried | Where-Object { -not (Test-PrivateUpdateUrl $_) }).Count -eq 0) {
+    $lanNote = "你的更新地址只有局域网地址（$(Get-UrlEndpoint $tried[0])），只在服务器所在的网络里能用。"
 }
 
 # 完整包通常自带清单；更新源短暂不可达时，用它继续做本地哈希对账，
@@ -2087,15 +2192,23 @@ if (-not $manifest) {
                 $manifest = $localManifest
                 $selectedManifestUrl = $manifestUrls[0]
                 Write-Host '[降级] 更新源暂时不可达，改用包内 server-manifest.json 做本地对账；缺失文件仍需更新源恢复后补下。' -ForegroundColor Yellow
+                if ($lanNote) { Write-Host ('[提示] ' + $lanNote + $script:LanOnlyHint) -ForegroundColor Yellow }
             }
         } catch { $manifest = $null }
     }
 }
 if (-not $manifest) {
-    throw (Format-UpdateError -ErrorRecord $lastManifestError -Phase '获取清单')
+    $fetchFailure = Format-UpdateError -ErrorRecord $lastManifestError -Phase '获取清单'
+    if ($lanNote) {
+        Write-SyncDetail $fetchFailure
+        $fetchFailure = "[获取清单失败] 连不上更新服务器（已尝试 $($tried.Count) 个地址）。" + $lanNote
+    }
+    throw $fetchFailure
 }
 $manifestUrl = [string]$selectedManifestUrl
-if (-not [string]::IsNullOrWhiteSpace($lastGood) -and $manifestUrl -eq $lastGood) {
+if ($usedFallback) {
+    Write-SyncDetail "[同步] 已改用本地记录的地址：$(Get-MaskedUrl $manifestUrl)"
+} elseif (-not [string]::IsNullOrWhiteSpace($lastGood) -and $manifestUrl -eq $lastGood) {
     Write-SyncDetail "[同步] 沿用上次可用更新地址：$(Get-MaskedUrl $manifestUrl)"
 } elseif ($manifestUrl -ne [string]$manifestUrls[0]) {
     Write-Host '[同步] 主更新地址连不上，已改用备用地址。'
@@ -2491,6 +2604,11 @@ $stateOut = [ordered]@{
 }
 Save-SyncState -Path $statePath -Value $stateOut
 if ([IO.File]::Exists($script:JournalPath)) { [IO.File]::Delete($script:JournalPath) }
+if ($usedFallback) {
+    try {
+        if ((Repair-RootAddressFiles -Root $instanceRoot -BackupRoot $backupRoot) -gt 0) { Write-Host '[修复] 已把实例文件夹里过期的更新地址换成最新的（原文件已备份）。' }
+    } catch { Write-Host '[提示] 过期的更新地址文件未能替换，不影响本次更新。' }
+}
 try {
     $prunedBackups = Remove-OldSyncBackups -Root $instanceRoot -Keep $backupRoot
     if ($prunedBackups -gt 0) { Write-Host "[清理] 已删除 $prunedBackups 份旧备份，只保留本次备份。" }
@@ -2541,7 +2659,9 @@ if (-not $NoPause) {
     Write-Host $failure -ForegroundColor Red
     $failureCode = Get-UpdateErrorCode $failure
     Write-Host "[错误编号] $failureCode"
-    if ($script:FailureHints.ContainsKey($failureCode)) { Write-Host ('[怎么办] ' + $script:FailureHints[$failureCode]) -ForegroundColor Yellow }
+    $hint = if ($failureCode -eq 'E-FETCH' -and $failure.Contains('只有局域网地址')) { $script:LanOnlyHint }
+            elseif ($script:FailureHints.ContainsKey($failureCode)) { $script:FailureHints[$failureCode] } else { '' }
+    if ($hint) { Write-Host ('[怎么办] ' + $hint) -ForegroundColor Yellow }
     if ($failureCode -ne 'E-BUSY' -and $instanceRoot -and (Write-DiagnosticPackage -Root $instanceRoot -Code $failureCode -Message $failure)) {
         Write-Host "[诊断] 已生成「$($script:DiagnosticName)」（在实例目录里），请把这个文件发给管理员，不需要截图。"
     }

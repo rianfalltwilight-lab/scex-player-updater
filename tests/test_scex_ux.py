@@ -178,7 +178,7 @@ class PythonHelperTests(unittest.TestCase):
         self.assertTrue(line.startswith('[进度] 1/2 个文件，1.0/2.0 MB'), line)
         self.assertIn('预计还需 1 秒', line)
         masked = u.mask_urls(f'see http://example.org:18088/{TOKEN}/server-manifest.json?x=1 now')
-        self.assertEqual(masked, 'see http://example.org/*** now')
+        self.assertEqual(masked, 'see http://example.org:18088/*** now')
         self.assertEqual(u.error_code('[文件占用] mods/a.jar'), 'E-LOCK')
         self.assertEqual(u.error_code('something else'), 'E-OTHER')
 

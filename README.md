@@ -97,7 +97,7 @@ PowerShell 发布器有可用 Python 时调用 `official-source-index.py`，按�
 
 可选的 CurseForge 元数据查询从发布进程的 `CURSEFORGE_API_KEY` 或 `officialSources.curseforgeKeyFile` 读取密钥。指纹只用于找候选，SHA-1 一致才会接受；客户端清单不含密钥。元数据匹配不保证 CDN 对玩家开放，下载仍须校验并回退，实际 CDN 鉴权需按自己的服务配置验证。
 
-地址文件可写多行 URL。scex 分支的所有入口（Python/PowerShell 同步器、自刷新、两个后台预下载、macOS 入口）使用同一规则：忽略非 http(s) 行，只使用第一个公网地址，失败后按文件顺序尝试明确写入的局域网地址；规则与用例见 `tests/fixtures/url-order-cases.json`。客户端不会修改系统代理、路由或防火墙；开启 TUN 时，应用直连不等于流量绕过 TUN。
+地址文件可写多行 URL。scex 分支的所有入口（Python/PowerShell 同步器、自刷新、两个后台预下载、macOS 入口）使用同一规则：忽略非 http(s) 行，只使用第一个公网地址，失败后按文件顺序尝试明确写入的局域网地址；规则与用例见 `tests/fixtures/url-order-cases.json`。地址文件里的地址都连不上时，两个同步引擎会再试本实例以前记录的地址（上次成功的地址、包内和缓存清单里的 `updateUrl`）；用它更新成功后，实例根目录里过期的地址文件会换成 `_updater/UPDATE-URL.txt` 的内容（原文件先备份）。只剩局域网地址时，失败提示会直接说明需要向管理员要最新的 `UPDATE-URL.txt`。客户端不会修改系统代理、路由或防火墙；开启 TUN 时，应用直连不等于流量绕过 TUN。
 
 ## 更新器维护工具（scex 分支）
 

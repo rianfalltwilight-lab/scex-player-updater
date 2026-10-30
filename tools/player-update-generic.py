@@ -1778,6 +1778,74 @@ def hide_internal_dirs(root) -> None:
         pass
 
 
+LAN_ONLY_HINT = ("请向管理员要最新的「UPDATE-URL.txt」，放进实例文件夹和里面的 _updater 文件夹（覆盖原文件），"
+                 "再重新运行更新器。")
+ADDRESS_FILES = _PRIMARY_UPDATE_URL_FILES + ("UPDATE-URL-LAN.txt", "_updater/UPDATE-URL-LAN.txt")
+# Root copies are not manifest rows; _updater/UPDATE-URL.txt is, and a sync keeps it current.
+ROOT_ADDRESS_FILES = ("UPDATE-URL.txt", "PORTABLE-UPDATE-URL.txt", "TFCR-update-url.txt")
+
+
+def endpoint_of(url) -> str:
+    """host:port of an update URL, never its token path."""
+    try:
+        return urllib.parse.urlsplit(str(url).strip()).netloc.rsplit("@", 1)[-1] or "?"
+    except ValueError:
+        return "?"
+
+
+def fallback_manifest_urls(root, state) -> list:
+    """ADDRESS_FALLBACK_V1: addresses this instance recorded before (the last one that worked,
+    the updateUrl of the bundled and of the cached manifest). Tried only after every address
+    in the address files failed; public addresses first."""
+    found = [str((state or {}).get("lastManifestUrl") or ""), str((state or {}).get("manifestUrl") or "")]
+    for rel in ("server-manifest.json", MANIFEST_CACHE_DIR + "/server-manifest.json"):
+        try:
+            found.append(str(json.loads(join_safe(root, rel).read_text(encoding="utf-8-sig")).get("updateUrl") or ""))
+        except (OSError, ValueError, UpdateError, AttributeError):
+            continue
+    usable, seen = [], set()
+    for url in (value.strip() for value in found):
+        if is_usable_update_url(url) and url.lower() not in seen:
+            seen.add(url.lower())
+            usable.append(url)
+    return [u for u in usable if not is_private_update_url(u)] + [u for u in usable if is_private_update_url(u)]
+
+
+def address_summary(root) -> dict:
+    """Diagnostics: every address file as masked scheme://host:port/*** lines."""
+    out = {}
+    for rel in ADDRESS_FILES:
+        path = root.joinpath(*rel.split("/"))
+        if path.is_file():
+            try:
+                out[rel] = [mask_urls(value) for value in _url_lines(path.read_text(encoding="utf-8-sig", errors="replace"))][:8]
+            except OSError:
+                out[rel] = ["<无法读取>"]
+    return out
+
+
+def repair_root_address_files(root, backup_root) -> int:
+    """ADDRESS_FALLBACK_V1: after a recorded address rescued the sync, stale root address files
+    take the content of the _updater/UPDATE-URL.txt the sync has just verified (originals backed up)."""
+    source = join_safe(root, "_updater/UPDATE-URL.txt")
+    if not source.is_file():
+        return 0
+    data = source.read_bytes()
+    if not any(is_usable_update_url(value) for value in _url_lines(data.decode("utf-8-sig", errors="replace"))):
+        return 0
+    fixed = 0
+    for rel in ROOT_ADDRESS_FILES:
+        path = join_safe(root, rel)
+        if not path.is_file() or path.read_bytes() == data:
+            continue
+        backup_file(path, root, rel, backup_root)
+        temp = path.with_name(path.name + ".portable-new.tmp")
+        temp.write_bytes(data)
+        os.replace(temp, path)
+        fixed += 1
+    return fixed
+
+
 def sync_instance(root, args) -> int:
     global _ACTIVE_JOURNAL
     reset_download_policy()
@@ -1806,7 +1874,9 @@ def sync_instance(root, args) -> int:
     selected_manifest_url = ""
     last_exc = None
     endpoint_errors = []
-    for candidate in manifest_urls:
+
+    def probe(candidate):
+        nonlocal last_exc
         timeout = probe_timeout_for_url(candidate)
         attempts = 1 if timeout <= 2 else 2
         for attempt in range(attempts):
@@ -1815,16 +1885,39 @@ def sync_instance(root, args) -> int:
                 candidate_manifest = json.loads(raw.decode("utf-8-sig"))
                 if not candidate_manifest.get("files"):
                     raise ValueError("manifest 没有 files")
-                manifest = candidate_manifest
-                selected_manifest_url = candidate
-                break
+                return candidate_manifest
             except Exception as exc:
                 last_exc = exc
                 if attempt + 1 < attempts:
                     time.sleep(1)
-        if manifest is not None:
-            break
         endpoint_errors.append(f"{mask_url(candidate)} -> {last_exc}")
+        return None
+
+    for candidate in manifest_urls:
+        manifest = probe(candidate)
+        if manifest is not None:
+            selected_manifest_url = candidate
+            break
+    tried = list(manifest_urls)
+    used_fallback = False
+    if manifest is None and not args.manifest_url:
+        # ADDRESS_FALLBACK_V1: the address files may be stale (an old pack, a LAN-only copy).
+        known = {url.lower() for url in manifest_urls}
+        for candidate in fallback_manifest_urls(root, state):
+            if candidate.lower() in known:
+                continue
+            known.add(candidate.lower())
+            tried.append(candidate)
+            detail_print(f"[同步] 改试本地记录的地址：{mask_url(candidate)}")
+            manifest = probe(candidate)
+            if manifest is not None:
+                selected_manifest_url = candidate
+                used_fallback = True
+                print("[同步] 地址文件里的地址都连不上，已改用以前记录的更新地址；更新完成后会把地址文件换成最新的。")
+                break
+    lan_note = ""
+    if manifest is None and not args.manifest_url and tried and all(is_private_update_url(url) for url in tried):
+        lan_note = f"你的更新地址只有局域网地址（{endpoint_of(tried[0])}），只在服务器所在的网络里能用。"
 
     # 完整懒人包通常自带 server-manifest.json。更新源暂时不可达时，
     # 用本地清单继续做哈希对账，已有文件可以直接完成同步，避免把整包判成失败。
@@ -1837,16 +1930,20 @@ def sync_instance(root, args) -> int:
                     manifest = local_candidate
                     selected_manifest_url = manifest_urls[0]
                     print("[降级] 更新源暂时不可达，改用包内 server-manifest.json 做本地对账；缺失文件仍需更新源恢复后补下。")
+                    if lan_note:
+                        print(f"[提示] {lan_note}{LAN_ONLY_HINT}")
         except Exception:
             manifest = None
     if manifest is None:
         for line in endpoint_errors:
             detail_print("[同步] 地址不可用：" + line)
         raise SystemExit(
-            f"[清单获取失败] 连不上更新服务器：{network_error_reason(last_exc)}（已尝试 {len(manifest_urls)} 个地址）。"
+            f"[清单获取失败] 连不上更新服务器：{network_error_reason(last_exc)}（已尝试 {len(tried)} 个地址）。{lan_note}"
         )
     manifest_url = selected_manifest_url
-    if last_good and manifest_url == last_good:
+    if used_fallback:
+        detail_print(f"[同步] 已改用本地记录的地址：{mask_url(manifest_url)}")
+    elif last_good and manifest_url == last_good:
         detail_print(f"[同步] 沿用上次可用更新地址：{mask_url(manifest_url)}")
     elif manifest_url != manifest_urls[0]:
         print("[同步] 主更新地址连不上，已改用备用地址。")
@@ -2189,6 +2286,12 @@ def sync_instance(root, args) -> int:
     }
     save_state(root, state_out)
     _ACTIVE_JOURNAL.finish()
+    if used_fallback:
+        try:
+            if repair_root_address_files(root, backup_root):
+                print("[修复] 已把实例文件夹里过期的更新地址换成最新的（原文件已备份）。")
+        except (OSError, UpdateError) as exc:
+            print(f"[提示] 过期的更新地址文件未能替换，不影响本次更新：{type(exc).__name__}")
     tidy_after_sync(root, backup_root)
     remove_root_helper_copies(root, files)
     config_applied = [
@@ -2321,7 +2424,8 @@ def mask_urls(text) -> str:
     def hide(match):
         try:
             parsed = urllib.parse.urlsplit(match.group(0))
-            return parsed.scheme + "://" + (parsed.hostname or "更新源") + "/***"
+            # The port is not secret and tells LAN, forwarded and public endpoints apart.
+            return parsed.scheme + "://" + (parsed.netloc.rsplit("@", 1)[-1] or "更新源") + "/***"
         except ValueError:
             return "[更新地址已隐藏]"
     return re.sub(r"https?://[^\s；，。\"']+", hide, str(text))
@@ -2574,15 +2678,22 @@ def write_diagnostic_package(root: pathlib.Path, code: str, message: str):
         import platform
         target = join_safe(root, DIAGNOSTIC_NAME)
         temporary = target.with_name(target.name + ".tmp")
-        summary = {"errorCode": code, "message": mask_urls(message), "engine": "python",
+        summary = {"errorCode": code, "message": mask_urls(message), "engine": "python", "updaterVersion": UPDATER_VERSION,
                    "python": sys.version.split()[0], "platform": platform.platform(),
                    "createdAt": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+        state = {}
         try:
             state = read_state_file(join_safe(root, ".portable-sync-state.json"))
             summary.update(packId=state.get("packId"), syncedVersion=state.get("version"),
                            syncedAt=state.get("syncedAt"), managedFiles=len(state.get("files") or []))
         except Exception:
             summary["syncedVersion"] = None
+        # DIAGNOSTIC_V2: which addresses the instance has (host:port only; tokens are masked).
+        try:
+            summary["addressFiles"] = address_summary(root)
+            summary["recordedAddresses"] = [mask_urls(url) for url in fallback_manifest_urls(root, state)]
+        except Exception:
+            summary["addressFiles"] = None
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("summary.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
             for rel in (".portable-sync-logs/latest.log", ".portable-sync-logs/previous.log", ".portable-staging/daemon.log"):
@@ -2788,11 +2899,18 @@ FAILURE_HINTS = {
 }
 
 
+def failure_hint(code, message):
+    if code == "E-FETCH" and "只有局域网地址" in str(message):
+        return LAN_ONLY_HINT
+    return FAILURE_HINTS.get(code)
+
+
 def report_failure(root, message):
     code = error_code(message)
     print(f"[错误编号] {code}", file=sys.stderr)
-    if code in FAILURE_HINTS:
-        print(f"[怎么办] {FAILURE_HINTS[code]}", file=sys.stderr)
+    hint = failure_hint(code, message)
+    if hint:
+        print(f"[怎么办] {hint}", file=sys.stderr)
     package = write_diagnostic_package(root, code, message)
     if package is not None:
         print(f"[诊断] 已生成「{DIAGNOSTIC_NAME}」（在实例目录里），请把这个文件发给管理员，不需要截图。", file=sys.stderr)
