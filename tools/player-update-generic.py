@@ -107,7 +107,7 @@ def fetch_bytes(url: str, timeout: float = 20) -> bytes:
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.29"
+UPDATER_VERSION = "2.27.37"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
