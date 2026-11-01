@@ -107,7 +107,7 @@ def fetch_bytes(url: str, timeout: float = 20) -> bytes:
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.37"
+UPDATER_VERSION = "2.27.52"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
@@ -1579,6 +1579,107 @@ def apply_launcher_profile(root: pathlib.Path, manifest: dict, backup_root: path
             shutil.copy2(src, dst)
     print(f"[启动器] 已写入本地实例配置：{instance_name}")
 
+def merge_preferred_server(data, name, ip):
+    """Prepend the preferred address without rewriting unrelated NBT entries."""
+    entry = (named_tag(8, "name") + nbt_string(name)
+             + named_tag(8, "ip") + nbt_string(ip)
+             + named_tag(1, "acceptTextures") + b"\x01\x00")
+    if data is None:
+        return named_tag(10, "") + named_tag(9, "servers") + b"\x0a" + struct.pack(">i", 1) + entry + b"\x00"
+    compressed = data[:2] == b"\x1f\x8b"
+    raw = gzip.decompress(data) if compressed else data
+    def take(pos, count):
+        if count < 0 or pos + count > len(raw):
+            raise ValueError("Invalid servers.dat length")
+        return pos + count
+    def string(pos):
+        end = take(pos, 2)
+        size = struct.unpack_from(">H", raw, pos)[0]
+        return take(end, size)
+    def payload(kind, pos, depth=0):
+        if depth > 64:
+            raise ValueError("NBT nesting too deep")
+        widths = {1: 1, 2: 2, 3: 4, 4: 8, 5: 4, 6: 8}
+        if kind in widths:
+            return take(pos, widths[kind])
+        if kind == 8:
+            return string(pos)
+        if kind in (7, 11, 12):
+            end = take(pos, 4)
+            count = struct.unpack_from(">i", raw, pos)[0]
+            return take(end, count * {7: 1, 11: 4, 12: 8}[kind])
+        if kind == 9:
+            take(pos, 5)
+            child, count = raw[pos], struct.unpack_from(">i", raw, pos + 1)[0]
+            if count < 0 or (count and child == 0):
+                raise ValueError("Invalid NBT list")
+            pos += 5
+            for _ in range(count):
+                pos = payload(child, pos, depth + 1)
+            return pos
+        if kind == 10:
+            while True:
+                take(pos, 1)
+                child = raw[pos]
+                pos += 1
+                if child == 0:
+                    return pos
+                pos = payload(child, string(pos), depth + 1)
+        raise ValueError("Unknown NBT tag")
+    def tags(start):
+        pos = start
+        while True:
+            take(pos, 1)
+            kind = raw[pos]
+            if not kind:
+                return
+            body = string(pos + 1)
+            key = raw[pos + 3:body].decode("utf-8", errors="replace")
+            end = payload(kind, body)
+            yield kind, key, pos, body, end
+            pos = end
+    if not raw or raw[0] != 10:
+        raise ValueError("servers.dat is not an NBT compound")
+    root_start = string(1)
+    root_end = payload(10, root_start)
+    if root_end != len(raw):
+        raise ValueError("Trailing servers.dat data")
+    found = [(start, body, end) for kind, key, start, body, end in tags(root_start)
+             if key == "servers" and kind == 9]
+    if len(found) > 1:
+        raise ValueError("Duplicate servers list")
+    if not found:
+        if any(key == "servers" for _, key, _, _, _ in tags(root_start)):
+            raise ValueError("Invalid servers tag")
+        result = raw[:-1] + named_tag(9, "servers") + b"\x0a" + struct.pack(">i", 1) + entry + b"\x00"
+    else:
+        start, body, end = found[0]
+        subtype = raw[body]
+        count = struct.unpack_from(">i", raw, body + 1)[0]
+        if subtype != 10 and not (count == 0 and subtype == 0):
+            raise ValueError("Servers list must contain compounds")
+        pos = body + 5
+        entries, preferred = [], None
+        for i in range(count):
+            finish = payload(10, pos)
+            entry_bytes = raw[pos:finish]
+            for kind, key, _, value, _ in tags(pos):
+                if kind == 8 and key == "ip":
+                    address = raw[value + 2:string(value)].decode("utf-8", errors="replace")
+                    if address.strip().casefold() == ip.strip().casefold() and preferred is None:
+                        preferred = i
+            entries.append(entry_bytes)
+            pos = finish
+        if preferred is None:
+            entries.insert(0, entry)
+        else:
+            entries.insert(0, entries.pop(preferred))
+        result = raw[:body] + b"\x0a" + struct.pack(">i", len(entries)) + b"".join(entries) + raw[end:]
+    if result == raw:
+        return data
+    return gzip.compress(result, mtime=0) if compressed else result
+
+
 def apply_server_list(root: pathlib.Path, manifest: dict, backup_root: pathlib.Path, preserved_deletions=None, initial_sync=False):
     preserved_deletions = preserved_deletions or set()
     config = manifest.get("serverList") or {}
@@ -1592,6 +1693,21 @@ def apply_server_list(root: pathlib.Path, manifest: dict, backup_root: pathlib.P
     if target.lower() in preserved_deletions:
         return
     path = join_safe(root, target)
+    if config.get("mergePreferred", False):
+        before = path.read_bytes() if path.is_file() else None
+        try:
+            after = merge_preferred_server(before, name, address)
+        except (ValueError, IndexError, struct.error, OSError, EOFError) as exc:
+            print(f"[保留] 服务器列表无法合并，原文件未改，请在游戏里手动添加 {address}：{exc}")
+            return
+        if before != after:
+            backup_file(path, root, target, backup_root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".sync-new")
+            temporary.write_bytes(after)
+            os.replace(temporary, path)
+            print(f"[线路] 已优先添加 {name} / {address}，保留其他服务器")
+        return
     if bool(config.get("writeIfMissingOnly", True)):
         if path.is_file():
             return
@@ -2243,7 +2359,13 @@ def sync_instance(root, args) -> int:
             "[重要] 已修改资源包顺序。请完全退出 Minecraft 后重新启动客户端；"
             "游戏运行中不会自动采用外部 options.txt 变更。"
         )
-    apply_server_list(root, manifest, backup_root, preserved_deletions, initial_sync)
+    # SERVER_LIST_MERGE_V1: a servers.dat problem never stops the file sync.
+    try:
+        apply_server_list(root, manifest, backup_root, preserved_deletions, initial_sync)
+    except (OSError, UpdateError, ValueError) as exc:
+        address = str((manifest.get("serverList") or {}).get("address") or manifest.get("serverAddress") or "")
+        hint = f"请在游戏里手动添加服务器 {address}" if address else "请在游戏里手动添加服务器"
+        print(f"[线路] 未能调整服务器列表，{hint}；文件同步继续。原因：{exc}")
     apply_launcher_profile(root, manifest, backup_root)
     ensure_neoforge_client_extra(root, manifest, backup_root)
     show_launcher_hints(root)

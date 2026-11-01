@@ -46,7 +46,9 @@ class AdoptionReportTests(unittest.TestCase):
                      '2026-10-26T10:01:05\t304\tv2\tSCEX-updater/2.27.28 (powershell 5.1; windows)',
                      '2026-10-26T10:02:00\t403\tv3\tSCEX-updater/2.27.28 (python 3.9; darwin)',
                      '2026-10-26T10:03:00\t200\tv4\tSCEX-release-verify/2.27.28',
-                     '2026-10-26T10:03:01\t200\tv4\tSCEX-updater/2.27.27 (bootstrap 5.1; windows)']
+                     '2026-10-26T10:03:01\t200\tv4\tSCEX-updater/2.27.27 (bootstrap 5.1; windows)',
+                     '2026-10-26T10:04:00\t200\tv5\tPython-urllib/3.14',
+                     '2026-10-26T10:04:30\t404\tv6\tpython-httpx/0.28.1']
             (logs / 'update-access-20261026.log').write_text('\n'.join(lines) + '\n', encoding='utf-8')
             public = Path(tmp) / 'public'
             (public / '_updater').mkdir(parents=True)
@@ -57,7 +59,10 @@ class AdoptionReportTests(unittest.TestCase):
             out = result.stdout.decode('utf-8')
             self.assertEqual(result.returncode, 0, out)
             self.assertIn('当前更新器版本：2.27.28（整合包清单版本 2.27.29）', out)
-            self.assertIn('3 位玩家取过清单，2 位已用更新器 2.27.28；另有 1 个发布验收地址（不计入）', out)
+            self.assertIn('3 位玩家取过清单，2 位已用更新器 2.27.28；另有 1 个发布验收地址（不计入）'
+                          '；管理或第三方脚本 Python-urllib 1 次、python-httpx 1 次（不计入）', out)
+            self.assertNotIn('  v5  ', out)
+            self.assertNotIn('v6', out.split('需要关注：', 1)[1])
             self.assertIn('v1  10:00:00  2.27.24 python  HTTP 200', out)
             self.assertIn('v2  10:01:05  2.27.28 powershell  HTTP 304；当天还用过 2.27.28 bootstrap', out)
             self.assertNotIn('  v4  ', out)
@@ -332,12 +337,104 @@ class FakeHostReleaseTests(unittest.TestCase):
                          '补充：\n  补充一行', '有过一次内容发布', '回滚：', 'dryrun.json'):
             self.assertIn(expected, text)
 
-    def test_prepare_refuses_a_version_the_engines_do_not_carry(self):
-        self.write_spec(version='1.0.3')
+    def test_release_version_and_engine_version_are_independent(self):
+        # ENGINE_VERSION_V2: content releases took 1.0.2-1.0.6; the engines still say 1.0.2.
+        self.write_spec(version='1.0.7')
         release = self.release()
         self.quiet(release.run_backup)
-        with self.assertRaises(SystemExit):
+        self.quiet(release.prepare)
+        receipt = json.loads((self.base / 'work' / 'release' / 'release-receipt.json').read_text(encoding='utf-8'))
+        self.assertEqual((receipt['version'], receipt['engineVersion']), ('1.0.7', '1.0.2'))
+        self.assertIn('1.0.1 -> 1.0.2', receipt['engineRule'])
+
+    def test_prepare_refuses_engines_not_newer_than_production(self):
+        hotfix = b'UPDATER_VERSION = "1.0.5"\nprint("hotfix")\n'
+        (self.host / 'tools/player-update-generic.py').write_bytes(hotfix)
+        release = self.release()
+        self.quiet(release.run_backup)
+        with self.assertRaises(SystemExit) as caught:
             self.quiet(release.prepare)
+        self.assertIn('production already has 1.0.5', str(caught.exception))
+
+    def test_known_drift_is_accepted_only_with_its_hash(self):
+        hotfix = b'UPDATER_VERSION = "1.0.1"\nprint("hotfix made on the server")\n'
+        (self.host / 'tools/player-update-generic.py').write_bytes(hotfix)
+        self.assertFalse(self.quiet(self.release().preflight)[0])
+        self.write_spec(knownDrift=[{'path': 'tools/player-update-generic.py', 'sha256': '0' * 64, 'reason': 'x'}])
+        self.assertFalse(self.quiet(self.release().preflight)[0])
+        self.write_spec(knownDrift=[{'path': 'tools/player-update-generic.py', 'sha256': sha256(hotfix), 'reason': '服务器热修复'}])
+        ok, out = self.quiet(self.release().preflight)
+        self.assertTrue(ok, out)
+        self.assertIn('"acceptedDrift": [\n      "tools/player-update-generic.py"', out)
+
+    def test_deploy_waits_for_a_running_content_publish(self):
+        release = self.tool.Release(str(self.config_path), str(self.spec_path), skip_ci=True)
+        self.assertEqual(release.publish_busy('fake'), [])
+        (self.host / '.portable-publish-lock').mkdir()
+        self.assertEqual(release.publish_busy('fake'), ['.portable-publish-lock'])
+        (self.base / 'work' / 'release').mkdir(parents=True)
+        with self.assertRaises(SystemExit) as caught:
+            self.quiet(release.deploy)
+        self.assertIn('content publish is running', str(caught.exception))
+        self.assertFalse((self.base / 'work' / 'release' / 'deployment-receipt.json').exists())
+        (self.host / '.portable-publish-lock').rmdir()
+        lock = self.host / 'tmp' / 'portable-publish.lock'
+        lock.parent.mkdir()
+        lock.write_bytes(b'0')
+        self.assertEqual(release.publish_busy('fake'), [])  # a leftover lock file is not a running publish
+        with lock.open('r+b') as stream:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(release.publish_busy('fake'), ['tmp/portable-publish.lock'])
+
+    def published_receipt(self, commit_id):
+        folder = self.base / 'prev' / 'release'
+        folder.mkdir(parents=True)
+        (folder / 'release-receipt.json').write_text(json.dumps({'version': '1.0.0', 'status': 'PUBLISHED_VERIFIED',
+                                                                 'completedAt': '2026-10-30T10:00:00+09:00', 'sourceCommit': commit_id}),
+                                                     encoding='utf-8')
+        return folder / 'release-receipt.json'
+
+    def test_new_writes_and_refreshes_release_json(self):
+        receipt = self.published_receipt(self.commit_a)
+        target = self.base / 'next' / 'release.json'
+        self.quiet(self.tool.Release(str(self.config_path), str(target)).new_spec)
+        spec = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual((spec['version'], spec['previousVersion'], spec['commit'], spec['previousCommit']),
+                         ('1.0.2', '1.0.1', self.commit_b, self.commit_a))
+        self.assertEqual((spec['previousReceipt'], spec['backupName'], spec['workdir']), (str(receipt), 'next', str(self.base / 'next')))
+        with self.assertRaises(SystemExit):  # notes and decision are still TODO
+            self.tool.Release(str(self.config_path), str(target)).preflight()
+        spec.update(decision='测试决定', notes=['说明一', '本次仅更新更新器，游戏内容与 1.0.1 相同。'])
+        target.write_text(json.dumps(spec, ensure_ascii=False), encoding='utf-8')
+        manifest_path = self.host / PUBLIC / 'server-manifest.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest['version'] = '1.0.4'  # another content release in the meantime
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding='utf-8')
+        self.quiet(self.tool.Release(str(self.config_path), str(target)).new_spec)
+        spec = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual((spec['version'], spec['previousVersion'], spec['decision']), ('1.0.5', '1.0.4', '测试决定'))
+        self.assertEqual(spec['notes'], ['说明一', '本次仅更新更新器，游戏内容与 1.0.4 相同。'])
+
+    def test_health_compares_production_with_the_last_release(self):
+        self.published_receipt(self.commit_a)
+        health = self.tool.Release(str(self.config_path)).health
+        ok, out = self.quiet(health)
+        self.assertTrue(ok, out)
+        self.assertIn('对照上次发布的提交 ' + self.commit_a[:7], out)
+        self.assertIn('[正常] 引擎版本号统一：1.0.1', out)
+        self.assertIn('结论：0 个问题', out)
+        (self.host / PUBLIC / '_updater/player-update-generic.py').write_bytes(b'UPDATER_VERSION = "9.9.9"\nprint("hand edit")\n')
+        (self.host / '.portable-publish-lock').mkdir()
+        ok, out = self.quiet(health)
+        self.assertFalse(ok)
+        for expected in ('玩家会用到的文件和上次发布不一致：' + PUBLIC + '_updater/player-update-generic.py', '引擎版本号不统一',
+                         '有内容发布正在进行', '结论：3 个问题'):
+            self.assertIn(expected, out)
 
     def test_log_replace_must_match(self):
         self.write_spec(logReplace=[['不存在的文字', 'x']])

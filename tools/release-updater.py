@@ -3,29 +3,41 @@
 servers without a full content publish. Each step can be re-run and it is safe to stop
 between steps; nothing is installed before `deploy`.
 
-  preflight  production still serves the previous release (hashes from its receipt), the
-             committed engines carry this version; prints the players' updater versions
+  new        write or refresh release.json: next free version from the live manifest, the
+             previous published receipt and commit, the current commit; notes are kept
+  health     read-only check of both hosts against the last published release (no --release
+             needed): reachability, engine copies, engine versions, manifests, publish lock
+  preflight  production still serves the previous release (hashes from its receipt; files
+             listed in "knownDrift" may differ), the engine version rule holds; prints the
+             players' updater versions
   backup     copy every file this release touches from each host (never overwrites)
   prepare    per-host payloads and deploy plans; manifest rows; files to remove
   e2e        local transition test (previous engines and entry -> this release; localhost)
   dryrun     run the generated deploy scripts against copies of the backup
   stage      copy payloads to each host's temp folder and verify every hash
   ci         GitHub Actions for the release commit: every job must have passed
-  deploy     CI gate (unless --skip-ci), then install host by host: files, optional
-             service restart, manifest and removals last
+  deploy     CI gate (unless --skip-ci), no content publish running on any host, then
+             install host by host: files, optional service restart, manifest and removals last
   verify     HTTP checks through every address, Range, gzip, live bootstrap checks
   finalize   confirm production hashes, remove the stages, write the receipts
   receipt    rewrite the Chinese 发布回执.txt from the JSON receipts
 
   python tools/release-updater.py --config <hosts.json> --release <release.json> [--skip-ci] <step>
+  python tools/release-updater.py --config <hosts.json> health
 
+The release version follows the live manifest (content releases use the same line); the
+engines' UPDATER_VERSION is independent (ENGINE_VERSION_V2): when a release changes an engine
+copy, the committed version must be greater than every engine version in production.
 The host config (addresses, users, paths and the token location) stays outside
 the repository. A release may list "removeFiles" (paths under a host root) that are
 deleted after the manifest; each must still hold its backed-up hash. "logReplace"
 ([old, new] pairs) rewrites text in the existing update-log.txt history, and
 "receiptNotes" adds lines to 发布回执.txt. When a content release came after the
 previous updater release, the files the content publisher owns may differ from the
-previous receipt, and the manifest keeps that release's notes after this one's."""
+previous receipt, and the manifest keeps that release's notes after this one's.
+"knownDrift" ([{"path", "sha256", "reason"}]) lists production files changed outside this
+tool (a hotfix) whose content the release has taken into the repository; preflight
+accepts exactly those hashes and the receipt records them."""
 import argparse
 import base64
 import copy
@@ -56,6 +68,33 @@ HELPERS = ["player-update-generic.ps1", "player-update-generic.py", "portable-st
 PS = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 # Files portable-publish.ps1 rewrites on every content release.
 CONTENT_OWNED = (PUBLIC + "server-manifest.json", PUBLIC + "update-log.txt", PUBLIC + "使用说明.txt", "tools/portable-pack.json")
+# Repo files that carry the updater version (tools/bump-updater-version.py changes them together).
+VERSIONED_ENGINES = ("tools/player-update-generic.py", "tools/player-update-generic.ps1", "tools/portable-stage-daemon.py",
+                     "tools/portable-stage-daemon.ps1", "tools/portable-bootstrap-refresh.ps1", "tools/portable-macos-sync.command",
+                     "tools/player-self-repair.ps1", "tools/portable-windows-repair.ps1")
+VERSION_PATTERNS = (r'^UPDATER_VERSION = "([\d.]+)"', r"^\$script:UpdaterVersion = '([\d.]+)'")
+PLACEHOLDER = "TODO"
+
+
+def text_version(data):
+    """The updater version line of an engine copy, or None."""
+    text = data.decode("utf-8-sig", errors="replace") if isinstance(data, bytes) else str(data)
+    for pattern in VERSION_PATTERNS:
+        match = re.search(pattern, text, re.M)
+        if match:
+            return match.group(1)
+    return None
+
+
+def version_key(version):
+    return tuple(int(p) for p in version.split(".")) if re.fullmatch(r"\d+(\.\d+)*", str(version or "")) else ()
+
+
+def next_patch(version):
+    parts = str(version).split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise SystemExit(f"the live manifest version is not X.Y.Z: {version}")
+    return f"{parts[0]}.{parts[1]}.{int(parts[2]) + 1}"
 
 
 def load_module(path, name):
@@ -79,6 +118,10 @@ def read_json(path):
 
 def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git_head():
+    return subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
 
 
 def bootstrap_counts(log):
@@ -119,20 +162,34 @@ def ci_verdict(runs, jobs_for):
 
 
 class Release:
-    def __init__(self, config_path, release_path, skip_ci=False):
+    def __init__(self, config_path, release_path=None, skip_ci=False):
         self.skip_ci = skip_ci
+        self.config_path = Path(config_path)
+        self.release_path = Path(release_path) if release_path else None
         self.config = read_json(config_path)
-        self.spec = read_json(release_path)
+        self.hosts = self.config["hosts"]
+        self.order = self.config["order"]
+        self.token = Path(self.config["tokenFile"]).read_text(encoding="utf-8-sig").strip()
+        self.spec = read_json(release_path) if self.release_path and self.release_path.is_file() else None
+        if self.spec is None:
+            self.commit = git_head()
+            return
         self.version = self.spec["version"]
         self.previous = self.spec["previousVersion"]
         self.commit = self.spec["commit"]
         self.work = Path(self.spec["workdir"])
         self.out = self.work / "release"
         self.backup = Path(self.config["backupRoot"]) / self.spec["backupName"]
-        self.hosts = self.config["hosts"]
-        self.order = self.config["order"]
         self.stage_name = "scex-updater-" + self.version.replace(".", "-")
-        self.token = Path(self.config["tokenFile"]).read_text(encoding="utf-8-sig").strip()
+
+    def require_spec(self):
+        if self.spec is None:
+            raise SystemExit("this step needs --release <release.json> (create it with the `new` step)")
+        for field in ("decision", "logTitle"):
+            if PLACEHOLDER in str(self.spec.get(field) or ""):
+                raise SystemExit(f"release.json: fill in {field!r} first")
+        if not self.spec.get("notes") or any(PLACEHOLDER in str(n) for n in self.spec["notes"]):
+            raise SystemExit("release.json: fill in the player notes first")
 
     # ---- remote helpers ------------------------------------------------------------
     def ssh(self, host, command, stdin=None, timeout=180):
@@ -162,6 +219,48 @@ class Release:
                   "{(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}else{$null}};$out|ConvertTo-Json -Compress")
         return json.loads(self.remote_powershell(host, script) or "{}")
 
+    def remote_file_info(self, host, paths):
+        """{path: {"sha256", "version"} or None}; version is the updater version line, if any."""
+        root = self.hosts[host]["root"]
+        if self.hosts[host]["kind"] == "posix":
+            program = ("import hashlib,json,pathlib,re\nroot=pathlib.Path(%r)\npaths=json.loads(%r)\npatterns=json.loads(%r)\nout={}\n"
+                       "for p in paths:\n    f=root/p\n    if not f.is_file():\n        out[p]=None\n        continue\n"
+                       "    data=f.read_bytes()\n    text=data.decode('utf-8-sig','replace')\n"
+                       "    found=[m.group(1) for m in (re.search(x,text,re.M) for x in patterns) if m]\n"
+                       "    out[p]={'sha256':hashlib.sha256(data).hexdigest(),'version':found[0] if found else None}\n"
+                       "print(json.dumps(out))\n" % (root, json.dumps(paths, ensure_ascii=False), json.dumps(VERSION_PATTERNS)))
+            return json.loads(self.remote_python(host, program))
+        script = ("$root='" + root + "';$out=@{};$paths=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
+                  + base64.b64encode(json.dumps(paths, ensure_ascii=False).encode()).decode() + "'))|ConvertFrom-Json;"
+                  "$patterns=@('(?m)^UPDATER_VERSION = \"([\\d.]+)\"',\"(?m)^\\`$script:UpdaterVersion = '([\\d.]+)'\");"
+                  "foreach($rel in $paths){$p=Join-Path $root $rel;if(-not(Test-Path -LiteralPath $p -PathType Leaf)){$out[$rel]=$null;continue};"
+                  "$text=[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8);$v=$null;"
+                  "foreach($x in $patterns){$m=[regex]::Match($text,$x);if($m.Success){$v=$m.Groups[1].Value;break}};"
+                  "$out[$rel]=@{sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant();version=$v}};"
+                  "$out|ConvertTo-Json -Compress -Depth 3")
+        return json.loads(self.remote_powershell(host, script) or "{}")
+
+    def publish_busy(self, host):
+        """PUBLISH_LOCK_V1: what a running content publish holds on this host (empty: none).
+        portable-publish.ps1 keeps tmp/portable-publish.lock open without sharing; the Python
+        publisher adds .portable-publish-lock and locks the same file. A leftover file is not busy."""
+        root = self.hosts[host]["root"]
+        if self.hosts[host]["kind"] == "posix":
+            return json.loads(self.remote_python(host, PUBLISH_LOCK_PROBE % (root,)))
+        script = ("$root='" + root + "';$busy=@();"
+                  "if(Test-Path -LiteralPath (Join-Path $root '.portable-publish-lock') -PathType Container){$busy+='.portable-publish-lock'};"
+                  "$p=Join-Path $root 'tmp\\portable-publish.lock';"
+                  "if(Test-Path -LiteralPath $p -PathType Leaf){try{$s=[IO.File]::Open($p,'Open','ReadWrite','None');$s.Dispose()}"
+                  "catch{$busy+='tmp/portable-publish.lock'}};ConvertTo-Json -InputObject @($busy) -Compress")
+        return json.loads(self.remote_powershell(host, script) or "[]")
+
+    def require_no_publish(self, hosts=None):
+        busy = {host: self.publish_busy(host) for host in (hosts or self.order)}
+        busy = {host: held for host, held in busy.items() if held}
+        if busy:
+            raise SystemExit("a content publish is running (" + "; ".join(f"{h}: {', '.join(v)}" for h, v in busy.items())
+                             + "); wait for it to finish, then rerun this step")
+
     def scp_from(self, host, rel, target):
         source = f"{self.hosts[host]['address']}:{self.hosts[host]['root']}/{rel}"
         result = subprocess.run(self.hosts[host]["scp"] + [source, str(target)], capture_output=True, timeout=120)
@@ -169,10 +268,11 @@ class Release:
             raise RuntimeError(f"{host}: cannot copy {rel}: " + result.stderr.decode("utf-8", "replace")[:300])
 
     # ---- what this release touches -------------------------------------------------
-    def committed(self, rel):
-        blob = subprocess.run(["git", "-C", str(REPO), "show", f"{self.commit}:{rel}"], capture_output=True, check=True).stdout
-        if (REPO / rel).read_bytes() != blob:
-            raise SystemExit(f"working tree differs from {self.commit[:12]}: {rel}")
+    def committed(self, rel, commit=None, strict=True):
+        commit = commit or self.commit
+        blob = subprocess.run(["git", "-C", str(REPO), "show", f"{commit}:{rel}"], capture_output=True, check=True).stdout
+        if strict and (REPO / rel).read_bytes() != blob:
+            raise SystemExit(f"working tree differs from {commit[:12]}: {rel}")
         return blob
 
     def changed_repo_files(self):
@@ -181,9 +281,9 @@ class Release:
                              capture_output=True, text=True, encoding="utf-8", check=True).stdout.split("\n")
         return [rel for rel in out if rel and (REPO / rel).is_file()]
 
-    def publisher_map(self):
+    def publisher_map(self, commit=None):
         """repo path -> public paths, read from the committed publisher's copy steps."""
-        text = self.committed("tools/portable-publish.ps1").decode("utf-8-sig")
+        text = self.committed("tools/portable-publish.ps1", commit, strict=commit is None).decode("utf-8-sig")
         mapping = {}
         for source, dest, where in re.findall(r"Copy-ToolFile -SourceName '([^']+)' -DestinationName '([^']+)' -DestinationRoot \$(updaterRoot|publishDir)", text):
             mapping.setdefault("tools/" + source, []).append(("_updater/" if where == "updaterRoot" else "") + dest)
@@ -221,16 +321,50 @@ class Release:
         return sorted((set(server) | {"tools/portable-pack.json"} | {r for r in removed if not r.startswith(PUBLIC)})), sorted(public | {r for r in removed if r.startswith(PUBLIC)})
 
     def engine_version(self):
-        """UPDATER_VERSION of the committed engine; the release must carry the same version."""
-        text = self.committed("tools/player-update-generic.py").decode("utf-8-sig")
-        match = re.search(r'^UPDATER_VERSION = "([\d.]+)"', text, re.M)
-        return match.group(1) if match else None
+        """UPDATER_VERSION of the committed engine (independent of the release version)."""
+        return text_version(self.committed("tools/player-update-generic.py"))
+
+    def engine_copies(self):
+        """Repo engine files present in this commit with every published copy, {repo path: [server paths]}."""
+        mapping = self.publisher_map()
+        listed = subprocess.run(["git", "-C", str(REPO), "ls-tree", "--name-only", self.commit, "--"] + list(VERSIONED_ENGINES),
+                                capture_output=True, text=True, check=True).stdout.split()
+        return {rel: [rel] + [PUBLIC + p for p in mapping.get(rel, [])] for rel in VERSIONED_ENGINES if rel in listed}
+
+    def engine_rule(self, production_versions):
+        """ENGINE_VERSION_V2. production_versions: {server path: version or None}. Returns (ok, message)."""
+        committed = {rel: text_version(self.committed(rel)) for rel in self.engine_copies()}
+        if len(set(committed.values())) != 1:
+            return False, "the committed engine copies disagree: " + json.dumps(committed) + " (use tools/bump-updater-version.py)"
+        engine = next(iter(committed.values()))
+        if not set(self.changed_repo_files()) & set(committed):
+            return True, f"no engine copy changes; engines stay at {engine}"
+        live = [v for v in production_versions.values() if v]
+        newest = max(live, key=version_key) if live else None
+        if newest and version_key(engine) <= version_key(newest):
+            return False, (f"the committed engines say {engine}, production already has {newest}: run "
+                           f"python tools/bump-updater-version.py <a version above {newest}> and commit first")
+        return True, f"engines {newest or '?'} -> {engine}"
+
+    def production_engine_versions(self, host, local_root=None):
+        paths = [p for copies in self.engine_copies().values() for p in copies]
+        if local_root is not None:
+            return {p: text_version((local_root / p).read_bytes()) if (local_root / p).is_file() else None for p in paths}
+        return {p: (info or {}).get("version") for p, info in self.remote_file_info(host, paths).items()}
 
     def require_engine_version(self):
-        found = self.engine_version()
-        if found != self.version:
-            raise SystemExit(f"the committed engines say {found}, the release says {self.version}: "
-                             f"run python tools/bump-updater-version.py {self.version} and commit first")
+        versions = {}
+        for host in self.order:
+            versions.update({f"{host}:{p}": v for p, v in self.production_engine_versions(host, self.backup / host).items()})
+        ok, message = self.engine_rule(versions)
+        if not ok:
+            raise SystemExit(message)
+        return message
+
+    def accepted_drift(self, path, digest):
+        """KNOWN_DRIFT_V1: a production change made outside this tool that the release takes over."""
+        return any(d.get("path") == path and str(d.get("sha256") or "").lower() == str(digest or "").lower()
+                   for d in self.spec.get("knownDrift", []) if isinstance(d, dict))
 
     def content_release_between(self):
         """True when a content release replaced the previous updater release's manifest."""
@@ -241,13 +375,13 @@ class Release:
         return self.ssh(host, python + " - " + " ".join(shlex.quote(a) for a in args), stdin=program.encode("utf-8"), timeout=timeout)
 
     def player_versions(self, days=2):
-        """Read-only: the committed update-adoption.py against the primary host's access log."""
+        """Read-only: this repo's update-adoption.py against the primary host's access log."""
         host = self.config["primary"]
         info = self.hosts[host]
         if info["kind"] != "posix" or not info.get("python"):
             return "(no access-log summary for a non-posix primary host)"
         root = info["root"].rstrip("/")
-        program = self.committed("tools/update-adoption.py").decode("utf-8")
+        program = (REPO / "tools/update-adoption.py").read_text(encoding="utf-8")
         try:
             return self.remote_python_args(host, program, ["--folder", root + "/logs/update-access",
                                                            "--public", root + "/" + PUBLIC.rstrip("/"), "--days", str(days)])
@@ -296,25 +430,36 @@ class Release:
 
     # ---- steps ---------------------------------------------------------------------
     def preflight(self):
+        self.require_spec()
         receipt = read_json(self.spec["previousReceipt"])
         content = self.content_release_between()
         report = {"engineVersion": self.engine_version(), "contentReleaseSincePreviousUpdater": content}
-        ok = report["engineVersion"] == self.version
+        ok = True
+        engine_versions = {}
         for host in self.order:
             expected = {e["path"]: e["after"] for e in receipt["hosts"][host]["files"]}
             actual = self.remote_hashes(host, list(expected))
             differ = [p for p in expected if actual.get(p) != expected[p]]
-            # A content release rewrites its own files; everything else must be untouched.
-            bad = [p for p in differ if not (content and p in CONTENT_OWNED)]
+            # A content release rewrites its own files; knownDrift lists the other changes this
+            # release takes over; everything else must be untouched.
+            drift = [p for p in differ if not (content and p in CONTENT_OWNED) and self.accepted_drift(p, actual.get(p))]
+            bad = [p for p in differ if not (content and p in CONTENT_OWNED) and p not in drift]
             manifest_version = None
             if not bad:
                 manifest_version = json.loads(self.remote_text(host, PUBLIC + "server-manifest.json")).get("version")
-            report[host] = {"checked": len(expected), "mismatched": bad, "changedByContentRelease": [p for p in differ if p not in bad],
+            report[host] = {"checked": len(expected), "mismatched": bad, "acceptedDrift": drift,
+                            "changedByContentRelease": [p for p in differ if p not in bad and p not in drift],
                             "manifestVersion": manifest_version}
             ok = ok and not bad and manifest_version == self.previous
+            engine_versions.update({f"{host}:{p}": v for p, v in self.production_engine_versions(host).items()})
+        engine_ok, report["engineRule"] = self.engine_rule(engine_versions)
+        ok = ok and engine_ok
         print(json.dumps({"productionMatchesPrevious": ok, **report}, ensure_ascii=False, indent=2))
-        if report["engineVersion"] != self.version:
-            print(f"the committed engines say {report['engineVersion']}: run python tools/bump-updater-version.py {self.version}")
+        if any(report[h]["manifestVersion"] not in (None, self.previous) for h in self.order):
+            print("the live manifest moved on: run the `new` step again to take the next free version")
+        busy = {host: self.publish_busy(host) for host in self.order}
+        if any(busy.values()):
+            print("note: a content publish is running now: " + json.dumps(busy))
         print("players (read-only access-log summary):\n" + self.player_versions())
         return ok
 
@@ -350,7 +495,7 @@ class Release:
         print(json.dumps({"baseline": self.previous, "backedUpFiles": len(records), "absentOnHost": absent}, ensure_ascii=False))
 
     def prepare(self):
-        self.require_engine_version()
+        engine_message = self.require_engine_version()
         baseline = read_json(self.work / "baseline-receipt.json")
         mapping = self.publisher_map()
         changed = self.changed_repo_files()
@@ -360,7 +505,8 @@ class Release:
         receipt = {"version": self.version, "previousVersion": self.previous, "updaterRevision": self.spec["revision"],
                    "preparedAt": now(), "sourceRepository": str(REPO), "sourceCommit": self.commit,
                    "previousCommit": self.spec["previousCommit"], "rollbackRoot": str(self.backup),
-                   "contentReleaseSincePreviousUpdater": content, "hosts": {}}
+                   "contentReleaseSincePreviousUpdater": content, "engineVersion": self.engine_version(),
+                   "engineRule": engine_message, "knownDrift": self.spec.get("knownDrift", []), "hosts": {}}
         stamp = now()
         for host in self.order:
             old = self.backup / host
@@ -549,7 +695,9 @@ class Release:
         if verdict["ok"] is False:
             raise SystemExit("CI gate: " + verdict["reason"] + " (nothing was installed; rerun later or pass --skip-ci)")
         print(json.dumps({"ci": verdict["reason"]}), flush=True)
-        report = {"startedAt": now(), "before": self.snapshot(), "steps": []}
+        # PUBLISH_LOCK_V1: a content publish rewrites the same files; never interleave with one.
+        self.require_no_publish()
+        report = {"startedAt": now(), "before": self.snapshot(), "steps": [], "publishLockChecked": True}
         restarted = []
         try:
             for host in self.order:
@@ -803,6 +951,145 @@ class Release:
         print(json.dumps({"status": "PUBLISHED_VERIFIED", "version": self.version, "productionFilesVerified": verified}))
         self.write_receipt()
 
+    # ---- release.json and the health check -----------------------------------------
+    def latest_receipt(self):
+        """The newest PUBLISHED_VERIFIED release receipt under the folder of the host config."""
+        found = []
+        for path in self.config_path.resolve().parent.glob("*/release/release-receipt.json"):
+            try:
+                receipt = read_json(path)
+            except (OSError, ValueError):
+                continue
+            if receipt.get("status") == "PUBLISHED_VERIFIED" and receipt.get("sourceCommit"):
+                found.append((str(receipt.get("completedAt") or ""), path, receipt))
+        if not found:
+            raise SystemExit("no published release receipt next to " + str(self.config_path))
+        _when, path, receipt = max(found, key=lambda item: item[0])
+        return path, receipt
+
+    def live_version(self):
+        return str(json.loads(self.remote_text(self.config["primary"], PUBLIC + "server-manifest.json")).get("version") or "")
+
+    def new_spec(self):
+        """Write or refresh release.json (RELEASE_SPEC_V1). Computed fields always follow production
+        and git; notes, decision and everything else that is already in the file stay."""
+        if self.release_path is None:
+            raise SystemExit("new needs --release <folder>/release.json")
+        receipt_path, receipt = self.latest_receipt()
+        live = self.live_version()
+        version = next_patch(live)
+        folder = self.release_path.resolve().parent
+        spec = dict(self.spec or {})
+        old_version, old_live = spec.get("version"), spec.get("previousVersion")
+        spec.setdefault("revision", dt.date.today().strftime("%Y.%m.%d") + "-updater")
+        spec.setdefault("restartService", False)
+        spec.setdefault("logTitle", "更新器更新")
+        spec.setdefault("decision", PLACEHOLDER + "：本次发布的决定")
+        spec.setdefault("notes", [PLACEHOLDER + "：玩家看到的更新说明", f"本次仅更新更新器，游戏内容与 {live} 相同。"])
+        spec.setdefault("removeFiles", [])
+        if old_live and old_live != live:  # "游戏内容与 X 相同" follows the live content version
+            for key in ("notes", "decision"):
+                value = spec.get(key)
+                fix = lambda text: str(text).replace(f"与 {old_live} 相同", f"与 {live} 相同")
+                spec[key] = [fix(n) for n in value] if isinstance(value, list) else fix(value)
+        spec.update(version=version, previousVersion=live, commit=git_head(), previousCommit=receipt["sourceCommit"],
+                    previousReceipt=str(receipt_path), workdir=str(folder), backupName=folder.name)
+        folder.mkdir(parents=True, exist_ok=True)
+        self.release_path.write_bytes(encoded(spec))
+        todo = [k for k in ("decision", "logTitle") if PLACEHOLDER in str(spec.get(k))] + (
+            ["notes"] if any(PLACEHOLDER in str(n) for n in spec["notes"]) else [])
+        print(json.dumps({"release": str(self.release_path), "version": version, "previousVersion": live,
+                          "previousReceipt": str(receipt_path), "previousCommit": receipt["sourceCommit"][:7],
+                          "commit": spec["commit"][:7], "fillIn": todo}, ensure_ascii=False))
+        if old_version and old_version != version:
+            print(f"version {old_version} -> {version}: the live manifest moved on; the backup folder name stays {folder.name}")
+
+    def health(self):
+        """HEALTH_V1: read-only. Production is compared with the last published release commit;
+        files a content release rewrites are left out. Returns False when anything needs action."""
+        try:
+            _path, receipt = self.latest_receipt()
+            baseline = receipt["sourceCommit"]
+        except SystemExit:
+            receipt, baseline = {}, git_head()
+        mapping = self.publisher_map(baseline)
+        player_files = {}  # server path -> repo path
+        for rel, publics in mapping.items():
+            player_files[rel] = rel
+            for p in publics:
+                player_files[PUBLIC + p] = rel
+        tracked = subprocess.run(["git", "-C", str(REPO), "ls-tree", "-r", "--name-only", baseline, "--", "tools"],
+                                 capture_output=True, text=True, check=True).stdout.split()
+        admin_files = [rel for rel in tracked if rel not in player_files and rel not in CONTENT_OWNED]
+        blobs = {}
+
+        def blob(rel):
+            if rel not in blobs:
+                blobs[rel] = sha256(self.committed(rel, baseline, strict=False))
+            return blobs[rel]
+
+        problems, notes, lines = [], [], [f"更新器巡检 {now()}，对照上次发布的提交 {baseline[:7]}（更新器 {receipt.get('version', '?')}）"]
+        manifests, versions = {}, {}
+        for host in self.order:
+            try:
+                info = self.remote_file_info(host, sorted(player_files) + admin_files + [PUBLIC + "server-manifest.json"])
+            except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+                problems.append(f"{host}：连不上（{str(exc)[:160]}）")
+                continue
+            lines.append(f"[正常] {host}：可以连接")
+            differ = [p for p, rel in sorted(player_files.items()) if info.get(p) and info[p]["sha256"] != blob(rel)]
+            missing = [p for p in sorted(player_files) if not info.get(p)]
+            if differ:
+                problems.append(f"{host}：玩家会用到的文件和上次发布不一致：" + "、".join(differ))
+            if missing:
+                problems.append(f"{host}：缺少文件：" + "、".join(missing))
+            admin_differ = [p for p in admin_files if info.get(p) and info[p]["sha256"] != blob(p)]
+            if admin_differ:
+                notes.append(f"{host}：管理端工具和仓库不同（不影响玩家）：" + "、".join(admin_differ))
+            for p, rel in player_files.items():
+                if rel in VERSIONED_ENGINES and info.get(p):
+                    versions.setdefault(info[p]["version"], []).append(f"{host}:{p}")
+            if info.get(PUBLIC + "server-manifest.json"):
+                manifests[host] = info[PUBLIC + "server-manifest.json"]["sha256"]
+            try:
+                busy = self.publish_busy(host)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError):
+                busy = ["无法检查"]
+            if busy:
+                problems.append(f"{host}：有内容发布正在进行（{'、'.join(busy)}），不要同时发布更新器")
+        if len(versions) > 1:
+            problems.append("引擎版本号不统一：" + "；".join(f"{v}：{len(paths)} 个副本（例如 {paths[0]}）" for v, paths in sorted(
+                versions.items(), key=lambda kv: version_key(kv[0] or ""))))
+        elif versions:
+            lines.append(f"[正常] 引擎版本号统一：{next(iter(versions))}")
+        if len(set(manifests.values())) > 1:
+            problems.append("各主机的清单不一致：" + "、".join(f"{h} {d[:12]}" for h, d in manifests.items()))
+        elif manifests:
+            try:
+                lines.append(f"[正常] 各主机的清单一致，版本 {self.live_version()}")
+            except (RuntimeError, OSError, ValueError):
+                lines.append("[正常] 各主机的清单一致")
+        primary = self.config["primary"]
+        for name, url in (self.config.get("verifyUrls") or {}).items():
+            try:
+                request = urllib.request.Request(url.format(token=self.token), headers={"User-Agent": "SCEX-release-verify/health"})
+                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=20) as response:
+                    served = sha256(response.read())
+                if manifests.get(primary) and served != manifests[primary]:
+                    problems.append(f"{name} 入口返回的清单和 {primary} 上的文件不同")
+                else:
+                    lines.append(f"[正常] {name} 入口可以访问")
+            except (OSError, ValueError) as exc:
+                problems.append(f"{name} 入口访问失败：{str(exc)[:120]}")
+        lines += ["[问题] " + p for p in problems] + ["[提示] " + n for n in notes]
+        summary = self.player_versions(days=1)
+        if "需要关注：" in summary:
+            attention = summary.split("需要关注：", 1)[1].strip()
+            lines.append("需要关注的玩家：" + ("无" if attention in ("", "无") else "\n  " + attention.replace("\n", "\n  ")))
+        lines.append(f"结论：{len(problems)} 个问题" + ("，需要处理。" if problems else "。"))
+        print("\n".join(lines))
+        return not problems
+
     # ---- the Chinese receipt -------------------------------------------------------
     def receipt_text(self):
         """RELEASE_RECEIPT_TEXT_V1: 发布回执.txt from the JSON receipts in the release folder."""
@@ -838,6 +1125,10 @@ class Release:
             entry = hosts[host]
             installed = [e["path"] for e in entry["files"] if not e.get("delete")]
             lines.append(f"  {host}：写入 {len(installed)} 个文件" + (("；删除（删除前已备份）" + "、".join(entry["removedFiles"])) if entry["removedFiles"] else "") + "。")
+        if receipt.get("engineVersion"):
+            lines.append(f"更新器引擎版本：{receipt['engineVersion']}（与整合包版本分开编号；{receipt.get('engineRule', '')}）。")
+        for drift in receipt.get("knownDrift") or []:
+            lines.append(f"接管的线上改动：{drift.get('path')}（{drift.get('reason') or '发布工具之外的改动'}），本版已包含。")
         if spec.get("logReplace"):
             lines.append("更新日志旧条目改写：" + "；".join(f"「{a}」→「{b}」" for a, b in spec["logReplace"]) + "。")
         if deploy:
@@ -885,6 +1176,29 @@ class Release:
         path.write_bytes(self.receipt_text().encode("utf-8"))
         print(json.dumps({"receipt": str(path)}, ensure_ascii=False))
 
+
+PUBLISH_LOCK_PROBE = r'''import json, os
+root = %r
+busy = []
+if os.path.isdir(os.path.join(root, ".portable-publish-lock")):
+    busy.append(".portable-publish-lock")
+path = os.path.join(root, "tmp", "portable-publish.lock")
+if os.path.isfile(path):
+    try:
+        with open(path, "r+b") as stream:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        busy.append("tmp/portable-publish.lock")
+print(json.dumps(busy))
+'''
 
 DEPLOY_POSIX = r'''from pathlib import Path
 import hashlib, json, os, shutil, sys
@@ -967,17 +1281,21 @@ foreach ($entry in $selected) {
 def main():
     parser = argparse.ArgumentParser(description="SCEX updater release tool")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--release", required=True)
+    parser.add_argument("--release", help="release.json (every step except health)")
     parser.add_argument("--skip-ci", action="store_true", help="deploy without the GitHub Actions gate (recorded in the receipt)")
-    parser.add_argument("step", choices=["preflight", "backup", "prepare", "e2e", "dryrun", "stage", "ci", "deploy", "verify",
-                                         "finalize", "receipt"])
+    parser.add_argument("step", choices=["new", "health", "preflight", "backup", "prepare", "e2e", "dryrun", "stage", "ci", "deploy",
+                                         "verify", "finalize", "receipt"])
     args = parser.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if args.step not in ("health",) and not args.release:
+        parser.error("--release is required for " + args.step)
     release = Release(args.config, args.release, skip_ci=args.skip_ci)
-    step = {"preflight": release.preflight, "backup": release.run_backup, "prepare": release.prepare, "e2e": release.e2e,
-            "dryrun": release.dryrun, "stage": release.stage, "ci": release.ci, "deploy": release.deploy, "verify": release.verify,
-            "finalize": release.finalize, "receipt": release.write_receipt}[args.step]
+    if args.step not in ("new", "health"):
+        release.require_spec()
+    step = {"new": release.new_spec, "health": release.health, "preflight": release.preflight, "backup": release.run_backup,
+            "prepare": release.prepare, "e2e": release.e2e, "dryrun": release.dryrun, "stage": release.stage, "ci": release.ci,
+            "deploy": release.deploy, "verify": release.verify, "finalize": release.finalize, "receipt": release.write_receipt}[args.step]
     result = step()
     return 1 if result is False else 0
 

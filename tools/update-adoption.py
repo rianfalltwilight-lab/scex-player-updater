@@ -34,6 +34,13 @@ def classify(agent):
     return "其他", (agent or "-")[:24]
 
 
+def is_player_agent(agent):
+    """Updater components, pre-2.27.24 updaters and the entry BAT's fallback (no User-Agent).
+    Python-urllib, SCEX-ServerModSync and similar are admin or third-party scripts."""
+    agent = agent or ""
+    return bool(UA_RE.match(agent)) or agent.startswith(("portable-server-kit", "portable-windows-repair")) or agent in ("", "-")
+
+
 def version_key(version):
     return tuple(int(p) for p in version.split(".")) if re.fullmatch(r"\d+(\.\d+)+", version or "") else None
 
@@ -70,9 +77,14 @@ def summarise_day(day, rows, current):
     """Printable lines for one day, and the attention items."""
     checkers = {visitor for _t, _s, visitor, agent in rows if agent.startswith(RELEASE_CHECK_PREFIX)}
     players = collections.OrderedDict()
+    scripts = collections.Counter()
     for time, status, visitor, agent in rows:
-        if visitor not in checkers:
-            players.setdefault(visitor, []).append((time, status) + classify(agent))
+        if visitor in checkers:
+            continue
+        if not is_player_agent(agent):
+            scripts[agent.split("/", 1)[0][:24]] += 1
+            continue
+        players.setdefault(visitor, []).append((time, status) + classify(agent))
     versions = collections.defaultdict(set)
     components = collections.defaultdict(set)
     for visitor, seen in players.items():
@@ -86,6 +98,8 @@ def summarise_day(day, rows, current):
         title += f"，{len(latest)} 位已用更新器 {current}"
     if checkers:
         title += f"；另有 {len(checkers)} 个发布验收地址（不计入）"
+    if scripts:
+        title += "；管理或第三方脚本 " + "、".join(f"{name} {count} 次" for name, count in sorted(scripts.items())) + "（不计入）"
     lines = [title]
     for version in sorted(versions, key=lambda v: (-len(versions[v]), v)):
         detail = "，".join(f"{c} {len(s)}" for (v, c), s in sorted(components.items()) if v == version)

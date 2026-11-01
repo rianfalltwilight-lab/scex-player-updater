@@ -85,6 +85,7 @@ python3 _updater/player-update-generic.py --instance-dir .
 
 - 示例默认保留配置的本地修改与删除，不分发 `options.txt`、`servers.dat` 或启动器，也不启用重复模组清理。需要统一覆盖某个文件时，在 `forceSyncGlobs` 填入精确路径。
 - `forceDeleteGlobs` 会主动移除匹配文件并备份，优先使用精确旧文件名；不要用宽泛规则清理玩家自装内容。
+- `serverList.mergePreferred` 为 `true` 时，两个同步引擎把 `serverList.address` 放到游戏服务器列表第一位（已有就挪上去），玩家自己的服务器和图标原样保留，原文件先备份；`servers.dat` 解析失败时不改文件，提示玩家手动添加，文件同步照常进行。
 - 常规同步会按上次清单管理的文件处理旧版本；额外模组不因“未出现在新清单”被全目录删除。`additiveDirs` 还可保留资源包、光影等目录的内容。
 - SHA-1 用于文件一致性检查，清单未做数字签名；请只向玩家提供自己可信的更新源。
 - macOS 启动器交互、实际游戏运行期间的后台预下载及公网 TLS/代理环境尚未在本次独立提取中实机验收。详见 [验证记录](docs/VALIDATION.md)。
@@ -103,7 +104,13 @@ PowerShell 发布器有可用 Python 时调用 `official-source-index.py`，按�
 
 - `python3 tools/update-adoption.py [--days 7]`：在下载服务器上只读汇总访问日志，按天列出玩家用的更新器版本和组件、每位访客最后一次的版本和状态，以及需要关注的访客（例如仍在用 2.27.24、或取清单失败）。访客编号每天更换，不记录 IP。
 - `python tools/bump-updater-version.py X.Y.Z [--mac-note 说明]`：一次修改所有引擎副本里的更新器版本号，macOS 入口的 `@version` 同时加一并记一行历史；各文件的 BOM 和换行保持不变。`--check` 只检查各副本是否一致。
-- `python tools/release-updater.py --config <主机配置> --release <release.json> <步骤>`：只发布更新器、不重发整合包。preflight 会核对提交里的引擎版本并显示玩家版本分布；deploy 前检查该提交的 GitHub CI 全部通过（`--skip-ci` 可跳过并记入回执）；finalize 后自动生成中文 `发布回执.txt`。主机配置和令牌放在仓库之外。
+- `python tools/release-updater.py --config <主机配置> --release <release.json> <步骤>`：只发布更新器、不重发整合包。
+  - `new` 生成或刷新 release.json：版本号取线上清单的下一个号，上一次发布的回执和提交自动填好，已写的说明保留；内容发布抢先用掉版本号时再跑一次即可。
+  - 发布版本号跟着整合包走，引擎的 `UPDATER_VERSION` 单独编号：本次改了引擎时，它必须比线上所有引擎副本都新。
+  - preflight 显示玩家版本分布；在发布工具之外改过的线上文件，内容已收进仓库后写进 `knownDrift`（路径和 sha256），preflight 只接受这些哈希。
+  - deploy 前检查该提交的 GitHub CI 全部通过（`--skip-ci` 可跳过并记入回执），并确认没有内容发布正在进行；finalize 后自动生成中文 `发布回执.txt`。
+  - `health`（不需要 `--release`）只读巡检：两台主机能否连接、玩家会用到的文件是否和上次发布一致、引擎版本号是否统一、各主机清单是否一致、是否有内容发布正在进行，以及需要关注的玩家。
+  - 主机配置和令牌放在仓库之外。
 
 ## 来源与许可
 

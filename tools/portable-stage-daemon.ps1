@@ -20,6 +20,8 @@ param(
     [ValidateSet("Watch", "Promote")]
     [string]$Mode = "Watch",
     [int]$IntervalSeconds = 30,
+    [int]$SlowIntervalSeconds = 300,
+    [int]$FastMinutes = 10,
     [int]$MaxRuntimeMinutes = 720,
     [int]$GraceMinutes = 15,
     [int]$IdleExitChecks = 3,
@@ -158,7 +160,7 @@ function Test-ManifestUrl {
 # tests/test_manifest_cache.py compares the copies (rules as in player-update-generic.py).
 # MANIFEST_CACHE_V1: the last manifest is kept with its ETag, so an unchanged manifest costs
 # one small 304 response; the server may send it gzip-compressed.
-$script:UpdaterVersion = '2.27.37'
+$script:UpdaterVersion = '2.27.52'
 $script:ManifestCacheDir = '.portable-manifest-cache'
 
 function Invoke-ManifestRequest {
@@ -510,7 +512,7 @@ if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
 }
 if ($selectedIndex -gt 0) { Write-Log "已切换到备用更新地址。" }
 $baseUrl = $manifestUrl.Substring(0, $manifestUrl.LastIndexOf('/') + 1)
-Write-Log ("暂存 daemon 启动 (PID $PID)，间隔 ${IntervalSeconds}s，最长 ${MaxRuntimeMinutes} 分钟。")
+Write-Log ("暂存 daemon 启动 (PID $PID)，前 ${FastMinutes} 分钟每 ${IntervalSeconds}s 检查一次，之后每 ${SlowIntervalSeconds}s，最长 ${MaxRuntimeMinutes} 分钟。")
 
 # 本地 sha1 缓存：key = "rel|size|mtimeTicks"，避免每轮重算数百 MB 的哈希。
 $script:LocalShaCache = @{}
@@ -639,6 +641,14 @@ function Save-StagedEntry {
     return 'home'
 }
 
+function Get-PollIntervalSeconds {
+    # STAGE_POLL_V1: the first minutes check often (an update published right before the game
+    # started), then every few minutes; a 304 is cheap but 30 s all day filled the access log.
+    param([double]$ElapsedMinutes, [int]$Fast, [int]$Slow, [int]$FastMinutes)
+    if ($ElapsedMinutes -lt $FastMinutes) { return [Math]::Max(1, $Fast) }
+    return [Math]::Max([Math]::Max(1, $Fast), $Slow)
+}
+
 function Test-GameRunning {
     # 严格：只认命令行精确含本实例路径的进程 = 本实例的游戏在跑。
     # 这样守 A 实例的 daemon 绝不会被主客户端/别的实例/无关 java 带偏（每实例各管各的，语义干净）。
@@ -708,8 +718,9 @@ $firstIteration = $true
 
 try {
     while ($true) {
-        # 启动后先等 3s 立刻探一次（不让玩家干等一个轮询周期）；此后每 IntervalSeconds 一轮。
-        if ($firstIteration) { $firstIteration = $false; Start-Sleep -Seconds 3 } else { Start-Sleep -Seconds $IntervalSeconds }
+        # 启动后先等 3s 立刻探一次（不让玩家干等一个轮询周期）；此后按 Get-PollIntervalSeconds 轮询。
+        if ($firstIteration) { $firstIteration = $false; Start-Sleep -Seconds 3 }
+        else { Start-Sleep -Seconds (Get-PollIntervalSeconds -ElapsedMinutes ((Get-Date) - $startTime).TotalMinutes -Fast $IntervalSeconds -Slow $SlowIntervalSeconds -FastMinutes $FastMinutes) }
 
         $elapsedMin = ((Get-Date) - $startTime).TotalMinutes
         if ($elapsedMin -ge $MaxRuntimeMinutes) { Write-Log "达到最长运行时间，退出。"; break }

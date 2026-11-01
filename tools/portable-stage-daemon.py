@@ -173,7 +173,7 @@ def probe_timeout_for_url(url: str) -> float:
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.37"
+UPDATER_VERSION = "2.27.52"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
@@ -645,9 +645,16 @@ class SyncLock:
             self.handle = None
 
 
+def poll_interval(elapsed_min, fast, slow, fast_min):
+    """STAGE_POLL_V1: the first minutes check often (an update published right before the game
+    started), then every few minutes; a 304 is cheap but 30 s all day filled the access log."""
+    fast = max(1, int(fast))
+    return fast if elapsed_min < fast_min else max(fast, int(slow))
+
+
 def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log_path,
               manifest_url, interval, max_runtime_min, grace_min, idle_exit_checks,
-              initial_text=None, initial_last_modified=None):
+              initial_text=None, initial_last_modified=None, slow_interval=300, fast_min=10):
     # 单例锁
     if lock_path.is_file():
         try:
@@ -660,7 +667,8 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
     lock_path.write_text(str(os.getpid()))
 
     base = manifest_url.rsplit("/", 1)[0] + "/"
-    log(log_path, f"暂存 daemon 启动 (PID {os.getpid()})，间隔 {interval}s，最长 {max_runtime_min} 分钟。")
+    log(log_path, f"暂存 daemon 启动 (PID {os.getpid()})，前 {fast_min} 分钟每 {interval}s 检查一次，之后每 {slow_interval}s，"
+                  f"最长 {max_runtime_min} 分钟。")
     proxy = get_proxy_url()
     if proxy:
         log(log_path, f"已检测到系统代理，官方源走代理；家宽更新服务始终直连。")
@@ -700,7 +708,7 @@ def run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log
     first = True
     try:
         while True:
-            time.sleep(3 if first else interval)
+            time.sleep(3 if first else poll_interval((time.time() - start) / 60.0, interval, slow_interval, fast_min))
             first = False
 
             elapsed_min = (time.time() - start) / 60.0
@@ -859,7 +867,9 @@ def main() -> int:
     ap.add_argument("--instance-dir", default=".")
     ap.add_argument("--manifest-url", default="")
     ap.add_argument("--mode", choices=("watch", "promote"), default="watch")
-    ap.add_argument("--interval-seconds", type=int, default=30)
+    ap.add_argument("--interval-seconds", type=int, default=30, help="poll interval for the first --fast-minutes")
+    ap.add_argument("--slow-interval-seconds", type=int, default=300, help="poll interval after that")
+    ap.add_argument("--fast-minutes", type=int, default=10)
     ap.add_argument("--max-runtime-minutes", type=int, default=720)
     ap.add_argument("--grace-minutes", type=int, default=15)
     ap.add_argument("--idle-exit-checks", type=int, default=3)
@@ -908,7 +918,8 @@ def main() -> int:
     run_watch(instance_root, stage_root, ready_path, notice_path, lock_path, log_path,
               manifest_url, args.interval_seconds, args.max_runtime_minutes,
               args.grace_minutes, args.idle_exit_checks,
-              initial_text=probe[0], initial_last_modified=probe[1])
+              initial_text=probe[0], initial_last_modified=probe[1],
+              slow_interval=args.slow_interval_seconds, fast_min=args.fast_minutes)
     return 0
 
 

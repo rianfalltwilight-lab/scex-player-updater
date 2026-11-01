@@ -437,7 +437,7 @@ function Get-OfficialFileUrls {
 # tests/test_manifest_cache.py compares the copies (rules as in player-update-generic.py).
 # MANIFEST_CACHE_V1: the last manifest is kept with its ETag, so an unchanged manifest costs
 # one small 304 response; the server may send it gzip-compressed.
-$script:UpdaterVersion = '2.27.37'
+$script:UpdaterVersion = '2.27.52'
 $script:ManifestCacheDir = '.portable-manifest-cache'
 
 function Invoke-ManifestRequest {
@@ -1419,6 +1419,124 @@ function Apply-LauncherProfile {
     }
     Write-Host ("[启动器] 已写入本地实例配置：{0}" -f $instanceName)
 }
+function Merge-PreferredServerList {
+    # Parse and preserve NBT directly; no runtime C# compilation or compiler subprocess.
+    param([byte[]]$Data, [string]$Name, [string]$Address)
+    $zipped = $null -ne $Data -and $Data.Length -ge 2 -and $Data[0] -eq 31 -and $Data[1] -eq 139
+    [byte[]]$raw = $Data
+    if ($null -eq $Data) { $raw = [byte[]]@(10,0,0,0) }
+    elseif ($zipped) {
+        $inputStream = New-Object IO.MemoryStream(,$Data)
+        $gzip = New-Object IO.Compression.GZipStream($inputStream,[IO.Compression.CompressionMode]::Decompress)
+        $outputStream = New-Object IO.MemoryStream
+        try { $gzip.CopyTo($outputStream); $raw=$outputStream.ToArray() }
+        finally { $gzip.Dispose(); $inputStream.Dispose(); $outputStream.Dispose() }
+    }
+    function Require-NbtBytes([int]$Position,[long]$Length) {
+        if ($Position -lt 0 -or $Length -lt 0 -or $Position -gt $raw.Length-$Length) { throw 'Invalid servers.dat length' }
+    }
+    function Read-NbtU16([int]$Position) {
+        Require-NbtBytes $Position 2
+        return ([int]$raw[$Position]*256+[int]$raw[$Position+1])
+    }
+    function Read-NbtI32([int]$Position) {
+        Require-NbtBytes $Position 4
+        return [int](([int]$raw[$Position] -shl 24) -bor ([int]$raw[$Position+1] -shl 16) -bor ([int]$raw[$Position+2] -shl 8) -bor [int]$raw[$Position+3])
+    }
+    function Get-NbtStringEnd([int]$Position) {
+        $length=Read-NbtU16 $Position
+        Require-NbtBytes ($Position+2) $length
+        return ($Position+2+$length)
+    }
+    function Read-NbtText([int]$Position) {
+        $end=Get-NbtStringEnd $Position
+        return [Text.Encoding]::UTF8.GetString($raw,$Position+2,$end-$Position-2)
+    }
+    function Get-NbtPayloadEnd([int]$Kind,[int]$Position,[int]$Depth=0) {
+        if ($Depth -gt 64) { throw 'NBT nesting too deep' }
+        if ($Kind -ge 1 -and $Kind -le 6) {
+            $width=@(0,1,2,4,8,4,8)[$Kind];Require-NbtBytes $Position $width;return ($Position+$width)
+        }
+        if ($Kind -eq 8) { return (Get-NbtStringEnd $Position) }
+        if ($Kind -in @(7,11,12)) {
+            $count=Read-NbtI32 $Position
+            $width=if($Kind -eq 7){1}elseif($Kind -eq 11){4}else{8}
+            $length=[long]$count*$width;Require-NbtBytes ($Position+4) $length;return [int]($Position+4+$length)
+        }
+        if ($Kind -eq 9) {
+            Require-NbtBytes $Position 5
+            $child=[int]$raw[$Position];$count=Read-NbtI32 ($Position+1)
+            if ($count -lt 0 -or ($count -gt 0 -and $child -eq 0)) { throw 'Invalid NBT list' }
+            $Position+=5
+            for($i=0;$i -lt $count;$i++) { $Position=Get-NbtPayloadEnd $child $Position ($Depth+1) }
+            return $Position
+        }
+        if ($Kind -eq 10) {
+            while($true) {
+                Require-NbtBytes $Position 1
+                $child=[int]$raw[$Position];$Position++
+                if ($child -eq 0) { return $Position }
+                $Position=Get-NbtPayloadEnd $child (Get-NbtStringEnd $Position) ($Depth+1)
+            }
+        }
+        throw 'Unknown NBT tag'
+    }
+    Require-NbtBytes 0 1
+    if ($raw[0] -ne 10) { throw 'servers.dat must contain an NBT compound' }
+    $pos=Get-NbtStringEnd 1
+    if ((Get-NbtPayloadEnd 10 $pos) -ne $raw.Length) { throw 'Trailing servers.dat data' }
+    $body=-1;$end=-1
+    while ($raw[$pos] -ne 0) {
+        $kind=[int]$raw[$pos];$key=Read-NbtText ($pos+1);$pos=Get-NbtStringEnd ($pos+1)
+        $finish=Get-NbtPayloadEnd $kind $pos
+        if ($key -eq 'servers') {
+            if ($kind -ne 9 -or $body -ne -1) { throw 'Invalid servers list' }
+            $body=$pos;$end=$finish
+        }
+        $pos=$finish
+    }
+    $entries=New-Object 'Collections.Generic.List[object]';$preferred=-1
+    if ($body -ge 0) {
+        $count=Read-NbtI32 ($body+1)
+        if ($raw[$body] -ne 10 -and -not ($raw[$body] -eq 0 -and $count -eq 0)) { throw 'Servers list must contain compounds' }
+        $pos=$body+5
+        for($i=0;$i -lt $count;$i++) {
+            $finish=Get-NbtPayloadEnd 10 $pos;$q=$pos
+            while ($raw[$q] -ne 0) {
+                $kind=[int]$raw[$q];$key=Read-NbtText ($q+1);$q=Get-NbtStringEnd ($q+1)
+                if ($kind -eq 8 -and $key -eq 'ip' -and $preferred -lt 0 -and (Read-NbtText $q).Trim().Equals($Address.Trim(),[StringComparison]::OrdinalIgnoreCase)) { $preferred=$i }
+                $q=Get-NbtPayloadEnd $kind $q
+            }
+            $entry=New-Object byte[] ($finish-$pos);[Array]::Copy($raw,$pos,$entry,0,$entry.Length);$entries.Add($entry);$pos=$finish
+        }
+    }
+    if ($preferred -lt 0) {
+        $entryStream=New-Object IO.MemoryStream;$writer=New-Object IO.BinaryWriter($entryStream)
+        try {
+            Write-NamedTagHeader $writer 8 'name';Write-NbtStringPayload $writer $Name
+            Write-NamedTagHeader $writer 8 'ip';Write-NbtStringPayload $writer $Address
+            Write-NamedTagHeader $writer 1 'acceptTextures';$writer.Write([byte]1);$writer.Write([byte]0)
+            $entries.Insert(0,$entryStream.ToArray())
+        } finally { $writer.Dispose();$entryStream.Dispose() }
+    } else { $entry=$entries[$preferred];$entries.RemoveAt($preferred);$entries.Insert(0,$entry) }
+    $outputStream=New-Object IO.MemoryStream;$writer=New-Object IO.BinaryWriter($outputStream)
+    try {
+        if ($body -lt 0) { $writer.Write($raw,0,$raw.Length-1);Write-NamedTagHeader $writer 9 'servers' }
+        else { $writer.Write($raw,0,$body) }
+        $writer.Write([byte]10);Write-I32BE $writer $entries.Count
+        foreach($entry in $entries) { $writer.Write([byte[]]$entry) }
+        if ($body -lt 0) { $writer.Write([byte]0) } else { $writer.Write($raw,$end,$raw.Length-$end) }
+        $result=$outputStream.ToArray()
+    } finally { $writer.Dispose();$outputStream.Dispose() }
+    if ($null -ne $Data -and [Convert]::ToBase64String($result) -ceq [Convert]::ToBase64String($raw)) { return ,$Data }
+    if (-not $zipped) { return ,$result }
+    $outputStream=New-Object IO.MemoryStream
+    $gzip=New-Object IO.Compression.GZipStream($outputStream,[IO.Compression.CompressionMode]::Compress,$true)
+    try { $gzip.Write($result,0,$result.Length);$gzip.Dispose();return ,$outputStream.ToArray() }
+    finally { $gzip.Dispose();$outputStream.Dispose() }
+}
+
+
 function Apply-ServerList {
     param([string]$Root, $Manifest, [string]$BackupRoot)
     $serverList = Get-PropertyValue -Object $Manifest -Name 'serverList' -Default $null
@@ -1430,6 +1548,22 @@ function Apply-ServerList {
     if ([string]::IsNullOrWhiteSpace($address) -or -not (Test-RelativePathSafe -Rel $target)) { return }
     if ($script:PreservedDeletionKeys -and $script:PreservedDeletionKeys.Contains((Normalize-RelKey $target))) { return }
     $path = Join-SafeRelativePath -Root $Root -Rel $target
+    if ([bool](Get-PropertyValue -Object $serverList -Name 'mergePreferred' -Default $false)) {
+        [byte[]]$before = $null
+        if (Test-Path -LiteralPath $path -PathType Leaf) { $before = [IO.File]::ReadAllBytes($path) }
+        try { [byte[]]$after = Merge-PreferredServerList -Data $before -Name $name -Address $address }
+        catch { Write-Host ("[保留] 服务器列表无法合并，原文件未改，请在游戏里手动添加 {0}：{1}" -f $address, $_.Exception.Message) -ForegroundColor Yellow; return }
+        if ($null -eq $before -or [Convert]::ToBase64String($before) -ne [Convert]::ToBase64String($after)) {
+            Backup-FileIfExists -Path $path -Rel $target -BackupRoot $BackupRoot
+            [IO.Directory]::CreateDirectory((Split-Path -Parent $path)) | Out-Null
+            $temporary = $path + '.sync-new'
+            [IO.File]::WriteAllBytes($temporary, $after)
+            if ([IO.File]::Exists($path)) { [IO.File]::Replace($temporary, $path, [System.Management.Automation.Language.NullString]::Value) }
+            else { [IO.File]::Move($temporary, $path) }
+            Write-Host ("[线路] 已优先添加 {0} / {1}，保留其他服务器" -f $name, $address)
+        }
+        return
+    }
     if ($writeIfMissingOnly) {
         if (Test-Path -LiteralPath $path -PathType Leaf) { return }
         if (-not $script:InitialSync) { return }
@@ -2560,7 +2694,16 @@ $requiredPackChanges = Ensure-RequiredResourcePacks -Root $instanceRoot -Manifes
 if ($requiredPackChanges -gt 0) {
     Write-Host "[重要] 已修改资源包顺序。请完全退出 Minecraft 后重新启动客户端；游戏运行中不会自动采用外部 options.txt 变更。" -ForegroundColor Yellow
 }
-Apply-ServerList -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
+# SERVER_LIST_MERGE_V1: a servers.dat problem never stops the file sync.
+try {
+    Write-SyncDetail '[线路] 正在核对服务器列表…'
+    Apply-ServerList -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
+} catch {
+    $listConfig = Get-PropertyValue -Object $manifest -Name 'serverList' -Default $null
+    $listAddress = [string](Get-PropertyValue -Object $listConfig -Name 'address' -Default (Get-PropertyValue -Object $manifest -Name 'serverAddress' -Default ''))
+    $manualHint = if ($listAddress) { "请在游戏里手动添加服务器 $listAddress" } else { '请在游戏里手动添加服务器' }
+    Write-Host ('[线路] 未能调整服务器列表，' + $manualHint + '；文件同步继续。原因：' + $_.Exception.Message) -ForegroundColor Yellow
+}
 Apply-LauncherProfile -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot
 [void](Ensure-NeoForgeClientExtra -Root $instanceRoot -Manifest $manifest -BackupRoot $backupRoot)
 Show-LauncherHints -Root $instanceRoot
