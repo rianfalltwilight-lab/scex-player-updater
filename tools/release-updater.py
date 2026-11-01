@@ -44,6 +44,7 @@ import copy
 import datetime as dt
 import functools
 import hashlib
+import http.client
 import http.server
 import importlib.util
 import json
@@ -207,6 +208,11 @@ class Release:
         return self.ssh(host, self.hosts[host]["python"] + " -", stdin=program.encode("utf-8"), timeout=timeout)
 
     def remote_hashes(self, host, paths):
+        if self.hosts[host]["kind"] != "posix" and len(paths) > 40:
+            merged = {}  # cmd.exe limit, see remote_file_info
+            for start in range(0, len(paths), 40):
+                merged.update(self.remote_hashes(host, paths[start:start + 40]))
+            return merged
         root = self.hosts[host]["root"]
         if self.hosts[host]["kind"] == "posix":
             program = ("import hashlib,json,pathlib\nroot=pathlib.Path(%r)\npaths=json.loads(%r)\n"
@@ -221,6 +227,12 @@ class Release:
 
     def remote_file_info(self, host, paths):
         """{path: {"sha256", "version"} or None}; version is the updater version line, if any."""
+        if self.hosts[host]["kind"] != "posix" and len(paths) > 20:
+            # Windows OpenSSH runs the command through cmd.exe: 8191 characters at most.
+            merged = {}
+            for start in range(0, len(paths), 20):
+                merged.update(self.remote_file_info(host, paths[start:start + 20]))
+            return merged
         root = self.hosts[host]["root"]
         if self.hosts[host]["kind"] == "posix":
             program = ("import hashlib,json,pathlib,re\nroot=pathlib.Path(%r)\npaths=json.loads(%r)\npatterns=json.loads(%r)\nout={}\n"
@@ -955,7 +967,7 @@ class Release:
     def latest_receipt(self):
         """The newest PUBLISHED_VERIFIED release receipt under the folder of the host config."""
         found = []
-        for path in self.config_path.resolve().parent.glob("*/release/release-receipt.json"):
+        for path in Path(os.path.abspath(self.config_path)).parent.glob("*/release/release-receipt.json"):
             try:
                 receipt = read_json(path)
             except (OSError, ValueError):
@@ -978,7 +990,7 @@ class Release:
         receipt_path, receipt = self.latest_receipt()
         live = self.live_version()
         version = next_patch(live)
-        folder = self.release_path.resolve().parent
+        folder = Path(os.path.abspath(self.release_path)).parent  # keep the spelling given (no 8.3 expansion)
         spec = dict(self.spec or {})
         old_version, old_live = spec.get("version"), spec.get("previousVersion")
         spec.setdefault("revision", dt.date.today().strftime("%Y.%m.%d") + "-updater")
@@ -1015,7 +1027,8 @@ class Release:
         mapping = self.publisher_map(baseline)
         player_files = {}  # server path -> repo path
         for rel, publics in mapping.items():
-            player_files[rel] = rel
+            if rel.startswith("tools/"):  # other sources (一键脚本/) are not kept on the hosts
+                player_files[rel] = rel
             for p in publics:
                 player_files[PUBLIC + p] = rel
         tracked = subprocess.run(["git", "-C", str(REPO), "ls-tree", "-r", "--name-only", baseline, "--", "tools"],
@@ -1062,25 +1075,33 @@ class Release:
                 versions.items(), key=lambda kv: version_key(kv[0] or ""))))
         elif versions:
             lines.append(f"[正常] 引擎版本号统一：{next(iter(versions))}")
+        partial = "（只核对了能连上的主机）" if len(manifests) < len(self.order) else ""
         if len(set(manifests.values())) > 1:
             problems.append("各主机的清单不一致：" + "、".join(f"{h} {d[:12]}" for h, d in manifests.items()))
         elif manifests:
             try:
-                lines.append(f"[正常] 各主机的清单一致，版本 {self.live_version()}")
+                lines.append(f"[正常] 各主机的清单一致{partial}，版本 {self.live_version()}")
             except (RuntimeError, OSError, ValueError):
-                lines.append("[正常] 各主机的清单一致")
+                lines.append(f"[正常] 各主机的清单一致{partial}")
         primary = self.config["primary"]
         for name, url in (self.config.get("verifyUrls") or {}).items():
-            try:
-                request = urllib.request.Request(url.format(token=self.token), headers={"User-Agent": "SCEX-release-verify/health"})
-                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=20) as response:
-                    served = sha256(response.read())
-                if manifests.get(primary) and served != manifests[primary]:
-                    problems.append(f"{name} 入口返回的清单和 {primary} 上的文件不同")
-                else:
-                    lines.append(f"[正常] {name} 入口可以访问")
-            except (OSError, ValueError) as exc:
-                problems.append(f"{name} 入口访问失败：{str(exc)[:120]}")
+            failure = None
+            for attempt in range(3):  # one dropped connection is not yet a failure
+                try:
+                    request = urllib.request.Request(url.format(token=self.token), headers={"User-Agent": "SCEX-release-verify/health"})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=20) as response:
+                        served = sha256(response.read())
+                    failure = None
+                    break
+                except (OSError, ValueError, http.client.HTTPException) as exc:
+                    failure = exc
+                    time.sleep(2)
+            if failure is not None:
+                problems.append(f"{name} 入口访问失败：{str(failure)[:120]}")
+            elif manifests.get(primary) and served != manifests[primary]:
+                problems.append(f"{name} 入口返回的清单和 {primary} 上的文件不同")
+            else:
+                lines.append(f"[正常] {name} 入口可以访问，返回的清单和主机上的文件一致")
         lines += ["[问题] " + p for p in problems] + ["[提示] " + n for n in notes]
         summary = self.player_versions(days=1)
         if "需要关注：" in summary:
