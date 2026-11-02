@@ -4,7 +4,9 @@
 
 默认分支仅提供更新器：客户端增量同步、后台预下载、更新脚本刷新与修复、管理员发布清单、更新文件下载服务。上游的服务器启停、面板、RCON、QQ/Discord 通知、备份管理、整套工具包自更新均已移除。Git 历史保留上游记录。
 
-`scex` 分支是 SCEX 正式部署使用的版本：在 main 的基础上保留单一公网地址规则、发布器 `-NoNotify` 与 Discord/QQ/RCON 通知、下载服务 `/kit/` 通道及默认 `0.0.0.0` 监听。正式发布物应从该分支的某个提交构建。
+`scex` 分支是 SCEX 正式部署使用的版本：在 main 的基础上保留单一公网地址规则、发布器 `-NoNotify` 与 Discord/QQ/RCON 通知，以及下载服务 `/kit/` 通道。正式发布物应从该分支的某个提交构建。
+
+截至 **2026-11-02**，`scex` 源码中的更新器引擎版本为 **2.27.52**，macOS 入口为 **`@version 20`**。最近功能与使用限制见 [11 月 2 日版本说明](docs/UPDATE-20261102.md)；这些是仓库源码版本，不代表本次已部署到玩家更新源。
 
 这是脚本工具，不是 Minecraft 模组，无须放进 `mods` 文件夹，也不需要服务器安装插件。仓库不包含整合包、模组 JAR、玩家存档、生产地址、令牌或私有配置。
 
@@ -19,7 +21,7 @@
 - 更新器自刷新、Windows 入口修复、客户端自助检查及按需修复；NeoForge 实例可补齐已安装的 client-extra 资源库引用，保留自定义启动参数并备份原版本配置。
 - 可配置保留玩家额外文件、本地配置改动与主动删除；也可显式指定强制同步、强制删除。
 - 发布器生成清单和更新摘要，复用相同内容的文件；按文件 SHA-1 查询并缓存 Modrinth 官方源，可选接入 CurseForge 元数据。
-- 下载服务只接受 GET / HEAD，通过随机 URL 路径限制访问，可配置 TLS；限制大文件并发缓冲并支持 PID 记录，默认监听本机。
+- 下载服务只接受 GET / HEAD，通过随机 URL 路径限制访问，可配置 TLS；限制大文件并发缓冲并支持 PID 记录。通用入口与 `start-portable-update-server.ps1` 默认监听 `127.0.0.1`；在 `scex` 分支直接运行 `secure-update-server.py` 时默认监听 `0.0.0.0`，部署时应明确选择监听地址。
 
 ## 管理员快速开始
 
@@ -63,7 +65,9 @@ Windows 将 `sh tools/portable-server.sh` 换成 `.\tools\portable-server.bat`�
 
 6. 把生成目录中的 `_updater`、`更新mod-Windows端.bat`、`更新mod-Mac端.command`、`一键客户端自助修复.bat` 和 `UPDATE-URL.txt` 放入发给玩家的**客户端实例目录**。初始客户端的游戏本体、加载器、Java 等仍需自行准备；本工具同步的是清单文件。
 
-后续修改客户端源目录，更新版本与 `releaseNotesVersion/releaseNotes`，再运行发布脚本即可。沿用怀旧服发布规则：换版本时使用 `X.Y.Z`，填写 `releaseLevel`（`major` / `minor` / `patch`）及 `releaseDecision`；例如 `1.0.0 → 1.0.1` 用 `patch`，`1.0.0 → 1.1.0` 用 `minor`。同版本允许重建。下载服务保持运行。此独立版发布脚本不发送群消息或游戏广播，也不提供 `-NoNotify` 参数。
+后续修改客户端源目录，更新版本与 `releaseNotesVersion/releaseNotes`，再运行发布脚本即可。沿用怀旧服发布规则：换版本时使用 `X.Y.Z`，填写 `releaseLevel`（`major` / `minor` / `patch`）及 `releaseDecision`；例如 `1.0.0 → 1.0.1` 用 `patch`，`1.0.0 → 1.1.0` 用 `minor`。同版本允许重建。下载服务保持运行。
+
+`main` 分支的独立发布脚本不发送群消息或游戏广播，也不提供 `-NoNotify` 参数。`scex` 分支的 PowerShell 发布器保留 Discord/QQ/RCON 通知接入；具备相应配置和外部脚本时可发送通知，传入 `-NoNotify` 可跳过本次通知。
 
 ## 玩家使用
 
@@ -126,4 +130,4 @@ python -m unittest discover -s tests -v
 
 测试使用临时客户端与本机随机端口，不连接生产更新源；Windows 自动测试 PowerShell 同步器与发布器，可用环境变量 `UPDATER_TEST_POWERSHELL` 指定 `pwsh.exe`。测试结束关闭服务并清理临时数据。
 
-GitHub CI 同时覆盖 Windows、Ubuntu 与 Python 3.10/3.12。通用发布、实际 HTTP 下载与增量同步、失败恢复、目录识别和 Windows 可移动 BAT 均使用合成数据验收；不启动 Minecraft 或操作生产服务器。
+`scex` 的 GitHub CI 覆盖六组环境：Windows × Python 3.9/3.10/3.12、Ubuntu × Python 3.9/3.12、macOS × Python 3.12。通用发布、实际 HTTP 下载与增量同步、失败恢复、目录识别、Windows 可移动 BAT 和 macOS 脚本入口使用合成数据验收；不启动 Minecraft 或操作生产服务器。各次检查的提交与范围见 [验证记录](docs/VALIDATION.md)。

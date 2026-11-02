@@ -1,5 +1,19 @@
 # 更新器验证记录
 
+## 2026-11-02 源码入口与既有 CI 核对
+
+本轮核对 `scex` 分支的源码版本、启动入口、分支差异与说明文档。引擎版本为 `2.27.52`，macOS 入口为 `@version 20`；对应代码提交为 [`03887d087069fef946fe6972306d8359076c15b3`](https://github.com/rianfalltwilight-lab/scex-player-updater/commit/03887d087069fef946fe6972306d8359076c15b3)。
+
+该代码提交的 [GitHub Actions 运行 41285598882](https://github.com/rianfalltwilight-lab/scex-player-updater/actions/runs/41285598882) 已完成，六组均为 `success`：
+
+- Windows / Python 3.9、3.10、3.12。
+- Ubuntu / Python 3.9、3.12。
+- macOS / Python 3.12。
+
+工作流运行 `python -m unittest discover -s tests -v`，使用临时客户端、本机 HTTP 服务与合成数据。macOS 任务包含脚本入口测试，不代表启动器 GUI 或实际 Minecraft 游戏已验收。
+
+本轮只更新仓库文档与入口说明，未重新运行完整测试、执行发布工具或部署玩家更新源。下面各节的测试数量与环境保留为当时记录，不作为当前版本的测试总数。最近功能说明见 [2026-11-02 版本说明](UPDATE-20261102.md)。
+
 ## 2026-10-25 现役功能同步
 
 对照现役更新器脚本移植通用功能，保留公开仓库的部署入口与玩家文件保护；运行配置、真实地址、令牌和固定主机服务任务未进入仓库。
