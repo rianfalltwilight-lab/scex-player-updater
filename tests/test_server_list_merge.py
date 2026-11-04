@@ -63,9 +63,9 @@ CASES = {
     'already-first': (servers_dat([EXISTING, A]), servers_dat([EXISTING, A])),
     'no-servers-tag': (tag(10, '', ROOT_EXTRA + b'\x00'), tag(10, '', ROOT_EXTRA + tag(9, 'servers', b'\x0a' + struct.pack('>i', 1) + PREFERRED) + b'\x00')),
     'empty-list': (tag(10, '', tag(9, 'servers', b'\x00' + struct.pack('>i', 0)) + b'\x00'), servers_dat([PREFERRED])),
-    'gzip': (gzip.compress(servers_dat([A]), mtime=0), servers_dat([PREFERRED, A])),
 }
 BROKEN = {
+    'gzip': gzip.compress(servers_dat([A]), mtime=0),  # AV_QUIET_V1: Minecraft cannot read it either
     'truncated': servers_dat([A])[:-3],
     'trailing': servers_dat([A]) + b'x',
     'not-compound': tag(8, '', nstr('x')),
@@ -82,11 +82,7 @@ class PythonMergeTests(unittest.TestCase):
     def test_cases(self):
         for name, (data, expected) in CASES.items():
             with self.subTest(name):
-                result = self.u.merge_preferred_server(data, NAME, ADDRESS)
-                if name == 'gzip':
-                    self.assertEqual(result[:2], b'\x1f\x8b')
-                    result = gzip.decompress(result)
-                self.assertEqual(result, expected)
+                self.assertEqual(self.u.merge_preferred_server(data, NAME, ADDRESS), expected)
         self.assertIs(self.u.merge_preferred_server(CASES['already-first'][0], NAME, ADDRESS), CASES['already-first'][0])
 
     def test_broken_files_are_refused(self):
@@ -116,7 +112,7 @@ class PythonMergeTests(unittest.TestCase):
 PS_RUNNER = r'''
 param([string]$Script, [string]$CasesPath)
 $ErrorActionPreference = 'Stop'
-$wanted = @('Write-U16BE', 'Write-I32BE', 'Write-NbtStringPayload', 'Write-NamedTagHeader', 'Merge-PreferredServerList')
+$wanted = @('Write-U16BE', 'Write-I32BE', 'Write-NbtStringPayload', 'Write-NamedTagHeader', 'Test-SameBytes', 'Merge-PreferredServerList')
 $ast = [Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
 foreach ($def in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
     if ($wanted -contains $def.Name) { . ([scriptblock]::Create($def.Extent.Text)) }
@@ -154,12 +150,8 @@ class PowerShellMergeTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertFalse(out[name].startswith('ERROR'), out[name])
                 got = base64.b64decode(out[name])
-                if name == 'gzip':
-                    self.assertEqual(got[:2], b'\x1f\x8b')
-                    got = gzip.decompress(got)
                 self.assertEqual(got, expected)
-                python = u.merge_preferred_server(data, NAME, ADDRESS)
-                self.assertEqual(got, gzip.decompress(python) if name == 'gzip' else python)
+                self.assertEqual(got, u.merge_preferred_server(data, NAME, ADDRESS))
         for name in BROKEN:
             with self.subTest(name):
                 self.assertTrue(out[name].startswith('ERROR'), name)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# @version 20
+# @version 21
 set -e
 cd "$(dirname "$0")"
 SCRIPT_DIR="$PWD"
@@ -103,7 +103,7 @@ def fetch_bytes(url, timeout=12):
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.52"
+UPDATER_VERSION = "2.27.53"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
@@ -496,3 +496,4 @@ exit "$status"
 # v18：去掉已退役云端的地址过滤（该云端已全面停用）。
 # v19：更新器 2.27.37；核心脚本自刷新合并为一行提示；没有新内容时 5 秒后自动关闭；地址文件过期时改用以前记录的地址。
 # v20：更新器 2.27.52：合并服务器列表时保留玩家已有的服务器；后台预下载 10 分钟后改为每 5 分钟检查一次。
+# v21：更新器 2.27.53：servers.dat 不再处理 gzip 压缩格式（游戏本身也不读压缩格式）；Windows 版去掉容易被 360 误报的写法。

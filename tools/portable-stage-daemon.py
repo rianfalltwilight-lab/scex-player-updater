@@ -173,7 +173,7 @@ def probe_timeout_for_url(url: str) -> float:
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.52"
+UPDATER_VERSION = "2.27.53"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 

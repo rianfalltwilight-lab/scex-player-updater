@@ -107,7 +107,7 @@ def fetch_bytes(url: str, timeout: float = 20) -> bytes:
 # one small 304 response; the server may send it gzip-compressed.
 import gzip, http.client, io, socket, stat as _cache_stat, urllib.error  # noqa: E401 (the heredoc lacks these)
 
-UPDATER_VERSION = "2.27.52"
+UPDATER_VERSION = "2.27.53"
 MANIFEST_CACHE_DIR = ".portable-manifest-cache"
 
 
@@ -1586,8 +1586,11 @@ def merge_preferred_server(data, name, ip):
              + named_tag(1, "acceptTextures") + b"\x01\x00")
     if data is None:
         return named_tag(10, "") + named_tag(9, "servers") + b"\x0a" + struct.pack(">i", 1) + entry + b"\x00"
-    compressed = data[:2] == b"\x1f\x8b"
-    raw = gzip.decompress(data) if compressed else data
+    # AV_QUIET_V1: same rule as the PowerShell engine. Minecraft reads servers.dat uncompressed,
+    # so a gzip file is left alone like any other unreadable one.
+    if data[:2] == b"\x1f\x8b":
+        raise ValueError("Compressed servers.dat is not supported")
+    raw = data
     def take(pos, count):
         if count < 0 or pos + count > len(raw):
             raise ValueError("Invalid servers.dat length")
@@ -1677,7 +1680,7 @@ def merge_preferred_server(data, name, ip):
         result = raw[:body] + b"\x0a" + struct.pack(">i", len(entries)) + b"".join(entries) + raw[end:]
     if result == raw:
         return data
-    return gzip.compress(result, mtime=0) if compressed else result
+    return result
 
 
 def apply_server_list(root: pathlib.Path, manifest: dict, backup_root: pathlib.Path, preserved_deletions=None, initial_sync=False):

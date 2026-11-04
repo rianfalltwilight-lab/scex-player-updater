@@ -437,7 +437,7 @@ function Get-OfficialFileUrls {
 # tests/test_manifest_cache.py compares the copies (rules as in player-update-generic.py).
 # MANIFEST_CACHE_V1: the last manifest is kept with its ETag, so an unchanged manifest costs
 # one small 304 response; the server may send it gzip-compressed.
-$script:UpdaterVersion = '2.27.52'
+$script:UpdaterVersion = '2.27.53'
 $script:ManifestCacheDir = '.portable-manifest-cache'
 
 function Invoke-ManifestRequest {
@@ -1419,19 +1419,20 @@ function Apply-LauncherProfile {
     }
     Write-Host ("[启动器] 已写入本地实例配置：{0}" -f $instanceName)
 }
+function Test-SameBytes {
+    param([byte[]]$Left, [byte[]]$Right)
+    if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
+    return ($Left.Length -eq $Right.Length -and [Collections.StructuralComparisons]::StructuralEqualityComparer.Equals($Left, $Right))
+}
 function Merge-PreferredServerList {
     # Parse and preserve NBT directly; no runtime C# compilation or compiler subprocess.
+    # AV_QUIET_V1: no stream decompression or base64 here. 360 scores "download + in-memory
+    # decompression" in one PowerShell script as a loader, and Minecraft reads servers.dat
+    # uncompressed anyway, so a gzip file is left alone like any other unreadable one.
     param([byte[]]$Data, [string]$Name, [string]$Address)
-    $zipped = $null -ne $Data -and $Data.Length -ge 2 -and $Data[0] -eq 31 -and $Data[1] -eq 139
+    if ($null -ne $Data -and $Data.Length -ge 2 -and $Data[0] -eq 31 -and $Data[1] -eq 139) { throw 'Compressed servers.dat is not supported' }
     [byte[]]$raw = $Data
     if ($null -eq $Data) { $raw = [byte[]]@(10,0,0,0) }
-    elseif ($zipped) {
-        $inputStream = New-Object IO.MemoryStream(,$Data)
-        $gzip = New-Object IO.Compression.GZipStream($inputStream,[IO.Compression.CompressionMode]::Decompress)
-        $outputStream = New-Object IO.MemoryStream
-        try { $gzip.CopyTo($outputStream); $raw=$outputStream.ToArray() }
-        finally { $gzip.Dispose(); $inputStream.Dispose(); $outputStream.Dispose() }
-    }
     function Require-NbtBytes([int]$Position,[long]$Length) {
         if ($Position -lt 0 -or $Length -lt 0 -or $Position -gt $raw.Length-$Length) { throw 'Invalid servers.dat length' }
     }
@@ -1528,12 +1529,8 @@ function Merge-PreferredServerList {
         if ($body -lt 0) { $writer.Write([byte]0) } else { $writer.Write($raw,$end,$raw.Length-$end) }
         $result=$outputStream.ToArray()
     } finally { $writer.Dispose();$outputStream.Dispose() }
-    if ($null -ne $Data -and [Convert]::ToBase64String($result) -ceq [Convert]::ToBase64String($raw)) { return ,$Data }
-    if (-not $zipped) { return ,$result }
-    $outputStream=New-Object IO.MemoryStream
-    $gzip=New-Object IO.Compression.GZipStream($outputStream,[IO.Compression.CompressionMode]::Compress,$true)
-    try { $gzip.Write($result,0,$result.Length);$gzip.Dispose();return ,$outputStream.ToArray() }
-    finally { $gzip.Dispose();$outputStream.Dispose() }
+    if ($null -ne $Data -and (Test-SameBytes $result $raw)) { return ,$Data }
+    return ,$result
 }
 
 
@@ -1553,7 +1550,7 @@ function Apply-ServerList {
         if (Test-Path -LiteralPath $path -PathType Leaf) { $before = [IO.File]::ReadAllBytes($path) }
         try { [byte[]]$after = Merge-PreferredServerList -Data $before -Name $name -Address $address }
         catch { Write-Host ("[保留] 服务器列表无法合并，原文件未改，请在游戏里手动添加 {0}：{1}" -f $address, $_.Exception.Message) -ForegroundColor Yellow; return }
-        if ($null -eq $before -or [Convert]::ToBase64String($before) -ne [Convert]::ToBase64String($after)) {
+        if (-not (Test-SameBytes $before $after)) {
             Backup-FileIfExists -Path $path -Rel $target -BackupRoot $BackupRoot
             [IO.Directory]::CreateDirectory((Split-Path -Parent $path)) | Out-Null
             $temporary = $path + '.sync-new'
@@ -1983,7 +1980,7 @@ function Repair-RootAddressFiles {
         $path = Join-SafeRelativePath -Root $Root -Rel $rel
         if (-not [IO.File]::Exists($path)) { continue }
         $current = [IO.File]::ReadAllBytes($path)
-        if ($current.Length -eq $data.Length -and [Convert]::ToBase64String($current) -eq [Convert]::ToBase64String($data)) { continue }
+        if (Test-SameBytes $current $data) { continue }
         Backup-FileIfExists -Path $path -Rel $rel -BackupRoot $BackupRoot
         $temp = $path + '.portable-new.tmp'
         [IO.File]::WriteAllBytes($temp, $data)
